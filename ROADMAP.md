@@ -6,24 +6,23 @@ This roadmap tracks feature parity between the original C# [ShareX](https://gith
 
 | Subsystem | Original C# project | Rust crate | Status |
 | --- | --- | --- | --- |
-| Core types, naming, config | `ShareX.HelpersLib` | `sharex-core` | Foundation complete |
+| Core types, naming, config, hotkeys | `ShareX.HelpersLib` | `sharex-core` | Foundation complete |
 | Capture history | `ShareX.HistoryLib` | `sharex-core` | JSONL complete, SQLite optional |
-| Screen capture | `ShareX.ScreenCaptureLib` | `sharex-capture` | Monitor and coordinate region complete |
-| Uploader destinations | `ShareX.UploadersLib` | `sharex-uploaders` | Trait, registry, and local mirror complete |
-| Desktop UI and CLI | `ShareX` | `sharex-app` | Basic window and CLI complete |
+| Screen capture and region overlay | `ShareX.ScreenCaptureLib` | `sharex-capture`, `sharex-app` | Fullscreen, monitor, active window, and drag-to-select region complete |
+| Annotation editor | `ShareX.ImageEditor` | `sharex-editor`, `sharex-app` | 13 core tools, pixelate, blur, crop, undo/redo, and save complete |
+| Desktop UI and global hotkeys | `ShareX` | `sharex-app` | ShareX dark UI, keybind manager, and CLI complete |
+| Uploader destinations | `ShareX.UploadersLib` | `sharex-uploaders` | Trait, registry, and local mirror complete; HTTP/`.sxcu` open |
 | Image effects pipeline | `ShareX.ImageEffectsLib` | Planned (`sharex-effects`) | Open |
-| Annotation editor | `ShareX.ImageEditor` | Planned (`sharex-editor`) | Open |
 | Screen and GIF recording | `ShareX.MediaLib` | Planned (`sharex-media`) | Open |
 | Extra utilities (OCR, color picker, QR) | `ShareX.Tools` | Planned (`sharex-tools`) | Open |
 
 ## Priority milestones for contributors
 
-### Milestone 1. Interactive desktop workflow
+### Milestone 1. System tray and multi-monitor polish
 
-- Global hotkeys (`PrintScreen`, `Ctrl+PrintScreen`, `Alt+PrintScreen`) via a cross-platform hotkey crate.
-- System tray icon and background menu.
-- Interactive fullscreen overlay for drag-to-select region capture.
-- Active-window capture on Windows, macOS, and Linux.
+- Minimize to Windows/macOS/Linux system tray with quick capture context menu.
+- Multi-monitor spanning region overlay and live pixel magnifier loupe.
+- Scrolling capture and window-element snapping during region selection.
 
 ### Milestone 2. Uploaders and sharing
 
@@ -31,10 +30,10 @@ This roadmap tracks feature parity between the original C# [ShareX](https://gith
 - Built-in uploaders for S3-compatible buckets, Imgur, GitHub Gist, and Pastebin.
 - Upload retry queue and transfer progress reporting.
 
-### Milestone 3. Editing and effects
+### Milestone 3. Image effects and advanced editor tools
 
-- Non-destructive image effects pipeline (border, shadow, resize, watermark, blur).
-- Interactive annotation canvas (arrows, rectangles, step numbers, pixelate, text).
+- Non-destructive automated after-capture image effects (border, shadow, resize, watermark).
+- Speech balloons, stickers, magnifier circles, and TrueType font selection in `sharex-editor`.
 
 ### Milestone 4. Recording and tools
 
