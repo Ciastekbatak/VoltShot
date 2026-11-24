@@ -275,6 +275,9 @@ impl ScreenCapturer for XcapCapturer {
 
     fn capture(&self, source: &CaptureSource) -> Result<CapturedImage, CoreError> {
         match source {
+            CaptureSource::WatchedFile => Err(CoreError::CaptureFailed(
+                "watched files must be loaded from disk".into(),
+            )),
             CaptureSource::ActiveWindow => Self::capture_active_window(),
             CaptureSource::Window { id } => Self::capture_window_by_id(*id),
             CaptureSource::PrimaryMonitor | CaptureSource::ActiveMonitor => {

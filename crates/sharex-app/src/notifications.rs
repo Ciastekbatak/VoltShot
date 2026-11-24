@@ -138,10 +138,7 @@ impl ToastManager {
         self.next_id = id.saturating_add(1);
 
         let thumbnail = thumb_img.map(|img| {
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                [img.width() as usize, img.height() as usize],
-                img.rgba(),
-            );
+            let color_image = crate::image_texture::bounded_color_image(img, 128);
             ctx.load_texture(
                 format!("sharex_toast_thumb_{id}"),
                 color_image,
@@ -226,6 +223,7 @@ impl ToastManager {
                 .with_always_on_top()
                 .with_decorations(false)
                 .with_resizable(false)
+                .with_active(false)
                 .with_transparent(true)
                 .with_taskbar(false)
                 .with_inner_size([TOAST_WIDTH, TOAST_HEIGHT])

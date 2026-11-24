@@ -527,6 +527,8 @@ pub const fn hotkey_id_for_action(action: HotkeyAction) -> &'static str {
         HotkeyAction::OpenEditor => "open-editor",
         HotkeyAction::RecordVideo => "record-video",
         HotkeyAction::RecordGif => "record-gif",
+        HotkeyAction::CaptureOcr => "capture-ocr",
+        HotkeyAction::PickScreenColor => "pick-screen-color",
     }
 }
 
@@ -536,7 +538,17 @@ pub fn resolve_config_for_hotkey(
     registry: &WorkflowRegistry,
     hotkey_id: &str,
 ) -> AppConfig {
-    let matched = registry
+    workflow_for_hotkey(base, registry, hotkey_id)
+        .and_then(|preset| resolve_effective_config(base, &preset.overrides).ok())
+        .unwrap_or_else(|| base.clone())
+}
+
+pub(crate) fn workflow_for_hotkey<'a>(
+    base: &AppConfig,
+    registry: &'a WorkflowRegistry,
+    hotkey_id: &str,
+) -> Option<&'a WorkflowPreset> {
+    registry
         .workflows
         .iter()
         .find(|preset| preset.enabled && preset.id == hotkey_id)
@@ -546,30 +558,16 @@ pub fn resolve_config_for_hotkey(
                 .workflows
                 .iter()
                 .find(|preset| preset.enabled && preset.action == action)
-        });
-
-    match matched {
-        Some(preset) => {
-            resolve_effective_config(base, &preset.overrides).unwrap_or_else(|_| base.clone())
-        }
-        None => base.clone(),
-    }
+        })
 }
 
 fn action_for_hotkey_id(base: &AppConfig, hotkey_id: &str) -> Option<HotkeyAction> {
     if let Some(binding) = base.hotkeys.iter().find(|binding| binding.id == hotkey_id) {
         return Some(binding.action);
     }
-    match hotkey_id {
-        "capture-fullscreen" => Some(HotkeyAction::CaptureFullscreen),
-        "capture-region" => Some(HotkeyAction::CaptureRegion),
-        "capture-active-window" => Some(HotkeyAction::CaptureActiveWindow),
-        "capture-last-region" => Some(HotkeyAction::CaptureLastRegion),
-        "open-editor" => Some(HotkeyAction::OpenEditor),
-        "record-video" => Some(HotkeyAction::RecordVideo),
-        "record-gif" => Some(HotkeyAction::RecordGif),
-        _ => None,
-    }
+    HotkeyAction::ALL
+        .into_iter()
+        .find(|&action| hotkey_id_for_action(action) == hotkey_id)
 }
 
 fn show_workflow_inline_editor(

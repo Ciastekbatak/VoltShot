@@ -6,6 +6,7 @@ pub mod effects_ui;
 pub mod gui;
 pub mod hotkeys;
 pub mod i18n;
+mod image_texture;
 pub mod notifications;
 pub mod pin_window;
 pub mod recording_hud;
@@ -134,8 +135,10 @@ pub fn run() -> Result<(), String> {
 
     let command = parsed.command.unwrap_or(Command::Gui);
     match command {
-        Command::Gui => gui::launch_gui_with_fallback(config_path, fallback_config)
-            .map_err(|err| err.to_string()),
+        Command::Gui => {
+            gui::launch_gui_with_fallback(config_path, fallback_config, parsed.minimized)
+                .map_err(|err| err.to_string())
+        }
         other => {
             let config = load_config_with_fallback(&config_path, fallback_config)
                 .map_err(format_core_error)?;

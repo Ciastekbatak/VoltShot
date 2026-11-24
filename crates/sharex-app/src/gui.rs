@@ -1,16 +1,22 @@
+use crate::autostart::AutostartManager;
 use crate::clipboard::SystemClipboard;
 use crate::editor_ui::{EditorAction, EditorViewState};
 use crate::effects_ui::EffectsPanelState;
 use crate::hotkeys::{HotkeyRuntime, HotkeyStatus, TriggeredHotkey};
 use crate::i18n::{self, UiLanguage};
+use crate::notifications::{ToastAction, ToastManager};
 use crate::pin_window::PinManager;
 use crate::recording_ui::RecordingPanelState;
-use crate::region_overlay::{OverlayOutcome, RegionOverlayState};
+use crate::region_overlay::{OverlayMode, OverlayModeOutcome, RegionOverlayState};
 use crate::theme::{SharexPalette, apply_sharex_theme, palette};
 use crate::thumb_cache::LruCache;
 use crate::tools_ui::{ToolsContext, ToolsPanelState};
 use crate::tray::{TrayAction, TrayRuntime};
 use crate::uploaders_ui::UploadersPanelState;
+use crate::watcher_runtime::WatchFolderRuntime;
+use crate::workflows_ui::{
+    WorkflowsPanelState, WorkflowsUiAction, resolve_config_for_hotkey, workflow_for_hotkey,
+};
 use chrono::Utc;
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 use sharex_capture::{DesktopSnapshot, XcapCapturer};
@@ -18,34 +24,50 @@ use sharex_core::{
     AppConfig, CaptureId, CaptureSource, CapturedImage, ClipboardSink, FileNameContext,
     FileNamePattern, HistoryEntry, HistoryQuery, HistoryRepository, HotkeyAction, HotkeyCombo,
     ImageFormat, JsonlHistoryStore, KeyCode, KeyModifiers, MonitorInfo, ScreenCapturer,
-    SqliteHistoryStore, default_sharex_hotkeys, resolve_unique_path,
+    SqliteHistoryStore, UploadRequest, Uploader, WatchedFileEvent, default_sharex_hotkeys,
+    resolve_effective_config, resolve_unique_path,
 };
 use sharex_media::RecordingFormat;
+use sharex_tools::{FallbackOcrChain, OcrEngine, OcrOptions};
 use std::collections::HashMap;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const THUMB_CACHE_CAPACITY: usize = 64;
 const HISTORY_LIMIT: usize = 100;
+const AUTOSTART_APP_NAME: &str = "ShareX-RS";
 
 /// Starts the ShareX-style native desktop application window with global hotkeys.
 pub fn launch_gui(config_path: PathBuf) -> Result<(), eframe::Error> {
-    launch_gui_with_fallback(config_path, AppConfig::default_for_os())
+    launch_gui_with_fallback(config_path, AppConfig::default_for_os(), false)
 }
 
 /// Starts the ShareX-style native desktop window with an explicit fallback config (e.g. portable mode).
 pub fn launch_gui_with_fallback(
     config_path: PathBuf,
     fallback_config: AppConfig,
+    minimized: bool,
 ) -> Result<(), eframe::Error> {
+    let (config, config_warning) =
+        match crate::load_config_with_fallback(&config_path, fallback_config.clone()) {
+            Ok(config) => (config, None),
+            Err(err) => (
+                fallback_config,
+                Some(format!("Loaded fallback config after error: {err}")),
+            ),
+        };
+    let start_minimized = minimized || config.start_minimized;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ShareX (Rust)")
             .with_inner_size([1160.0, 720.0])
-            .with_min_inner_size([860.0, 540.0]),
+            .with_min_inner_size([860.0, 540.0])
+            .with_visible(!start_minimized),
         ..Default::default()
     };
 
@@ -56,7 +78,9 @@ pub fn launch_gui_with_fallback(
             Ok(Box::new(SharexGuiApp::new(
                 cc,
                 config_path,
-                fallback_config,
+                config,
+                config_warning,
+                start_minimized,
             )))
         }),
     )
@@ -70,9 +94,37 @@ enum ActiveView {
     Tools,
     Recording,
     Uploaders,
+    Workflows,
     Hotkeys,
     Settings,
 }
+
+struct CaptureSettings {
+    config: AppConfig,
+    effect_preset: Option<String>,
+}
+
+#[derive(Clone)]
+struct WatchedCapture {
+    event: WatchedFileEvent,
+    move_after: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct CaptureCompletion {
+    entry: HistoryEntry,
+    status: String,
+    record_history: bool,
+    copy_path: bool,
+    watched: Option<WatchedCapture>,
+}
+
+struct CaptureUpload {
+    completion: CaptureCompletion,
+    result: Result<String, String>,
+}
+
+type OcrOutcome = Result<(String, &'static str), String>;
 
 struct SharexGuiApp {
     config_path: PathBuf,
@@ -97,9 +149,18 @@ struct SharexGuiApp {
     tools: ToolsPanelState,
     recording: RecordingPanelState,
     uploaders: UploadersPanelState,
+    toasts: ToastManager,
+    workflows: WorkflowsPanelState,
+    watcher: WatchFolderRuntime,
+    capture_upload_tx: Sender<CaptureUpload>,
+    capture_upload_rx: Receiver<CaptureUpload>,
     overlay: Option<RegionOverlayState>,
+    overlay_capture_settings: Option<CaptureSettings>,
+    ocr_pending: Option<Receiver<OcrOutcome>>,
     pins: PinManager,
     tray: TrayRuntime,
+    force_quit: bool,
+    run_at_startup: bool,
     hotkeys: HotkeyRuntime,
     last_hotkey_retry: Instant,
     capturer: XcapCapturer,
@@ -112,27 +173,22 @@ impl SharexGuiApp {
     fn new(
         cc: &eframe::CreationContext<'_>,
         config_path: PathBuf,
-        fallback_config: AppConfig,
+        mut config: AppConfig,
+        config_warning: Option<String>,
+        start_minimized: bool,
     ) -> Self {
-        let language = UiLanguage::default();
-        let ready_text = i18n::strings(language).ready_status.to_owned();
-        let (mut config, mut initial_status) = if config_path.exists() {
-            match AppConfig::load_or_default(&config_path) {
-                Ok(cfg) => (cfg, ready_text),
-                Err(err) => (
-                    fallback_config,
-                    format!("Loaded fallback config after error: {err}"),
-                ),
-            }
-        } else {
-            (fallback_config, ready_text)
-        };
+        let language = config.ui_language.parse::<UiLanguage>().unwrap_or_default();
+        let mut initial_status =
+            config_warning.unwrap_or_else(|| i18n::strings(language).ready_status.to_owned());
 
         if !config.hotkeys.is_empty() {
             for binding in default_sharex_hotkeys().into_iter().filter(|binding| {
                 matches!(
                     binding.action,
-                    HotkeyAction::RecordVideo | HotkeyAction::RecordGif
+                    HotkeyAction::RecordVideo
+                        | HotkeyAction::RecordGif
+                        | HotkeyAction::CaptureOcr
+                        | HotkeyAction::PickScreenColor
                 )
             }) {
                 if !config
@@ -148,6 +204,17 @@ impl SharexGuiApp {
         apply_sharex_theme(&cc.egui_ctx, config.dark_theme);
         let hotkeys = HotkeyRuntime::new(cc.egui_ctx.clone(), &config.hotkeys);
         let tray = TrayRuntime::new(cc.egui_ctx.clone());
+        if start_minimized {
+            if tray.is_available() {
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+        }
         let capturer = XcapCapturer::new();
         let monitors = capturer.list_monitors().unwrap_or_default();
         let sqlite_path = config.history_path.with_extension("sqlite");
@@ -167,7 +234,17 @@ impl SharexGuiApp {
             }
         };
         let jsonl_history = JsonlHistoryStore::new(&config.history_path);
-        let uploaders = UploadersPanelState::new(&crate::default_mirror_dir(&config));
+        let mut uploaders = UploadersPanelState::new(&crate::default_mirror_dir(&config));
+        uploaders.configure_settings_path(config_path.with_file_name("uploaders.json"));
+        let workflows_path = WorkflowsPanelState::default_path_for_config(&config_path);
+        let workflows =
+            WorkflowsPanelState::load_or_default(&workflows_path).unwrap_or_else(|err| {
+                initial_status.push_str(&format!(" Failed to load workflows: {err}"));
+                WorkflowsPanelState::new()
+            });
+        let watcher =
+            WatchFolderRuntime::new(cc.egui_ctx.clone(), workflows.watch_rules().to_vec());
+        let (capture_upload_tx, capture_upload_rx) = mpsc::channel();
         let output_dir_input = config.output_dir.display().to_string();
         let cache_cap = NonZeroUsize::new(THUMB_CACHE_CAPACITY).expect("non-zero cache capacity");
 
@@ -195,9 +272,18 @@ impl SharexGuiApp {
             tools: ToolsPanelState::new(),
             recording: RecordingPanelState::new(),
             uploaders,
+            toasts: ToastManager::new(),
+            workflows,
+            watcher,
+            capture_upload_tx,
+            capture_upload_rx,
             overlay: None,
+            overlay_capture_settings: None,
+            ocr_pending: None,
             pins: PinManager::new(),
             tray,
+            force_quit: false,
+            run_at_startup: AutostartManager::is_enabled(AUTOSTART_APP_NAME),
             hotkeys,
             last_hotkey_retry: Instant::now(),
             capturer,
@@ -211,6 +297,14 @@ impl SharexGuiApp {
     fn persist_config_silent(&mut self) {
         if let Err(err) = self.config.save(&self.config_path) {
             self.status_line = format!("Failed to save config: {err}");
+        }
+    }
+
+    fn set_language(&mut self, language: UiLanguage) {
+        if self.language != language {
+            self.language = language;
+            self.config.ui_language = language.code().to_owned();
+            self.persist_config_silent();
         }
     }
 
@@ -257,15 +351,14 @@ impl SharexGuiApp {
                 self.capture_source(ctx, CaptureSource::ActiveWindow);
             }
             TrayAction::OpenMainWindow => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                show_main_window(ctx);
             }
             TrayAction::OpenScreenshotsFolder => {
                 let _ = fs::create_dir_all(&self.config.output_dir);
                 open_folder_in_os(&self.config.output_dir);
             }
             TrayAction::Quit => {
+                self.force_quit = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
@@ -274,44 +367,44 @@ impl SharexGuiApp {
     fn trigger_hotkey_event(&mut self, ctx: &egui::Context, event: TriggeredHotkey) {
         match event.action {
             HotkeyAction::CaptureFullscreen => {
-                self.capture_source(ctx, CaptureSource::PrimaryMonitor);
+                let settings = self.capture_settings_for_hotkey(&event.id);
+                self.capture_source_with_settings(ctx, CaptureSource::PrimaryMonitor, settings);
             }
             HotkeyAction::CaptureRegion => {
-                if let Some(snapshot) = event.pre_snapshot {
-                    self.open_region_overlay_with_snapshot(ctx, snapshot);
-                } else {
-                    self.start_region_overlay(ctx);
-                }
+                let settings = self.capture_settings_for_hotkey(&event.id);
+                self.start_overlay(
+                    ctx,
+                    OverlayMode::Capture,
+                    event.pre_snapshot,
+                    Some(settings),
+                );
             }
             HotkeyAction::CaptureActiveWindow => {
-                self.capture_source(ctx, CaptureSource::ActiveWindow);
+                let settings = self.capture_settings_for_hotkey(&event.id);
+                self.capture_source_with_settings(ctx, CaptureSource::ActiveWindow, settings);
             }
             HotkeyAction::CaptureLastRegion => {
-                if let Some(region) = self.config.last_region {
-                    self.capture_source(ctx, CaptureSource::Region { region });
-                } else {
-                    self.status_line =
-                        "No last region saved yet. Starting region selection.".into();
-                    self.start_region_overlay(ctx);
-                }
+                let settings = self.capture_settings_for_hotkey(&event.id);
+                self.capture_last_region(ctx, settings);
             }
             HotkeyAction::OpenEditor => {
                 if self.editor.is_some() {
                     self.active_view = ActiveView::Editor;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    show_main_window(ctx);
                 } else if let Some(first_path) = self
                     .history_entries
                     .iter()
                     .find_map(|e| e.file_path.clone())
                 {
                     self.open_file_in_editor(ctx, &first_path);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    show_main_window(ctx);
                 } else {
                     self.status_line =
                         "No screenshot available to open in the image editor.".into();
                 }
             }
             HotkeyAction::RecordVideo | HotkeyAction::RecordGif => {
+                let settings = self.capture_settings_for_hotkey(&event.id);
                 let format = if event.action == HotkeyAction::RecordVideo {
                     RecordingFormat::Mp4H264
                 } else {
@@ -319,37 +412,93 @@ impl SharexGuiApp {
                 };
                 self.status_line = self
                     .recording
-                    .toggle_hotkey_recording(format, &self.config.output_dir);
+                    .toggle_hotkey_recording(format, &settings.config.output_dir);
                 self.active_view = ActiveView::Recording;
+            }
+            HotkeyAction::CaptureOcr => {
+                self.start_overlay(ctx, OverlayMode::Ocr, event.pre_snapshot, None);
+            }
+            HotkeyAction::PickScreenColor => {
+                self.start_overlay(ctx, OverlayMode::ColorPicker, event.pre_snapshot, None);
             }
         }
     }
 
-    fn open_region_overlay_with_snapshot(
+    fn capture_settings(&self) -> CaptureSettings {
+        CaptureSettings {
+            config: self.config.clone(),
+            effect_preset: None,
+        }
+    }
+
+    fn capture_settings_for_hotkey(&self, hotkey_id: &str) -> CaptureSettings {
+        let registry = self.workflows.registry();
+        CaptureSettings {
+            config: resolve_config_for_hotkey(&self.config, registry, hotkey_id),
+            effect_preset: workflow_for_hotkey(&self.config, registry, hotkey_id)
+                .and_then(|preset| preset.overrides.effect_preset_name.clone()),
+        }
+    }
+
+    fn start_overlay(
         &mut self,
         ctx: &egui::Context,
-        snapshot: DesktopSnapshot,
+        mode: OverlayMode,
+        pre_snapshot: Option<DesktopSnapshot>,
+        capture_settings: Option<CaptureSettings>,
     ) {
-        self.overlay = Some(RegionOverlayState::open(ctx, snapshot));
-        self.status_line =
-            "Region capture active: drag to select, annotate from top bar, Esc to cancel.".into();
+        if self.overlay.is_some() || (mode == OverlayMode::Ocr && self.ocr_pending.is_some()) {
+            return;
+        }
+        let snapshot = pre_snapshot.map_or_else(|| capture_overlay_snapshot(&self.capturer), Ok);
+        match snapshot {
+            Ok(snapshot) => {
+                self.overlay = Some(RegionOverlayState::open_with_mode(ctx, snapshot, mode));
+                self.overlay_capture_settings = capture_settings;
+                self.status_line = match mode {
+                    OverlayMode::Capture => "Select a region to capture. Esc to cancel.",
+                    OverlayMode::Ocr => "Select a region containing text. Esc to cancel.",
+                    OverlayMode::SelectRecordingRegion => {
+                        "Select a region to record. Esc to cancel."
+                    }
+                    OverlayMode::ColorPicker => "Click a pixel to copy its color. Esc to cancel.",
+                }
+                .into();
+                ctx.request_repaint();
+            }
+            Err(err) => self.status_line = format!("Could not capture the desktop: {err}"),
+        }
     }
 
     fn start_region_overlay(&mut self, ctx: &egui::Context) {
-        match self.capturer.capture_primary_snapshot() {
-            Ok(snapshot) => {
-                self.open_region_overlay_with_snapshot(ctx, snapshot);
-            }
-            Err(err) => {
-                self.status_line = format!("Region capture failed: {err}");
-            }
+        self.start_overlay_with_mode(ctx, OverlayMode::Capture);
+    }
+
+    fn start_overlay_with_mode(&mut self, ctx: &egui::Context, mode: OverlayMode) {
+        self.start_overlay(ctx, mode, None, None);
+    }
+
+    fn capture_last_region(&mut self, ctx: &egui::Context, settings: CaptureSettings) {
+        if let Some(region) = self.config.last_region {
+            self.capture_source_with_settings(ctx, CaptureSource::Region { region }, settings);
+        } else {
+            self.start_overlay(ctx, OverlayMode::Capture, None, Some(settings));
         }
     }
 
     fn capture_source(&mut self, ctx: &egui::Context, source: CaptureSource) {
+        self.capture_source_with_settings(ctx, source, self.capture_settings());
+    }
+
+    fn capture_source_with_settings(
+        &mut self,
+        ctx: &egui::Context,
+        source: CaptureSource,
+        settings: CaptureSettings,
+    ) {
         match self.capturer.capture(&source) {
             Ok(image) => {
-                self.commit_captured_image(ctx, image, source, false);
+                self.commit_captured_image(ctx, image, source, settings, false, None);
             }
             Err(err) => {
                 self.status_line = format!("Capture failed: {err}");
@@ -362,26 +511,33 @@ impl SharexGuiApp {
         ctx: &egui::Context,
         image: CapturedImage,
         source: CaptureSource,
+        settings: CaptureSettings,
         force_open_in_editor: bool,
+        watched: Option<WatchedCapture>,
     ) {
-        let mut effect_note = String::new();
-        let image = match self.effects.apply_if_enabled(&image) {
-            Ok(processed) => {
-                if self.effects.apply_on_capture && self.effects.active_preset().is_some() {
-                    effect_note = format!(" [{}]", self.effects.active_preset_name());
-                }
-                processed
-            }
-            Err(err) => {
-                effect_note = format!(" [effect skipped: {err}]");
-                image
-            }
+        let config = settings.config;
+        let preset = match settings.effect_preset.as_deref() {
+            Some(name) => self.effects.preset_by_name(name),
+            None if self.effects.apply_on_capture => self.effects.active_preset(),
+            None => None,
+        };
+        let (image, effect_note) = match preset {
+            Some(preset) => match preset.apply(&image) {
+                Ok(processed) => (processed, format!(" [{}]", preset.name)),
+                Err(err) => (image, format!(" [effect skipped: {err}]")),
+            },
+            None => (
+                image,
+                settings
+                    .effect_preset
+                    .map_or_else(String::new, |name| format!(" [unknown effect: {name}]")),
+            ),
         };
 
         let now = Utc::now();
-        let format = self.config.image_format;
-        let saved_path = if self.config.pipeline.save_to_file {
-            match self.write_new_capture_file(&image, format, now) {
+        let format = config.image_format;
+        let saved_path = if config.pipeline.save_to_file {
+            match write_capture_file(&config, &image, format, now) {
                 Ok(path) => {
                     self.thumbnails.remove(&path);
                     self.failed_thumbs.remove(&path);
@@ -396,66 +552,395 @@ impl SharexGuiApp {
             None
         };
 
-        if self.config.pipeline.copy_image_to_clipboard
+        let target = saved_path
+            .clone()
+            .or_else(|| watched.as_ref().map(|watched| watched.event.path.clone()));
+        let title = if watched.is_some() {
+            "Watched image processed"
+        } else {
+            "Screenshot captured"
+        };
+        let dimensions = format!(
+            "{}x{} ({format}){effect_note}",
+            image.width(),
+            image.height()
+        );
+        let mut status = format!("{title}: {dimensions}");
+        if let Some(path) = &target {
+            status.push_str(&format!(" -> {}", path.display()));
+        }
+        if config.pipeline.copy_image_to_clipboard
             && let Err(err) = self.clipboard.copy_image(&image)
         {
-            self.status_line = format!("Saved capture, but clipboard copy failed: {err}");
+            status.push_str(&format!(". Clipboard copy failed: {err}"));
+        }
+        if watched.is_none() && self.config.play_capture_sound {
+            crate::sound::play_capture_sound();
+        }
+        if self.config.show_toasts {
+            self.toasts
+                .push_capture(ctx, title, dimensions, Some(&image), target.clone(), None);
         }
 
-        if self.config.pipeline.copy_path_to_clipboard
-            && let Some(path) = &saved_path
-        {
-            let _ = self.clipboard.copy_text(&path.display().to_string());
-        }
-
-        let capture_id = CaptureId::from_timestamp(now, image.width() ^ image.height());
-        let history_result = if self.config.pipeline.record_history {
-            let entry = HistoryEntry {
-                id: capture_id,
+        let mut completion = CaptureCompletion {
+            entry: HistoryEntry {
+                id: CaptureId::from_timestamp(now, image.width() ^ image.height()),
                 timestamp: now,
                 source,
                 width: image.width(),
                 height: image.height(),
                 format,
-                file_path: saved_path.clone(),
+                file_path: target,
                 upload_url: None,
                 tags: Vec::new(),
-                note: None,
-            };
-            self.history_repository()
-                .append(&entry)
-                .map(|()| self.select_capture(&entry))
+                note: watched
+                    .as_ref()
+                    .map(|watched| format!("Watch folder: {}", watched.event.path.display())),
+            },
+            status,
+            record_history: config.pipeline.record_history,
+            copy_path: config.pipeline.copy_path_to_clipboard,
+            watched,
+        };
+
+        let upload_started = config.pipeline.uploader_id.as_deref().is_some_and(|id| {
+            match self.start_capture_upload(ctx, &config, &image, &completion, id) {
+                Ok(()) => true,
+                Err(err) => {
+                    completion
+                        .status
+                        .push_str(&format!(". Upload failed: {err}"));
+                    if let Some(watched) = &mut completion.watched {
+                        watched.move_after = None;
+                    }
+                    false
+                }
+            }
+        });
+        if upload_started {
+            self.status_line = format!("{}. Uploading…", completion.status);
         } else {
-            Ok(())
-        };
-
-        self.status_line = match &saved_path {
-            Some(p) => format!(
-                "Captured {}x{} ({}){} -> {}",
-                image.width(),
-                image.height(),
-                format,
-                effect_note,
-                p.display()
-            ),
-            None => format!(
-                "Captured {}x{} ({}){}.",
-                image.width(),
-                image.height(),
-                format,
-                effect_note
-            ),
-        };
-        if let Err(err) = history_result {
-            self.status_line
-                .push_str(&format!(" History update failed: {err}"));
+            self.finish_capture(completion);
         }
-        self.refresh_history();
 
-        if force_open_in_editor || self.config.pipeline.open_in_editor {
+        if force_open_in_editor || config.pipeline.open_in_editor {
             self.editor = Some(EditorViewState::open(ctx, image, saved_path, format));
             self.active_view = ActiveView::Editor;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            show_main_window(ctx);
+        }
+    }
+
+    fn start_capture_upload(
+        &self,
+        ctx: &egui::Context,
+        config: &AppConfig,
+        image: &CapturedImage,
+        completion: &CaptureCompletion,
+        id: &str,
+    ) -> Result<(), String> {
+        let uploader = self
+            .uploaders
+            .workflow_uploader(id)
+            .map_err(|err| err.to_string())?;
+        let format = config.image_format;
+        let stem = capture_filename_stem(config, image, completion.entry.timestamp)?;
+        let file_name = format!("{stem}.{}", format.extension());
+        let completion = completion.clone();
+        let image = image.clone();
+        let sender = self.capture_upload_tx.clone();
+        let ctx = ctx.clone();
+        thread::Builder::new()
+            .name("sharex-workflow-upload".into())
+            .spawn(move || {
+                let result = image.encode(format).and_then(|bytes| {
+                    uploader.upload(&UploadRequest {
+                        file_name,
+                        mime_type: format.mime_type().into(),
+                        bytes,
+                    })
+                });
+                let _ = sender.send(CaptureUpload {
+                    completion,
+                    result: result
+                        .map(|report| report.url)
+                        .map_err(|err| err.to_string()),
+                });
+                ctx.request_repaint();
+            })
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    fn finish_capture(&mut self, mut completion: CaptureCompletion) {
+        if let Some(watched) = completion.watched {
+            if let Some(folder) = watched.move_after.as_deref() {
+                match move_watched_file(&watched.event.path, folder) {
+                    Ok(target) => {
+                        if completion.entry.file_path.as_ref() == Some(&watched.event.path) {
+                            completion.entry.file_path = Some(target);
+                        }
+                    }
+                    Err(err) => completion.status.push_str(&format!(". Move failed: {err}")),
+                }
+            }
+            self.workflows.record_processed_event(watched.event);
+        }
+
+        if completion.copy_path
+            && let Some(text) = completion.entry.upload_url.clone().or_else(|| {
+                completion
+                    .entry
+                    .file_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            })
+            && let Err(err) = self.clipboard.copy_text(&text)
+        {
+            completion
+                .status
+                .push_str(&format!(". Clipboard copy failed: {err}"));
+        }
+        if completion.record_history {
+            match self.history_repository().append(&completion.entry) {
+                Ok(()) => self.select_capture(&completion.entry),
+                Err(err) => completion
+                    .status
+                    .push_str(&format!(". History update failed: {err}")),
+            }
+            self.refresh_history();
+        }
+        self.status_line = completion.status;
+    }
+
+    fn poll_capture_uploads(&mut self, ctx: &egui::Context) {
+        while let Ok(mut upload) = self.capture_upload_rx.try_recv() {
+            match upload.result {
+                Ok(url) => {
+                    upload
+                        .completion
+                        .status
+                        .push_str(&format!(". Uploaded to {url}"));
+                    if self.config.show_toasts {
+                        self.toasts.push_capture(
+                            ctx,
+                            "Upload complete",
+                            &url,
+                            None,
+                            upload.completion.entry.file_path.clone(),
+                            Some(url.clone()),
+                        );
+                    }
+                    upload.completion.entry.upload_url = Some(url);
+                }
+                Err(err) => {
+                    upload
+                        .completion
+                        .status
+                        .push_str(&format!(". Upload failed: {err}"));
+                    if let Some(watched) = &mut upload.completion.watched {
+                        watched.move_after = None;
+                    }
+                }
+            }
+            self.finish_capture(upload.completion);
+        }
+    }
+
+    fn poll_watcher(&mut self, ctx: &egui::Context) {
+        for event in self.watcher.poll_events() {
+            let Some(rule) = self
+                .workflows
+                .watch_rules()
+                .iter()
+                .find(|rule| rule.id == event.rule_id && rule.enabled)
+            else {
+                continue;
+            };
+            let Ok(image) = CapturedImage::load_from_file(&event.path) else {
+                continue;
+            };
+            let mut settings = self.capture_settings();
+            if let Some(id) = event.workflow_id.as_deref() {
+                let Some(preset) = self
+                    .workflows
+                    .registry()
+                    .find_by_id(id)
+                    .filter(|p| p.enabled)
+                else {
+                    self.status_line = format!("Watch folder workflow '{id}' is unavailable.");
+                    continue;
+                };
+                match resolve_effective_config(&self.config, &preset.overrides) {
+                    Ok(config) => settings.config = config,
+                    Err(err) => {
+                        self.status_line = format!("Watch folder workflow '{id}' failed: {err}");
+                        continue;
+                    }
+                }
+                settings
+                    .effect_preset
+                    .clone_from(&preset.overrides.effect_preset_name);
+            }
+            while self.is_watched_directory(&settings.config.output_dir) {
+                settings.config.output_dir.push("Processed");
+            }
+            let move_after = rule.move_after_process.clone();
+            if let Some(folder) = &move_after
+                && self.is_watched_directory(folder)
+            {
+                self.status_line =
+                    format!("Move destination is a watched folder: {}", folder.display());
+                continue;
+            }
+            self.commit_captured_image(
+                ctx,
+                image,
+                CaptureSource::WatchedFile,
+                settings,
+                false,
+                Some(WatchedCapture { event, move_after }),
+            );
+        }
+    }
+
+    fn is_watched_directory(&self, path: &Path) -> bool {
+        let canonical = path.canonicalize().ok();
+        self.workflows.watch_rules().iter().any(|rule| {
+            rule.enabled
+                && (rule.folder == path
+                    || canonical.as_ref().is_some_and(|candidate| {
+                        rule.folder
+                            .canonicalize()
+                            .as_ref()
+                            .is_ok_and(|root| root == candidate)
+                    }))
+        })
+    }
+
+    fn update_overlay(&mut self, ctx: &egui::Context) {
+        let Some(overlay) = self.overlay.as_mut() else {
+            return;
+        };
+        let outcome = overlay.show_mode(ctx);
+        if matches!(outcome, OverlayModeOutcome::Pending) {
+            return;
+        }
+        let closing = self.overlay.take();
+        let capture_settings = self.overlay_capture_settings.take();
+        if let Some(closing) = closing.as_ref()
+            && !matches!(outcome, OverlayModeOutcome::Captured { .. })
+        {
+            closing.restore_previous_focus();
+        }
+
+        match outcome {
+            OverlayModeOutcome::Pending => {}
+            OverlayModeOutcome::Cancelled => {
+                self.status_line = "Region selection cancelled.".into()
+            }
+            OverlayModeOutcome::Captured {
+                image,
+                global_region,
+                open_in_editor,
+            } => {
+                self.config.last_region = Some(global_region);
+                self.persist_config_silent();
+                let settings = capture_settings.unwrap_or_else(|| self.capture_settings());
+                let will_open_editor = open_in_editor || settings.config.pipeline.open_in_editor;
+                self.commit_captured_image(
+                    ctx,
+                    image,
+                    CaptureSource::Region {
+                        region: global_region,
+                    },
+                    settings,
+                    open_in_editor,
+                    None,
+                );
+                if !will_open_editor && let Some(closing) = closing {
+                    closing.restore_previous_focus();
+                }
+            }
+            OverlayModeOutcome::OcrRegion { image, .. } => self.start_ocr(ctx, image),
+            OverlayModeOutcome::RecordingRegion(region) => {
+                self.recording.set_region(Some(region));
+                self.active_view = ActiveView::Recording;
+                self.status_line = format!(
+                    "Recording region selected: {} × {}",
+                    region.width(),
+                    region.height()
+                );
+            }
+            OverlayModeOutcome::ColorPicked { hex, .. } => {
+                self.status_line = match self.clipboard.copy_text(&hex) {
+                    Ok(()) => format!("Copied {hex} to clipboard."),
+                    Err(err) => format!("Picked {hex}. Clipboard copy failed: {err}"),
+                };
+                self.tools.set_picked_color(hex.clone());
+                self.active_view = ActiveView::Tools;
+                if self.config.show_toasts {
+                    self.toasts
+                        .push_capture(ctx, "Screen color picked", hex, None, None, None);
+                }
+            }
+        }
+    }
+
+    fn start_ocr(&mut self, ctx: &egui::Context, image: CapturedImage) {
+        let (sender, receiver) = mpsc::channel();
+        let repaint = ctx.clone();
+        match thread::Builder::new()
+            .name("sharex-region-ocr".into())
+            .spawn(move || {
+                let result = FallbackOcrChain::default()
+                    .recognize(&image, &OcrOptions::default())
+                    .map(|result| (result.text, result.engine_name))
+                    .map_err(|err| err.to_string());
+                let _ = sender.send(result);
+                repaint.request_repaint();
+            }) {
+            Ok(_) => {
+                self.ocr_pending = Some(receiver);
+                self.status_line = i18n::strings(self.language).running_ocr.to_owned();
+            }
+            Err(err) => self.status_line = format!("Could not start OCR: {err}"),
+        }
+    }
+
+    fn poll_ocr(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.ocr_pending.as_ref() else {
+            return;
+        };
+        let s = i18n::strings(self.language);
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(s.ocr_interrupted.to_owned()),
+        };
+        self.ocr_pending = None;
+        match result {
+            Ok((text, engine)) => {
+                self.status_line = if text.trim().is_empty() {
+                    s.ocr_no_text.to_owned()
+                } else {
+                    match self.clipboard.copy_text(&text) {
+                        Ok(()) => {
+                            format!("{} ({engine}). Text copied to clipboard.", s.ocr_completed)
+                        }
+                        Err(err) => format!(
+                            "{} ({engine}). Clipboard copy failed: {err}",
+                            s.ocr_completed
+                        ),
+                    }
+                };
+                self.tools.set_ocr_result(text, engine);
+                self.active_view = ActiveView::Tools;
+            }
+            Err(err) => self.status_line = format!("OCR failed: {err}"),
+        }
+        if self.config.show_toasts {
+            self.toasts
+                .push_capture(ctx, s.ocr_tool, &self.status_line, None, None, None);
         }
     }
 
@@ -465,19 +950,7 @@ impl SharexGuiApp {
         format: ImageFormat,
         now: chrono::DateTime<Utc>,
     ) -> Result<PathBuf, String> {
-        let pattern =
-            FileNamePattern::parse(&self.config.file_name_pattern).map_err(|e| e.to_string())?;
-        let stem = pattern.expand(&FileNameContext {
-            timestamp: now,
-            app_name: "ShareX",
-            width: image.width(),
-            height: image.height(),
-        });
-        fs::create_dir_all(&self.config.output_dir).map_err(|e| e.to_string())?;
-        let path = resolve_unique_path(&self.config.output_dir, &stem, format.extension());
-        let bytes = image.encode(format).map_err(|e| e.to_string())?;
-        fs::write(&path, bytes).map_err(|e| e.to_string())?;
-        Ok(path)
+        write_capture_file(&self.config, image, format, now)
     }
 
     fn open_file_in_editor(&mut self, ctx: &egui::Context, path: &Path) {
@@ -600,10 +1073,7 @@ impl SharexGuiApp {
         }
         match CapturedImage::load_from_file(path) {
             Ok(img) => {
-                let color = egui::ColorImage::from_rgba_unmultiplied(
-                    [img.width() as usize, img.height() as usize],
-                    img.rgba(),
-                );
+                let color = crate::image_texture::bounded_color_image(&img, 256);
                 let tex = ctx.load_texture(
                     format!("thumb_{}", path.display()),
                     color,
@@ -636,14 +1106,14 @@ impl SharexGuiApp {
                     .on_hover_text(UiLanguage::Pl.display_name())
                     .clicked()
                 {
-                    self.language = UiLanguage::Pl;
+                    self.set_language(UiLanguage::Pl);
                 }
                 if ui
                     .selectable_label(self.language == UiLanguage::En, "EN")
                     .on_hover_text(UiLanguage::En.display_name())
                     .clicked()
                 {
-                    self.language = UiLanguage::En;
+                    self.set_language(UiLanguage::En);
                 }
             });
         });
@@ -691,13 +1161,7 @@ impl SharexGuiApp {
                     &self.hotkey_hint(HotkeyAction::CaptureLastRegion),
                     p,
                 ) {
-                    self.trigger_hotkey_event(
-                        ctx,
-                        TriggeredHotkey {
-                            action: HotkeyAction::CaptureLastRegion,
-                            pre_snapshot: None,
-                        },
-                    );
+                    self.capture_last_region(ctx, self.capture_settings());
                 }
 
                 ui.add_space(4.0);
@@ -808,6 +1272,14 @@ impl SharexGuiApp {
                 ) {
                     self.active_view = ActiveView::Uploaders;
                     self.refresh_history();
+                }
+                if sidebar_nav_button(
+                    ui,
+                    s.workflows,
+                    self.active_view == ActiveView::Workflows,
+                    p,
+                ) {
+                    self.active_view = ActiveView::Workflows;
                 }
                 if sidebar_nav_button(
                     ui,
@@ -1396,6 +1868,40 @@ impl SharexGuiApp {
         }
     }
 
+    fn render_workflows_view(&mut self, ui: &mut egui::Ui, p: &SharexPalette) {
+        if let Some(err) = self.watcher.last_error() {
+            ui.colored_label(p.warning, err);
+        }
+        let path = WorkflowsPanelState::default_path_for_config(&self.config_path);
+        match self.workflows.show(
+            ui,
+            p,
+            &path,
+            self.watcher.watched_count(),
+            self.watcher.is_active(),
+        ) {
+            WorkflowsUiAction::None => {}
+            WorkflowsUiAction::RulesChanged(rules) => self.watcher.sync_rules(rules),
+            WorkflowsUiAction::Saved(message) => {
+                self.watcher
+                    .sync_rules(self.workflows.watch_rules().to_vec());
+                self.status_line = message;
+            }
+        }
+    }
+
+    fn set_autostart(&mut self, enabled: bool) -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+        AutostartManager::set_enabled(
+            AUTOSTART_APP_NAME,
+            &exe,
+            self.config.start_minimized,
+            enabled,
+        )?;
+        self.run_at_startup = enabled;
+        Ok(())
+    }
+
     fn render_settings_view(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p: &SharexPalette) {
         let s = i18n::strings(self.language);
 
@@ -1485,7 +1991,7 @@ impl SharexGuiApp {
                             .selectable_label(self.language == lang, lang.display_name())
                             .clicked()
                         {
-                            self.language = lang;
+                            self.set_language(lang);
                         }
                     }
                 });
@@ -1497,13 +2003,43 @@ impl SharexGuiApp {
             self.theme_applied_dark = self.config.dark_theme;
         }
 
+        ui.add_space(8.0);
+        ui.checkbox(&mut self.config.show_toasts, s.toast_notifications);
+        ui.checkbox(&mut self.config.play_capture_sound, s.capture_sound);
+        ui.add_enabled(
+            self.tray.is_available(),
+            egui::Checkbox::new(&mut self.config.close_to_tray, s.close_to_tray),
+        );
+        ui.checkbox(&mut self.config.start_minimized, s.start_minimized);
+        let mut next = self.run_at_startup;
+        if ui
+            .add_enabled(
+                cfg!(target_os = "windows"),
+                egui::Checkbox::new(&mut next, s.run_at_startup),
+            )
+            .changed()
+            && let Err(err) = self.set_autostart(next)
+        {
+            self.status_line = format!("Could not change startup registration: {err}");
+        }
+
         ui.add_space(14.0);
         let save_btn =
             egui::Button::new(RichText::new(s.save_settings).color(Color32::WHITE)).fill(p.accent);
         if ui.add(save_btn).clicked() {
             self.config.output_dir = PathBuf::from(self.output_dir_input.trim());
             self.status_line = match self.config.save(&self.config_path) {
-                Ok(()) => format!("Saved settings to {}", self.config_path.display()),
+                Ok(()) => {
+                    if self.run_at_startup
+                        && let Err(err) = self.set_autostart(true)
+                    {
+                        format!(
+                            "Settings saved, but startup registration could not be updated: {err}"
+                        )
+                    } else {
+                        format!("Saved settings to {}", self.config_path.display())
+                    }
+                }
                 Err(err) => format!("Failed to save settings: {err}"),
             };
         }
@@ -1517,9 +2053,6 @@ impl eframe::App for SharexGuiApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.uploaders.poll_upload(&self.clipboard);
-        if self.uploaders.is_uploading() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
 
         if self.hotkeys.has_conflicts() {
             if self.last_hotkey_retry.elapsed() >= Duration::from_secs(2) {
@@ -1532,50 +2065,32 @@ impl eframe::App for SharexGuiApp {
         for action in self.tray.poll_actions() {
             self.handle_tray_action(ctx, action);
         }
+        if ctx.input(|input| input.viewport().close_requested())
+            && self.config.close_to_tray
+            && !self.force_quit
+            && self.tray.is_available()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
 
         let pending_actions = self.hotkeys.poll_actions();
         for event in pending_actions {
             self.trigger_hotkey_event(ctx, event);
         }
 
-        if let Some(overlay) = self.overlay.as_mut() {
-            match overlay.show(ctx) {
-                OverlayOutcome::Pending => {}
-                OverlayOutcome::Cancelled => {
-                    if let Some(closing) = self.overlay.take() {
-                        closing.restore_previous_focus();
-                    }
-                    self.status_line = "Region capture cancelled.".into();
-                }
-                OverlayOutcome::Captured {
-                    image,
-                    global_region,
-                    open_in_editor,
-                } => {
-                    let closing = self.overlay.take();
-                    self.config.last_region = Some(global_region);
-                    self.persist_config_silent();
-                    let will_open_editor = open_in_editor || self.config.pipeline.open_in_editor;
-                    self.commit_captured_image(
-                        ctx,
-                        image,
-                        CaptureSource::Region {
-                            region: global_region,
-                        },
-                        open_in_editor,
-                    );
-                    if !will_open_editor && let Some(prev) = closing {
-                        prev.restore_previous_focus();
-                    }
-                }
-            }
-        }
+        self.update_overlay(ctx);
+        self.poll_ocr(ctx);
+        self.poll_capture_uploads(ctx);
+        self.poll_watcher(ctx);
 
         if let Some(msg) = self.recording.poll_finalize() {
             self.status_line = msg;
         }
-        if self.recording.is_finalizing() {
-            ctx.request_repaint_after(Duration::from_millis(100));
+        if self.recording.is_recording()
+            && let Some(msg) = self.recording.show_hud(ctx)
+        {
+            self.status_line = msg;
         }
 
         self.pins.show_all(ctx);
@@ -1660,10 +2175,102 @@ impl eframe::App for SharexGuiApp {
                 ActiveView::Tools => self.render_tools_view(ctx, ui, &p),
                 ActiveView::Recording => self.render_recording_view(ctx, ui, &p),
                 ActiveView::Uploaders => self.render_uploaders_view(ui, &p),
+                ActiveView::Workflows => self.render_workflows_view(ui, &p),
                 ActiveView::Hotkeys => self.render_hotkeys_view(ui, &p),
                 ActiveView::Settings => self.render_settings_view(ctx, ui, &p),
             });
+
+        if self.tools.take_pick_color_request() {
+            self.start_overlay_with_mode(ctx, OverlayMode::ColorPicker);
+        }
+        if self.tools.take_ocr_region_request() {
+            self.start_overlay_with_mode(ctx, OverlayMode::Ocr);
+        }
+        if self.recording.take_select_region_request() {
+            self.start_overlay_with_mode(ctx, OverlayMode::SelectRecordingRegion);
+        }
+
+        if !self.config.show_toasts {
+            self.toasts.dismiss_all();
+        }
+        match self.toasts.show_all(ctx, self.config.dark_theme) {
+            ToastAction::None => {}
+            ToastAction::OpenPath(path) => {
+                open_folder_in_os(if path.is_file() {
+                    path.parent().unwrap_or(&path)
+                } else {
+                    &path
+                });
+            }
+            ToastAction::OpenUrl(url) => {
+                if url.starts_with("https://") || url.starts_with("http://") {
+                    ctx.open_url(egui::OpenUrl::new_tab(url));
+                }
+            }
+        }
+
+        if self.recording.is_recording()
+            || self.recording.is_finalizing()
+            || self.uploaders.is_uploading()
+            || self.ocr_pending.is_some()
+        {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
+}
+
+pub(crate) fn capture_overlay_snapshot(
+    capturer: &XcapCapturer,
+) -> Result<DesktopSnapshot, sharex_core::CoreError> {
+    capturer
+        .capture_virtual_desktop()
+        .or_else(|_| capturer.capture_primary_snapshot())
+}
+
+fn show_main_window(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+}
+
+fn capture_filename_stem(
+    config: &AppConfig,
+    image: &CapturedImage,
+    now: chrono::DateTime<Utc>,
+) -> Result<String, String> {
+    Ok(FileNamePattern::parse(&config.file_name_pattern)
+        .map_err(|err| err.to_string())?
+        .expand(&FileNameContext {
+            timestamp: now,
+            app_name: "ShareX",
+            width: image.width(),
+            height: image.height(),
+        }))
+}
+
+fn write_capture_file(
+    config: &AppConfig,
+    image: &CapturedImage,
+    format: ImageFormat,
+    now: chrono::DateTime<Utc>,
+) -> Result<PathBuf, String> {
+    let stem = capture_filename_stem(config, image, now)?;
+    fs::create_dir_all(&config.output_dir).map_err(|err| err.to_string())?;
+    let path = resolve_unique_path(&config.output_dir, &stem, format.extension());
+    let bytes = image.encode(format).map_err(|err| err.to_string())?;
+    fs::write(&path, bytes).map_err(|err| err.to_string())?;
+    Ok(path)
+}
+
+fn move_watched_file(path: &Path, folder: &Path) -> Result<PathBuf, std::io::Error> {
+    let name = path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
+    fs::create_dir_all(folder)?;
+    let target = folder.join(name);
+    if target.exists() {
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    fs::rename(path, &target)?;
+    Ok(target)
 }
 
 fn first_existing_capture_path(entries: &[HistoryEntry]) -> Option<&Path> {

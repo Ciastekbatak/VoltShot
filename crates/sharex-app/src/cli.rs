@@ -24,6 +24,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub portable: bool,
 
+    /// Start the desktop window minimized or hidden in the system tray.
+    #[arg(long, global = true)]
+    pub minimized: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -436,6 +440,21 @@ mod tests {
         assert!(out.contains("id=7"));
         assert!(out.contains("1920x1080"));
         assert!(out.contains("[primary]"));
+    }
+
+    #[test]
+    fn cli_accepts_minimized_before_and_after_gui_subcommand() {
+        for args in [
+            ["sharex", "--minimized", "gui"],
+            ["sharex", "gui", "--minimized"],
+        ] {
+            let parsed = Cli::try_parse_from(args).expect("parse minimized GUI");
+            assert!(parsed.minimized);
+            assert!(matches!(parsed.command, Some(Command::Gui)));
+        }
+        let parsed = Cli::try_parse_from(["sharex", "--minimized"]).expect("parse minimized");
+        assert!(parsed.minimized);
+        assert!(parsed.command.is_none());
     }
 
     #[test]

@@ -80,6 +80,14 @@ impl EffectsPanelState {
         }
     }
 
+    pub(crate) fn preset_by_name(&self, name: &str) -> Option<&EffectPreset> {
+        self.presets
+            .iter()
+            .chain(&self.extended_presets)
+            .chain(std::iter::once(&self.custom))
+            .find(|preset| preset.name == name)
+    }
+
     fn custom_index(&self) -> usize {
         self.presets.len() + self.extended_presets.len()
     }

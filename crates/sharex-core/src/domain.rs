@@ -236,6 +236,7 @@ pub enum CaptureSource {
     Monitor { id: MonitorId },
     Window { id: WindowId },
     Region { region: Region },
+    WatchedFile,
 }
 
 /// Output encoding format for saved or uploaded captures.

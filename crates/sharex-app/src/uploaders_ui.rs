@@ -294,7 +294,11 @@ impl UploadersPanelState {
     }
 
     fn upload_target(&self) -> Result<UploadTarget, CoreError> {
-        let uploader: Box<dyn Uploader> = match self.destination {
+        self.upload_target_for(self.destination)
+    }
+
+    fn upload_target_for(&self, destination: &str) -> Result<UploadTarget, CoreError> {
+        let uploader: Box<dyn Uploader> = match destination {
             LOCAL_MIRROR => {
                 let folder = self.mirror_folder.trim();
                 if folder.is_empty() {
@@ -326,6 +330,17 @@ impl UploadersPanelState {
             }
         };
         Ok(UploadTarget::Uploader(uploader))
+    }
+
+    pub(crate) fn workflow_uploader(&self, id: &str) -> Result<impl Uploader + use<>, CoreError> {
+        let id = DESTINATIONS
+            .into_iter()
+            .find(|destination| *destination == id)
+            .ok_or_else(|| CoreError::UnknownUploader(id.to_owned()))?;
+        Ok(SelectedUploader {
+            id,
+            target: self.upload_target_for(id)?,
+        })
     }
 
     fn start_upload(&mut self, path: &Path) -> Result<(), CoreError> {

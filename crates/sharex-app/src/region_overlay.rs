@@ -234,12 +234,9 @@ impl RegionOverlayState {
                 height: primary.height as f32,
             })
         });
-        let color_img = egui::ColorImage::from_rgba_unmultiplied(
-            [
-                snapshot.image.width() as usize,
-                snapshot.image.height() as usize,
-            ],
-            snapshot.image.rgba(),
+        let color_img = crate::image_texture::bounded_color_image(
+            &snapshot.image,
+            ctx.input(|input| input.max_texture_side),
         );
         let texture = ctx.load_texture(
             "sharex_region_overlay_backdrop",

@@ -1891,10 +1891,8 @@ fn load_editor_texture(
     image: &CapturedImage,
     version: u64,
 ) -> egui::TextureHandle {
-    let color = egui::ColorImage::from_rgba_unmultiplied(
-        [image.width() as usize, image.height() as usize],
-        image.rgba(),
-    );
+    let color =
+        crate::image_texture::bounded_color_image(image, ctx.input(|input| input.max_texture_side));
     ctx.load_texture(
         format!("sharex_editor_canvas_{version}"),
         color,

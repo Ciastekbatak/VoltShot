@@ -24,6 +24,7 @@ fn compiled_binary_serves_help_uploaders_config_history_and_hotkeys_commands() {
     assert!(help_text.contains("history"));
     assert!(help_text.contains("hotkeys"));
     assert!(help_text.contains("gui"));
+    assert!(help_text.contains("--minimized"));
 
     let uploaders = Command::new(bin)
         .args(["--config", cfg_path.to_str().expect("utf8"), "uploaders"])
@@ -68,4 +69,6 @@ fn compiled_binary_serves_help_uploaders_config_history_and_hotkeys_commands() {
     assert!(hk_text.contains("PrintScreen"));
     assert!(hk_text.contains("Ctrl + PrintScreen"));
     assert!(hk_text.contains("Alt + PrintScreen"));
+    assert!(hk_text.contains("Ctrl + Shift + O"));
+    assert!(hk_text.contains("Ctrl + Shift + C"));
 }

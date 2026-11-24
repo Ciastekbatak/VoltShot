@@ -14,10 +14,12 @@ pub enum HotkeyAction {
     OpenEditor,
     RecordVideo,
     RecordGif,
+    CaptureOcr,
+    PickScreenColor,
 }
 
 impl HotkeyAction {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::CaptureFullscreen,
         Self::CaptureRegion,
         Self::CaptureActiveWindow,
@@ -25,6 +27,8 @@ impl HotkeyAction {
         Self::OpenEditor,
         Self::RecordVideo,
         Self::RecordGif,
+        Self::CaptureOcr,
+        Self::PickScreenColor,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -36,6 +40,8 @@ impl HotkeyAction {
             Self::OpenEditor => "Open image editor",
             Self::RecordVideo => "Record screen (MP4)",
             Self::RecordGif => "Record screen (GIF)",
+            Self::CaptureOcr => "Capture text (OCR)",
+            Self::PickScreenColor => "Screen color picker",
         }
     }
 }
@@ -474,6 +480,32 @@ pub fn default_sharex_hotkeys() -> Vec<HotkeyBinding> {
             )),
             enabled: true,
         },
+        HotkeyBinding {
+            id: "capture-ocr".into(),
+            action: HotkeyAction::CaptureOcr,
+            combo: Some(HotkeyCombo::new(
+                KeyModifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..KeyModifiers::NONE
+                },
+                KeyCode::KeyO,
+            )),
+            enabled: true,
+        },
+        HotkeyBinding {
+            id: "pick-screen-color".into(),
+            action: HotkeyAction::PickScreenColor,
+            combo: Some(HotkeyCombo::new(
+                KeyModifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..KeyModifiers::NONE
+                },
+                KeyCode::KeyC,
+            )),
+            enabled: true,
+        },
     ]
 }
 
@@ -499,7 +531,15 @@ mod tests {
     #[test]
     fn default_hotkeys_include_standard_sharex_bindings() {
         let defaults = default_sharex_hotkeys();
-        assert_eq!(defaults.len(), 7);
+        assert_eq!(defaults.len(), 9);
+        assert!(
+            defaults
+                .iter()
+                .map(|binding| binding.action)
+                .eq(HotkeyAction::ALL)
+        );
+        assert_eq!(HotkeyAction::CaptureOcr.label(), "Capture text (OCR)");
+        assert_eq!(HotkeyAction::PickScreenColor.label(), "Screen color picker");
         assert_eq!(
             defaults[0].combo.map(|c| c.to_string()).as_deref(),
             Some("PrintScreen")
@@ -528,6 +568,18 @@ mod tests {
                 "record-gif",
                 HotkeyAction::RecordGif,
                 "Alt + Shift + PrintScreen",
+            ),
+            (
+                &defaults[7],
+                "capture-ocr",
+                HotkeyAction::CaptureOcr,
+                "Ctrl + Shift + O",
+            ),
+            (
+                &defaults[8],
+                "pick-screen-color",
+                HotkeyAction::PickScreenColor,
+                "Ctrl + Shift + C",
             ),
         ] {
             assert_eq!(binding.id, id);

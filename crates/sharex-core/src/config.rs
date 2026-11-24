@@ -33,8 +33,12 @@ impl Default for PipelineConfig {
     }
 }
 
-fn default_dark_theme() -> bool {
+fn default_true() -> bool {
     true
+}
+
+fn default_ui_language() -> String {
+    "en".into()
 }
 
 /// Persisted application configuration.
@@ -49,8 +53,18 @@ pub struct AppConfig {
     pub hotkeys: Vec<HotkeyBinding>,
     #[serde(default)]
     pub last_region: Option<Region>,
-    #[serde(default = "default_dark_theme")]
+    #[serde(default = "default_true")]
     pub dark_theme: bool,
+    #[serde(default = "default_true")]
+    pub show_toasts: bool,
+    #[serde(default)]
+    pub close_to_tray: bool,
+    #[serde(default)]
+    pub start_minimized: bool,
+    #[serde(default)]
+    pub play_capture_sound: bool,
+    #[serde(default = "default_ui_language")]
+    pub ui_language: String,
 }
 
 impl AppConfig {
@@ -74,6 +88,11 @@ impl AppConfig {
             hotkeys: default_sharex_hotkeys(),
             last_region: None,
             dark_theme: true,
+            show_toasts: true,
+            close_to_tray: false,
+            start_minimized: false,
+            play_capture_sound: false,
+            ui_language: default_ui_language(),
         }
     }
 
@@ -94,6 +113,11 @@ impl AppConfig {
             hotkeys: default_sharex_hotkeys(),
             last_region: None,
             dark_theme: true,
+            show_toasts: true,
+            close_to_tray: false,
+            start_minimized: false,
+            play_capture_sound: false,
+            ui_language: default_ui_language(),
         }
     }
 
@@ -150,10 +174,40 @@ mod tests {
         cfg.image_format = ImageFormat::Webp;
         cfg.pipeline.copy_path_to_clipboard = true;
         cfg.pipeline.uploader_id = Some("local-mirror".into());
+        cfg.show_toasts = false;
+        cfg.close_to_tray = true;
+        cfg.start_minimized = true;
+        cfg.play_capture_sound = true;
+        cfg.ui_language = "pl".into();
 
         cfg.save(&cfg_path).expect("save config");
         let loaded = AppConfig::load_or_default(&cfg_path).expect("load config");
         assert_eq!(loaded, cfg);
+    }
+
+    #[test]
+    fn legacy_toml_defaults_desktop_preferences() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+output_dir = "Screenshots"
+file_name_pattern = "ShareX_%y-%mo-%d"
+image_format = "png"
+history_path = "history.jsonl"
+
+[pipeline]
+save_to_file = true
+copy_image_to_clipboard = true
+copy_path_to_clipboard = false
+record_history = true
+"#,
+        )
+        .expect("legacy config");
+        assert!(cfg.dark_theme);
+        assert!(cfg.show_toasts);
+        assert!(!cfg.close_to_tray);
+        assert!(!cfg.start_minimized);
+        assert!(!cfg.play_capture_sound);
+        assert_eq!(cfg.ui_language, "en");
     }
 
     #[test]

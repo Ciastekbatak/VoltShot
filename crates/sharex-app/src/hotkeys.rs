@@ -9,6 +9,7 @@ pub enum HotkeyStatus {
 
 /// Global hotkey event delivered to the GUI loop, optionally carrying a pre-focus screen snapshot.
 pub struct TriggeredHotkey {
+    pub id: String,
     pub action: sharex_core::HotkeyAction,
     pub pre_snapshot: Option<sharex_capture::DesktopSnapshot>,
 }
@@ -146,7 +147,7 @@ mod platform {
         }
         let tid = unsafe { GetCurrentThreadId() };
 
-        let mut registered: HashMap<i32, HotkeyAction> = HashMap::new();
+        let mut registered = HashMap::new();
         apply_win32_bindings(&desired, &statuses, &mut registered);
         let _ = ready_tx.send(tid);
 
@@ -158,24 +159,26 @@ mod platform {
             match msg.message {
                 WM_HOTKEY => {
                     let id = msg.wParam as i32;
-                    if let Some(&action) = registered.get(&id) {
+                    if let Some((binding_id, action)) = registered.get(&id) {
                         win_focus::allow_self_foreground();
-                        let pre_snapshot = if action == HotkeyAction::CaptureRegion {
-                            let snap = XcapCapturer::new().capture_primary_snapshot().ok();
+                        let pre_snapshot = if matches!(
+                            action,
+                            HotkeyAction::CaptureRegion
+                                | HotkeyAction::CaptureOcr
+                                | HotkeyAction::PickScreenColor
+                        ) {
+                            let snap =
+                                crate::gui::capture_overlay_snapshot(&XcapCapturer::new()).ok();
                             win_focus::release_cursor_clip();
                             snap
                         } else {
                             None
                         };
                         let _ = action_tx.send(TriggeredHotkey {
-                            action,
+                            id: binding_id.clone(),
+                            action: *action,
                             pre_snapshot,
                         });
-                        if action == HotkeyAction::CaptureRegion
-                            || action == HotkeyAction::OpenEditor
-                        {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                        }
                         ctx.request_repaint();
                     }
                 }
@@ -197,7 +200,7 @@ mod platform {
     fn apply_win32_bindings(
         desired: &Arc<Mutex<Vec<HotkeyBinding>>>,
         statuses: &Arc<Mutex<HashMap<String, HotkeyStatus>>>,
-        registered: &mut HashMap<i32, HotkeyAction>,
+        registered: &mut HashMap<i32, (String, HotkeyAction)>,
     ) {
         for id in registered.keys() {
             unsafe {
@@ -223,7 +226,7 @@ mod platform {
             let (mods, vk) = to_win32_hotkey(combo);
             let ok = unsafe { RegisterHotKey(ptr::null_mut(), win_id, mods, vk) };
             if ok != 0 {
-                registered.insert(win_id, binding.action);
+                registered.insert(win_id, (binding.id.clone(), binding.action));
                 next_statuses.insert(binding.id.clone(), HotkeyStatus::Active);
             } else {
                 let err = std::io::Error::last_os_error();
@@ -370,7 +373,7 @@ mod platform {
         manager: Option<GlobalHotKeyManager>,
         init_error: Option<String>,
         registered: Vec<HotKey>,
-        id_to_action: HashMap<u32, HotkeyAction>,
+        id_to_binding: HashMap<u32, (String, HotkeyAction)>,
         statuses: HashMap<String, HotkeyStatus>,
         rx: Receiver<u32>,
     }
@@ -397,7 +400,7 @@ mod platform {
                 manager,
                 init_error,
                 registered: Vec::new(),
-                id_to_action: HashMap::new(),
+                id_to_binding: HashMap::new(),
                 statuses: HashMap::new(),
                 rx,
             };
@@ -411,7 +414,7 @@ mod platform {
                     let _ = manager.unregister(existing);
                 }
             }
-            self.id_to_action.clear();
+            self.id_to_binding.clear();
             self.statuses.clear();
 
             for binding in bindings {
@@ -438,7 +441,8 @@ mod platform {
                 let hotkey = to_global_hotkey(combo);
                 match manager.register(hotkey) {
                     Ok(()) => {
-                        self.id_to_action.insert(hotkey.id(), binding.action);
+                        self.id_to_binding
+                            .insert(hotkey.id(), (binding.id.clone(), binding.action));
                         self.registered.push(hotkey);
                         self.statuses
                             .insert(binding.id.clone(), HotkeyStatus::Active);
@@ -466,9 +470,10 @@ mod platform {
         pub fn poll_actions(&self) -> Vec<TriggeredHotkey> {
             let mut actions = Vec::new();
             while let Ok(id) = self.rx.try_recv() {
-                if let Some(action) = self.id_to_action.get(&id).copied() {
+                if let Some((binding_id, action)) = self.id_to_binding.get(&id) {
                     actions.push(TriggeredHotkey {
-                        action,
+                        id: binding_id.clone(),
+                        action: *action,
                         pre_snapshot: None,
                     });
                 }
