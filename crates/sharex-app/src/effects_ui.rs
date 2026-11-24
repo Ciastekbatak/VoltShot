@@ -2,18 +2,26 @@ use crate::i18n::Strings;
 use crate::theme::SharexPalette;
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 use sharex_core::CapturedImage;
-use sharex_effects::{EffectPreset, ImageEffect, apply_effects, builtin_presets};
+use sharex_effects::{
+    EffectColor, EffectPreset, ImageEffect, WatermarkAnchor, apply_effects, builtin_presets,
+    extended_presets,
+};
 use std::path::{Path, PathBuf};
 
 /// Interactive Image Effects preset selector and live preview panel state.
 pub struct EffectsPanelState {
     presets: Vec<EffectPreset>,
+    extended_presets: Vec<EffectPreset>,
+    custom: EffectPreset,
     selected_preset_idx: Option<usize>,
+    preset_toml: String,
+    toml_status: Option<String>,
     pub apply_on_capture: bool,
     use_latest_capture: bool,
     preview_texture: Option<egui::TextureHandle>,
     preview_dims: Option<(u32, u32)>,
     preview_key: Option<(Option<usize>, Option<PathBuf>)>,
+    preview_source: Option<(Option<PathBuf>, CapturedImage)>,
     preview_error: Option<String>,
 }
 
@@ -25,18 +33,29 @@ impl Default for EffectsPanelState {
 
 impl EffectsPanelState {
     pub fn new() -> Self {
+        let presets = builtin_presets();
         Self {
-            presets: builtin_presets(),
+            extended_presets: extended_presets().into_iter().skip(presets.len()).collect(),
+            presets,
+            custom: EffectPreset {
+                name: "Custom Pipeline".into(),
+                enabled: true,
+                effects: Vec::new(),
+            },
             selected_preset_idx: Some(0),
+            preset_toml: String::new(),
+            toml_status: None,
             apply_on_capture: false,
             use_latest_capture: false,
             preview_texture: None,
             preview_dims: None,
             preview_key: None,
+            preview_source: None,
             preview_error: None,
         }
     }
 
+    /// Returns the original built-in catalog; the panel also shows supplemental and custom presets.
     pub fn presets(&self) -> &[EffectPreset] {
         &self.presets
     }
@@ -46,12 +65,61 @@ impl EffectsPanelState {
     }
 
     pub fn set_selected_preset_idx(&mut self, idx: Option<usize>) {
-        self.selected_preset_idx = idx.filter(|&i| i < self.presets.len());
+        self.selected_preset_idx = idx.filter(|&index| index <= self.custom_index());
     }
 
     pub fn active_preset(&self) -> Option<&EffectPreset> {
-        self.selected_preset_idx
-            .and_then(|idx| self.presets.get(idx))
+        let index = self.selected_preset_idx?;
+        if index == self.custom_index() {
+            Some(&self.custom)
+        } else {
+            self.presets()
+                .iter()
+                .chain(&self.extended_presets)
+                .nth(index)
+        }
+    }
+
+    fn custom_index(&self) -> usize {
+        self.presets.len() + self.extended_presets.len()
+    }
+
+    fn editable_pipeline(&mut self) -> &mut EffectPreset {
+        if self.selected_preset_idx != Some(self.custom_index()) {
+            self.custom.effects = self
+                .active_preset()
+                .map_or_else(Vec::new, |preset| preset.effects.clone());
+            self.custom.name = "Custom Pipeline".into();
+            self.custom.enabled = true;
+            self.selected_preset_idx = Some(self.custom_index());
+        }
+        self.preview_key = None;
+        &mut self.custom
+    }
+
+    fn edit_pipeline(&mut self, edit: PipelineEdit) {
+        let effects = &mut self.editable_pipeline().effects;
+        match edit {
+            PipelineEdit::Add(effect) => effects.push(effect),
+            PipelineEdit::Move { from, to } => effects.swap(from, to),
+            PipelineEdit::Remove(index) => {
+                effects.remove(index);
+            }
+        }
+    }
+
+    fn export_preset_toml(&self) -> Result<String, String> {
+        self.active_preset()
+            .ok_or_else(|| "Select a preset to export.".to_owned())?
+            .to_toml()
+            .map_err(|err| err.to_string())
+    }
+
+    fn import_preset_toml(&mut self, toml: &str) -> Result<(), String> {
+        self.custom = EffectPreset::from_toml(toml).map_err(|err| err.to_string())?;
+        self.selected_preset_idx = Some(self.custom_index());
+        self.preview_key = None;
+        Ok(())
     }
 
     pub fn active_preset_name(&self) -> &str {
@@ -68,7 +136,7 @@ impl EffectsPanelState {
         let Some(preset) = self.active_preset() else {
             return Ok(image.clone());
         };
-        apply_effects(image, &preset.effects).map_err(|err| err.to_string())
+        preset.apply(image).map_err(|err| err.to_string())
     }
 
     pub fn show(
@@ -101,7 +169,7 @@ impl EffectsPanelState {
         ui.separator();
 
         ui.columns(2, |columns| {
-            columns[0].vertical(|ui| {
+            egui::ScrollArea::vertical().show(&mut columns[0], |ui| {
                 ui.label(
                     RichText::new("PRESETS")
                         .size(11.0)
@@ -117,8 +185,9 @@ impl EffectsPanelState {
                 ui.add_space(4.0);
 
                 let preset_summaries: Vec<(String, String)> = self
-                    .presets
+                    .presets()
                     .iter()
+                    .chain(&self.extended_presets)
                     .map(|preset| (preset.name.clone(), summarize_preset(preset)))
                     .collect();
 
@@ -130,9 +199,20 @@ impl EffectsPanelState {
                     ui.add_space(4.0);
                 }
 
+                let custom_index = self.custom_index();
+                if preset_row(
+                    ui,
+                    &self.custom.name,
+                    "Editable custom pipeline",
+                    self.selected_preset_idx == Some(custom_index),
+                    p,
+                ) {
+                    self.selected_preset_idx = Some(custom_index);
+                }
+
                 ui.add_space(10.0);
                 ui.label(
-                    RichText::new("EFFECT PIPELINE")
+                    RichText::new("CUSTOM PIPELINE BUILDER")
                         .size(11.0)
                         .strong()
                         .color(p.text_muted),
@@ -145,26 +225,10 @@ impl EffectsPanelState {
                     .corner_radius(CornerRadius::same(5))
                     .inner_margin(Margin::same(10))
                     .show(ui, |ui| {
-                        if let Some(preset) = self.active_preset() {
-                            for (step, effect) in preset.effects.iter().enumerate() {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{}. {}",
-                                        step + 1,
-                                        describe_effect(effect)
-                                    ))
-                                    .size(12.5)
-                                    .color(p.text_primary),
-                                );
-                            }
-                        } else {
-                            ui.label(
-                                RichText::new("No effects will be applied.")
-                                    .size(12.5)
-                                    .color(p.text_muted),
-                            );
-                        }
+                        self.show_pipeline(ui);
                     });
+
+                self.show_preset_toml(ui, p);
             });
 
             columns[1].vertical(|ui| {
@@ -180,10 +244,8 @@ impl EffectsPanelState {
                         if ui
                             .add_enabled(
                                 has_latest,
-                                egui::SelectableLabel::new(
-                                    self.use_latest_capture && has_latest,
-                                    "Latest capture",
-                                ),
+                                egui::Button::new("Latest capture")
+                                    .selected(self.use_latest_capture && has_latest),
                             )
                             .clicked()
                         {
@@ -252,6 +314,135 @@ impl EffectsPanelState {
         status_msg
     }
 
+    fn show_pipeline(&mut self, ui: &mut egui::Ui) {
+        let editing = self.selected_preset_idx == Some(self.custom_index());
+        if !editing
+            && self.active_preset().is_some()
+            && ui
+                .button("Edit a copy")
+                .on_hover_text("Copy this preset over the current custom pipeline")
+                .clicked()
+        {
+            self.editable_pipeline();
+        }
+        let mut edit = None;
+        let add = ui.menu_button("+ Add Effect", |ui| {
+            for effect in default_effects() {
+                if ui.button(effect_label(&effect)).clicked() {
+                    edit = Some(PipelineEdit::Add(effect));
+                    ui.close_menu();
+                }
+            }
+        });
+        if !editing && self.active_preset().is_some() {
+            add.response
+                .on_hover_text("Start a custom pipeline from this preset, then add a step");
+        }
+
+        if self.selected_preset_idx == Some(self.custom_index()) {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.custom.name)
+                        .hint_text("Preset name")
+                        .desired_width(130.0),
+                );
+                if ui.checkbox(&mut self.custom.enabled, "Enabled").changed() {
+                    self.preview_key = None;
+                }
+            });
+            let len = self.custom.effects.len();
+            for (index, effect) in self.custom.effects.iter_mut().enumerate() {
+                ui.separator();
+                ui.push_id(index, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(format!("{}. {}", index + 1, effect_label(effect)));
+                        if ui
+                            .add_enabled(index > 0, egui::Button::new("^"))
+                            .on_hover_text("Move up")
+                            .clicked()
+                        {
+                            edit = Some(PipelineEdit::Move {
+                                from: index,
+                                to: index - 1,
+                            });
+                        }
+                        if ui
+                            .add_enabled(index + 1 < len, egui::Button::new("v"))
+                            .on_hover_text("Move down")
+                            .clicked()
+                        {
+                            edit = Some(PipelineEdit::Move {
+                                from: index,
+                                to: index + 1,
+                            });
+                        }
+                        if ui
+                            .small_button("x")
+                            .on_hover_text("Remove effect")
+                            .clicked()
+                        {
+                            edit = Some(PipelineEdit::Remove(index));
+                        }
+                    });
+                    if edit_effect(ui, effect) {
+                        self.preview_key = None;
+                    }
+                });
+            }
+        } else if let Some(preset) = self.active_preset() {
+            for (index, effect) in preset.effects.iter().enumerate() {
+                ui.label(format!("{}. {}", index + 1, effect_label(effect)));
+            }
+        } else {
+            ui.label("No effects will be applied.");
+        }
+
+        if let Some(edit) = edit {
+            self.edit_pipeline(edit);
+        }
+    }
+
+    fn show_preset_toml(&mut self, ui: &mut egui::Ui, palette: &SharexPalette) {
+        ui.collapsing("Export / Import TOML", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        self.active_preset().is_some(),
+                        egui::Button::new("Export TOML"),
+                    )
+                    .clicked()
+                {
+                    match self.export_preset_toml() {
+                        Ok(toml) => {
+                            ui.ctx().copy_text(toml.clone());
+                            self.preset_toml = toml;
+                            self.toml_status = Some("Preset TOML copied to the clipboard.".into());
+                        }
+                        Err(err) => self.toml_status = Some(err),
+                    }
+                }
+                if ui.button("Load TOML Preset").clicked() {
+                    let toml = std::mem::take(&mut self.preset_toml);
+                    self.toml_status = Some(match self.import_preset_toml(&toml) {
+                        Ok(()) => format!("Loaded {}.", self.custom.name),
+                        Err(err) => format!("Import failed: {err}"),
+                    });
+                    self.preset_toml = toml;
+                }
+            });
+            ui.add(
+                egui::TextEdit::multiline(&mut self.preset_toml)
+                    .code_editor()
+                    .desired_width(ui.available_width())
+                    .desired_rows(6)
+                    .hint_text("Paste preset TOML here"),
+            );
+            if let Some(status) = &self.toml_status {
+                ui.label(RichText::new(status).color(palette.text_muted));
+            }
+        });
+    }
+
     fn ensure_preview_texture(&mut self, ctx: &egui::Context, source_path: Option<PathBuf>) {
         let desired_key = (self.selected_preset_idx, source_path.clone());
         if self.preview_key.as_ref() == Some(&desired_key)
@@ -260,32 +451,44 @@ impl EffectsPanelState {
             return;
         }
 
-        let base_image = match source_path {
-            Some(ref path) => match CapturedImage::load_from_file(path) {
-                Ok(img) => downscale_for_preview(&img, 420, 260),
-                Err(_) => build_sample_preview_image(),
-            },
-            None => build_sample_preview_image(),
+        if self
+            .preview_source
+            .as_ref()
+            .is_none_or(|(path, _)| *path != source_path)
+        {
+            let image = source_path
+                .as_ref()
+                .and_then(|path| CapturedImage::load_from_file(path).ok())
+                .map_or_else(build_sample_preview_image, |image| {
+                    downscale_for_preview(&image, 420, 260)
+                });
+            self.preview_source = Some((source_path, image));
+        }
+        let Some((_, base_image)) = &self.preview_source else {
+            return;
         };
-
-        let rendered = match self.active_preset() {
-            Some(preset) => apply_effects(&base_image, &preset.effects),
-            None => Ok(base_image),
-        };
+        let rendered = self
+            .active_preset()
+            .map_or_else(|| Ok(base_image.clone()), |preset| preset.apply(base_image));
 
         match rendered {
             Ok(img) => {
+                let texture_limit = ctx.input(|input| input.max_texture_side) as u32;
+                let preview = downscale_for_preview(&img, texture_limit, texture_limit);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
-                    [img.width() as usize, img.height() as usize],
-                    img.rgba(),
+                    [preview.width() as usize, preview.height() as usize],
+                    preview.rgba(),
                 );
-                let tex = ctx.load_texture(
-                    "sharex_effects_preview",
-                    color,
-                    egui::TextureOptions::LINEAR,
-                );
+                if let Some(texture) = &mut self.preview_texture {
+                    texture.set(color, egui::TextureOptions::LINEAR);
+                } else {
+                    self.preview_texture = Some(ctx.load_texture(
+                        "sharex_effects_preview",
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
                 self.preview_dims = Some((img.width(), img.height()));
-                self.preview_texture = Some(tex);
                 self.preview_error = None;
             }
             Err(err) => {
@@ -338,14 +541,15 @@ fn preset_row(
     } else {
         p.text_muted
     };
-    ui.painter().text(
+    let label_painter = ui.painter().with_clip_rect(rect);
+    label_painter.text(
         egui::pos2(rect.min.x + 10.0, rect.min.y + 14.0),
         egui::Align2::LEFT_CENTER,
         title,
         egui::FontId::proportional(13.5),
         title_color,
     );
-    ui.painter().text(
+    label_painter.text(
         egui::pos2(rect.min.x + 10.0, rect.min.y + 32.0),
         egui::Align2::LEFT_CENTER,
         subtitle,
@@ -355,26 +559,14 @@ fn preset_row(
     resp.clicked()
 }
 
+enum PipelineEdit {
+    Add(ImageEffect),
+    Move { from: usize, to: usize },
+    Remove(usize),
+}
+
 fn summarize_preset(preset: &EffectPreset) -> String {
-    let labels: Vec<&'static str> = preset
-        .effects
-        .iter()
-        .map(|effect| match effect {
-            ImageEffect::Border { .. } => "Border",
-            ImageEffect::CanvasPadding { .. } => "Padding",
-            ImageEffect::RoundedCorners { .. } => "Rounded corners",
-            ImageEffect::DropShadow { .. } => "Drop shadow",
-            ImageEffect::Resize { .. } => "Resize",
-            ImageEffect::Grayscale => "Grayscale",
-            ImageEffect::Invert => "Invert",
-            ImageEffect::BrightnessContrast { .. } => "Brightness/Contrast",
-            ImageEffect::AutoCrop { .. } => "Auto-crop",
-            ImageEffect::WatermarkText { .. } => "Text watermark",
-            ImageEffect::Colorize { .. } => "Colorize",
-            ImageEffect::Slice { .. } => "Slice",
-            ImageEffect::ImageWatermark { .. } => "Image watermark",
-        })
-        .collect();
+    let labels: Vec<_> = preset.effects.iter().map(effect_label).collect();
     if labels.is_empty() {
         "No steps".to_owned()
     } else {
@@ -382,57 +574,227 @@ fn summarize_preset(preset: &EffectPreset) -> String {
     }
 }
 
-fn describe_effect(effect: &ImageEffect) -> String {
+fn effect_label(effect: &ImageEffect) -> &'static str {
+    match effect {
+        ImageEffect::Border { .. } => "Border",
+        ImageEffect::CanvasPadding { .. } => "Canvas padding",
+        ImageEffect::RoundedCorners { .. } => "Rounded corners",
+        ImageEffect::DropShadow { .. } => "Drop shadow",
+        ImageEffect::Resize { .. } => "Resize",
+        ImageEffect::Grayscale => "Grayscale",
+        ImageEffect::Invert => "Invert colors",
+        ImageEffect::BrightnessContrast { .. } => "Brightness/Contrast",
+        ImageEffect::AutoCrop { .. } => "Auto-crop",
+        ImageEffect::WatermarkText { .. } => "Text watermark",
+        ImageEffect::Colorize { .. } => "Colorize",
+        ImageEffect::Slice { .. } => "Slice",
+        ImageEffect::ImageWatermark { .. } => "Image watermark",
+    }
+}
+
+fn default_effects() -> [ImageEffect; 11] {
+    [
+        ImageEffect::Border {
+            width: 2,
+            color: EffectColor::BLACK,
+        },
+        ImageEffect::DropShadow {
+            offset_x: 0,
+            offset_y: 8,
+            blur_radius: 12,
+            color: EffectColor::rgba(0, 0, 0, 120),
+            background: EffectColor::TRANSPARENT,
+        },
+        ImageEffect::RoundedCorners { radius: 12 },
+        ImageEffect::CanvasPadding {
+            top: 12,
+            right: 12,
+            bottom: 12,
+            left: 12,
+            color: EffectColor::WHITE,
+        },
+        ImageEffect::WatermarkText {
+            text: "ShareX".into(),
+            position: WatermarkAnchor::BottomRight,
+            color: EffectColor::WHITE,
+            opacity: 0.8,
+            scale: 2,
+            margin: 12,
+            shadow: true,
+        },
+        ImageEffect::Colorize {
+            color: EffectColor::rgb(80, 140, 220),
+            strength: 0.5,
+        },
+        ImageEffect::BrightnessContrast {
+            brightness: 0,
+            contrast: 15,
+        },
+        ImageEffect::Grayscale,
+        ImageEffect::Invert,
+        ImageEffect::Slice {
+            min_height: 4,
+            max_height: 16,
+            shift: 8,
+        },
+        ImageEffect::AutoCrop { tolerance: 8 },
+    ]
+}
+
+fn edit_effect(ui: &mut egui::Ui, effect: &mut ImageEffect) -> bool {
     match effect {
         ImageEffect::Border { width, color } => {
-            format!(
-                "Border ({width}px, #{:02X}{:02X}{:02X})",
-                color.r, color.g, color.b
-            )
+            effect_slider(ui, width, 0..=64, "Width") | effect_color(ui, color, "Color")
         }
+        ImageEffect::DropShadow {
+            offset_x,
+            offset_y,
+            blur_radius,
+            color,
+            background,
+        } => {
+            effect_slider(ui, blur_radius, 0..=64, "Blur radius")
+                | effect_slider(ui, offset_x, -64..=64, "Horizontal offset")
+                | effect_slider(ui, offset_y, -64..=64, "Vertical offset")
+                | effect_color(ui, color, "Shadow")
+                | effect_color(ui, background, "Background")
+        }
+        ImageEffect::RoundedCorners { radius } => effect_slider(ui, radius, 0..=128, "Radius"),
         ImageEffect::CanvasPadding {
             top,
             right,
             bottom,
             left,
-            ..
-        } => format!("Canvas padding ({top}/{right}/{bottom}/{left} px)"),
-        ImageEffect::RoundedCorners { radius } => format!("Rounded corners (radius {radius}px)"),
-        ImageEffect::DropShadow {
-            offset_x,
-            offset_y,
-            blur_radius,
-            ..
-        } => format!("Drop shadow (offset {offset_x},{offset_y}, blur {blur_radius}px)"),
-        ImageEffect::Resize {
-            width,
-            height,
-            keep_aspect,
-        } => format!(
-            "Resize ({width}x{height}{})",
-            if *keep_aspect { ", keep aspect" } else { "" }
-        ),
-        ImageEffect::Grayscale => "Grayscale".to_owned(),
-        ImageEffect::Invert => "Invert colors".to_owned(),
+            color,
+        } => {
+            effect_slider(ui, top, 0..=128, "Top")
+                | effect_slider(ui, right, 0..=128, "Right")
+                | effect_slider(ui, bottom, 0..=128, "Bottom")
+                | effect_slider(ui, left, 0..=128, "Left")
+                | effect_color(ui, color, "Color")
+        }
+        ImageEffect::WatermarkText {
+            text,
+            position,
+            color,
+            opacity,
+            scale,
+            margin,
+            shadow,
+        } => {
+            ui.add(egui::TextEdit::singleline(text).hint_text("Watermark text"))
+                .changed()
+                | edit_anchor(ui, position)
+                | effect_color(ui, color, "Text color")
+                | effect_slider(ui, opacity, 0.0..=1.0, "Opacity")
+                | effect_slider(ui, scale, 1..=12, "Text scale")
+                | effect_slider(ui, margin, 0..=128, "Margin")
+                | ui.checkbox(shadow, "Text shadow").changed()
+        }
+        ImageEffect::Colorize { color, strength } => {
+            effect_color(ui, color, "Tint") | effect_slider(ui, strength, 0.0..=1.0, "Strength")
+        }
         ImageEffect::BrightnessContrast {
             brightness,
             contrast,
-        } => format!("Brightness {brightness:+} / Contrast {contrast:+}"),
-        ImageEffect::AutoCrop { tolerance } => format!("Auto-crop (tolerance {tolerance})"),
-        ImageEffect::WatermarkText { position, .. } => format!("Text watermark ({position:?})"),
-        ImageEffect::Colorize { strength, .. } => format!("Colorize ({:.0}%)", strength * 100.0),
+        } => {
+            effect_slider(ui, brightness, -100..=100, "Brightness")
+                | effect_slider(ui, contrast, -100..=100, "Contrast")
+        }
         ImageEffect::Slice {
             min_height,
             max_height,
             shift,
-        } => format!("Slice ({min_height}-{max_height}px bands, {shift:+}px shift)"),
+        } => {
+            let minimum_changed = effect_slider(ui, min_height, 1..=128, "Min band height");
+            let maximum_changed = effect_slider(ui, max_height, 1..=128, "Max band height");
+            if minimum_changed && *min_height > *max_height {
+                *max_height = *min_height;
+            } else if maximum_changed && *max_height < *min_height {
+                *min_height = *max_height;
+            }
+            minimum_changed | maximum_changed | effect_slider(ui, shift, -128..=128, "Shift")
+        }
+        ImageEffect::AutoCrop { tolerance } => effect_slider(ui, tolerance, 0..=255, "Tolerance"),
+        ImageEffect::Resize {
+            width,
+            height,
+            keep_aspect,
+        } => {
+            effect_slider(ui, width, 1..=4096, "Width")
+                | effect_slider(ui, height, 1..=4096, "Height")
+                | ui.checkbox(keep_aspect, "Keep aspect ratio").changed()
+        }
         ImageEffect::ImageWatermark {
             width,
             height,
             position,
+            opacity,
+            margin,
             ..
-        } => format!("Image watermark ({width}x{height}, {position:?})"),
+        } => {
+            ui.label(format!("Embedded stamp: {width} x {height}"));
+            edit_anchor(ui, position)
+                | effect_slider(ui, opacity, 0.0..=1.0, "Opacity")
+                | effect_slider(ui, margin, 0..=128, "Margin")
+        }
+        ImageEffect::Grayscale | ImageEffect::Invert => false,
     }
+}
+
+fn effect_slider<T: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    range: std::ops::RangeInclusive<T>,
+    label: &str,
+) -> bool {
+    ui.add(
+        egui::Slider::new(value, range)
+            .text(label)
+            .clamping(egui::SliderClamping::Edits),
+    )
+    .changed()
+}
+
+fn effect_color(ui: &mut egui::Ui, color: &mut EffectColor, label: &str) -> bool {
+    let mut rgba = color.to_array();
+    let changed = ui
+        .horizontal(|ui| {
+            ui.label(label);
+            ui.color_edit_button_srgba_unmultiplied(&mut rgba).changed()
+        })
+        .inner;
+    if changed {
+        let [red, green, blue, alpha] = rgba;
+        *color = EffectColor::rgba(red, green, blue, alpha);
+    }
+    changed
+}
+
+fn edit_anchor(ui: &mut egui::Ui, position: &mut WatermarkAnchor) -> bool {
+    let original = *position;
+    let anchors = [
+        (WatermarkAnchor::TopLeft, "Top left"),
+        (WatermarkAnchor::TopCenter, "Top center"),
+        (WatermarkAnchor::TopRight, "Top right"),
+        (WatermarkAnchor::MiddleLeft, "Middle left"),
+        (WatermarkAnchor::Center, "Center"),
+        (WatermarkAnchor::MiddleRight, "Middle right"),
+        (WatermarkAnchor::BottomLeft, "Bottom left"),
+        (WatermarkAnchor::BottomCenter, "Bottom center"),
+        (WatermarkAnchor::BottomRight, "Bottom right"),
+    ];
+    let selected = anchors
+        .iter()
+        .find_map(|&(anchor, label)| (anchor == original).then_some(label));
+    egui::ComboBox::from_id_salt("watermark_anchor")
+        .selected_text(selected.unwrap_or_default())
+        .show_ui(ui, |ui| {
+            for (anchor, label) in anchors {
+                ui.selectable_value(position, anchor, label);
+            }
+        });
+    *position != original
 }
 
 fn downscale_for_preview(img: &CapturedImage, max_w: u32, max_h: u32) -> CapturedImage {
@@ -495,6 +857,48 @@ fn build_sample_preview_image() -> CapturedImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_pipeline_edits_preserve_builtins_and_update_the_preview() {
+        let mut state = EffectsPanelState::new();
+        state.set_selected_preset_idx(Some(state.presets().len()));
+        assert_eq!(state.active_preset_name(), "Watermarked Share");
+        let original = state.active_preset().unwrap().clone();
+        state.edit_pipeline(PipelineEdit::Add(ImageEffect::Invert));
+        state.edit_pipeline(PipelineEdit::Move { from: 1, to: 0 });
+        let custom = state.active_preset().unwrap();
+        assert_eq!(
+            custom.effects,
+            [ImageEffect::Invert, original.effects[0].clone()]
+        );
+
+        let ctx = egui::Context::default();
+        state.ensure_preview_texture(&ctx, None);
+        assert_eq!(state.preview_dims, Some((280, 168)));
+        state.edit_pipeline(PipelineEdit::Remove(1));
+        state.edit_pipeline(PipelineEdit::Add(default_effects()[0].clone()));
+        state.ensure_preview_texture(&ctx, None);
+        assert_eq!(state.preview_dims, Some((284, 172)));
+        state.set_selected_preset_idx(Some(state.presets().len()));
+        assert_eq!(state.active_preset(), Some(&original));
+    }
+
+    #[test]
+    fn custom_pipeline_toml_round_trips_and_failed_import_keeps_the_active_preset() {
+        let mut source = EffectsPanelState::new();
+        source.set_selected_preset_idx(None);
+        for effect in default_effects() {
+            source.edit_pipeline(PipelineEdit::Add(effect));
+        }
+        source.custom.name = "Shared preset".into();
+        let toml = source.export_preset_toml().unwrap();
+        let mut destination = EffectsPanelState::new();
+        destination.import_preset_toml(&toml).unwrap();
+        assert_eq!(destination.active_preset(), source.active_preset());
+        assert_eq!(destination.export_preset_toml().unwrap(), toml);
+        assert!(destination.import_preset_toml("unparsable").is_err());
+        assert_eq!(destination.active_preset(), source.active_preset());
+    }
 
     #[test]
     fn effects_state_loads_builtin_presets_and_applies_only_when_enabled() {
