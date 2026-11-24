@@ -285,6 +285,11 @@ impl UploadersPanelState {
         self.settings_path = path;
     }
 
+    pub(crate) fn mirror_folder_path(&self) -> Option<PathBuf> {
+        let trimmed = self.mirror_folder.trim();
+        (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+    }
+
     fn is_text_destination(&self) -> bool {
         matches!(self.destination, "github-gist" | "pastebin")
     }

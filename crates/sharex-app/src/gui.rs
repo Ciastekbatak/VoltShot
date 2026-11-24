@@ -111,6 +111,7 @@ struct CaptureSettings {
 struct WatchedCapture {
     event: WatchedFileEvent,
     move_after: Option<PathBuf>,
+    source_signature: Option<(u64, Option<std::time::SystemTime>)>,
 }
 
 #[derive(Clone)]
@@ -646,8 +647,19 @@ impl SharexGuiApp {
             .workflow_uploader(id)
             .map_err(|err| err.to_string())?;
         let format = config.image_format;
-        let stem = capture_filename_stem(config, image, completion.entry.timestamp)?;
-        let file_name = format!("{stem}.{}", format.extension());
+        let file_name = completion
+            .entry
+            .file_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                let stem = capture_filename_stem(config, image, completion.entry.timestamp)
+                    .unwrap_or_else(|_| "ShareX".to_owned());
+                format!("{stem}_{}.{}", completion.entry.id, format.extension())
+            });
         let completion = completion.clone();
         let image = image.clone();
         let sender = self.capture_upload_tx.clone();
@@ -677,13 +689,22 @@ impl SharexGuiApp {
     fn finish_capture(&mut self, mut completion: CaptureCompletion) {
         if let Some(watched) = completion.watched {
             if let Some(folder) = watched.move_after.as_deref() {
-                match move_watched_file(&watched.event.path, folder) {
-                    Ok(target) => {
-                        if completion.entry.file_path.as_ref() == Some(&watched.event.path) {
-                            completion.entry.file_path = Some(target);
+                let current_sig = fs::metadata(&watched.event.path)
+                    .ok()
+                    .map(|meta| (meta.len(), meta.modified().ok()));
+                if watched.source_signature.is_some() && current_sig != watched.source_signature {
+                    completion
+                        .status
+                        .push_str(". Skipped move: watched file changed while processing");
+                } else {
+                    match move_watched_file(&watched.event.path, folder) {
+                        Ok(target) => {
+                            if completion.entry.file_path.as_ref() == Some(&watched.event.path) {
+                                completion.entry.file_path = Some(target);
+                            }
                         }
+                        Err(err) => completion.status.push_str(&format!(". Move failed: {err}")),
                     }
-                    Err(err) => completion.status.push_str(&format!(". Move failed: {err}")),
                 }
             }
             self.workflows.record_processed_event(watched.event);
@@ -759,6 +780,9 @@ impl SharexGuiApp {
             else {
                 continue;
             };
+            let source_signature = fs::metadata(&event.path)
+                .ok()
+                .map(|meta| (meta.len(), meta.modified().ok()));
             let Ok(image) = CapturedImage::load_from_file(&event.path) else {
                 continue;
             };
@@ -784,6 +808,16 @@ impl SharexGuiApp {
                     .effect_preset
                     .clone_from(&preset.overrides.effect_preset_name);
             }
+            if settings.config.pipeline.uploader_id.as_deref() == Some("local-mirror")
+                && self
+                    .uploaders
+                    .mirror_folder_path()
+                    .is_some_and(|dir| self.is_watched_directory(&dir))
+            {
+                self.status_line =
+                    "Skipped Local Mirror upload: mirror folder is a watched directory.".into();
+                settings.config.pipeline.uploader_id = None;
+            }
             while self.is_watched_directory(&settings.config.output_dir) {
                 settings.config.output_dir.push("Processed");
             }
@@ -801,7 +835,11 @@ impl SharexGuiApp {
                 CaptureSource::WatchedFile,
                 settings,
                 false,
-                Some(WatchedCapture { event, move_after }),
+                Some(WatchedCapture {
+                    event,
+                    move_after,
+                    source_signature,
+                }),
             );
         }
     }
@@ -2434,6 +2472,9 @@ impl eframe::App for SharexGuiApp {
         }
 
         self.update_overlay(ctx);
+        if self.overlay.is_some() {
+            return;
+        }
         self.poll_ocr(ctx);
         self.poll_capture_uploads(ctx);
         self.poll_watcher(ctx);
