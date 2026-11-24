@@ -1,3 +1,4 @@
+pub mod autostart;
 pub mod cli;
 pub mod clipboard;
 pub mod editor_ui;
@@ -5,9 +6,11 @@ pub mod effects_ui;
 pub mod gui;
 pub mod hotkeys;
 pub mod i18n;
+pub mod notifications;
 pub mod pin_window;
 pub mod recording_ui;
 pub mod region_overlay;
+pub mod sound;
 pub mod theme;
 pub mod thumb_cache;
 pub mod tools_ui;
