@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use crate::editor_ui::{paint_annotation, paint_arrow, paint_ellipse_stroke, to_egui_color};
 use crate::icons::{Icon, paint_icon, toolbar_icon_button};
 use crate::win_focus::OverlayFocusGuard;
@@ -245,9 +243,6 @@ pub struct RegionOverlayState {
     auto_capture_on_drag: bool,
     windows: Vec<WindowInfo>,
     snap_to_windows: bool,
-    visual_snap_rect: Option<RectF>,
-    visual_snap_target: Option<RectF>,
-    last_frame_time: Instant,
     show_magnifier: bool,
     show_style_bar: bool,
     color: RgbaColor,
@@ -312,9 +307,6 @@ impl RegionOverlayState {
             auto_capture_on_drag: true,
             windows,
             snap_to_windows: true,
-            visual_snap_rect: None,
-            visual_snap_target: None,
-            last_frame_time: Instant::now(),
             show_magnifier: true,
             show_style_bar: false,
             color: RgbaColor::RED,
@@ -392,9 +384,6 @@ impl RegionOverlayState {
                     }
                 }
             }
-            let now = Instant::now();
-            let frame_dt = now.duration_since(self.last_frame_time).as_secs_f32();
-            self.last_frame_time = now;
             let typing = overlay_ctx.wants_keyboard_input();
             let capture_mode = self.mode == OverlayMode::Capture;
             let color_picker = self.mode == OverlayMode::ColorPicker;
@@ -642,22 +631,9 @@ impl RegionOverlayState {
                         pointer_pos.and_then(|pos| self.snapped_window_at(to_image(pos)))
                     };
                     let target_snap_rect = snapped_window.map(|(_, rect)| rect);
-                    let visual_snap_rect = target_snap_rect.map(|target| {
-                        self.visual_snap_rect.map_or(target, |current| {
-                            let dt = if self.visual_snap_target == target_snap_rect {
-                                frame_dt
-                            } else {
-                                frame_dt.min(overlay_ctx.input(|input| input.predicted_dt))
-                            };
-                            lerp_rect(current, target, 1.0 - (-dt * 30.0).exp())
-                        })
-                    });
-                    if visual_snap_rect != target_snap_rect {
-                        overlay_ctx.request_repaint();
-                    }
 
                     let scrim = Color32::from_black_alpha(112);
-                    if let Some(sel_img) = active_region.or(visual_snap_rect) {
+                    if let Some(sel_img) = active_region.or(target_snap_rect) {
                         let sel = to_screen_rect(sel_img);
 
                         painter.rect_filled(
@@ -713,7 +689,7 @@ impl RegionOverlayState {
                         self.paint_draft(&painter, draft, &to_screen, zoom, accent);
                     }
 
-                    if let (Some((window, _)), Some(rect)) = (snapped_window, visual_snap_rect) {
+                    if let Some((window, rect)) = snapped_window {
                         paint_snapped_window(
                             &painter,
                             to_screen_rect(rect),
@@ -722,8 +698,6 @@ impl RegionOverlayState {
                             window,
                         );
                     }
-                    self.visual_snap_rect = visual_snap_rect;
-                    self.visual_snap_target = target_snap_rect;
 
                     if let Some(pos) = pointer_pos {
                         if self.active_tool == OverlayTool::Region {
@@ -951,7 +925,7 @@ impl RegionOverlayState {
 
                 paint_toolbar_divider(ui);
 
-                let toggle_bg = Color32::from_rgba_unmultiplied(59, 130, 246, 85);
+                let toggle_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 34);
                 if toolbar_icon_button(
                     ui,
                     Icon::SnapMagnet,
@@ -1462,16 +1436,14 @@ impl RegionOverlayState {
                         paint_arrow(painter, to_screen(*start), to_screen(*current), col, sw);
                     }
                     OverlayTool::Pixelate | OverlayTool::Blur => {
-                        painter.rect_filled(
+                        let _ = accent;
+                        painter.rect_filled(sr, 0.0, Color32::from_black_alpha(68));
+                        paint_dashed_border(
+                            painter,
                             sr,
-                            0.0,
-                            Color32::from_rgba_unmultiplied(59, 130, 246, 55),
-                        );
-                        painter.rect_stroke(
-                            sr,
-                            0.0,
-                            Stroke::new(1.5_f32, accent),
-                            egui::StrokeKind::Inside,
+                            Color32::WHITE,
+                            Color32::from_black_alpha(220),
+                            5.0_f32,
                         );
                     }
                     _ => {}
@@ -1519,24 +1491,6 @@ fn format_picked_color(r: u8, g: u8, b: u8) -> String {
 fn exceeds_half_pixel(offset: Vec2, pixels_per_point: f32) -> bool {
     let tolerance = 0.5 / pixels_per_point;
     offset.x.abs() > tolerance || offset.y.abs() > tolerance
-}
-
-fn lerp_rect(current: RectF, target: RectF, alpha: f32) -> RectF {
-    let left = egui::lerp(current.x..=target.x, alpha);
-    let top = egui::lerp(current.y..=target.y, alpha);
-    let right = egui::lerp(current.right()..=target.right(), alpha);
-    let bottom = egui::lerp(current.bottom()..=target.bottom(), alpha);
-    let edge_deltas = [
-        left - target.x,
-        top - target.y,
-        right - target.right(),
-        bottom - target.bottom(),
-    ];
-    if edge_deltas.iter().all(|delta| delta.abs() <= 0.5) {
-        target
-    } else {
-        RectF::from_points(Point::new(left, top), Point::new(right, bottom))
-    }
 }
 
 fn clipped_window_rect(
@@ -1641,11 +1595,6 @@ fn paint_snapped_window(
     toolbar_rect: Rect,
     window: &WindowInfo,
 ) {
-    painter.rect_filled(
-        bounds,
-        0.0,
-        Color32::from_rgba_unmultiplied(59, 130, 246, 16),
-    );
     paint_dashed_border(
         painter,
         bounds,
@@ -2033,24 +1982,6 @@ mod tests {
         assert_eq!(
             sample_magnifier_grid(&image, 0, 1, 0),
             (vec![PIXELS[2]], PIXELS[2])
-        );
-    }
-
-    #[test]
-    fn lerp_rect_converges_and_finishes_at_the_exact_target() {
-        let start = RectF::from_points(Point::new(0.0, 0.0), Point::new(300.0, 200.0));
-        let target = RectF::from_points(Point::new(400.0, 200.0), Point::new(520.0, 440.0));
-        let alpha = 1.0 - (-30.0_f32 / 120.0).exp();
-        let first = lerp_rect(start, target, alpha);
-        assert!(first.x > start.x && first.x < target.x);
-        assert!(first.right() > start.right() && first.right() < target.right());
-        let two_frames = lerp_rect(first, target, alpha);
-        let one_frame = lerp_rect(start, target, 1.0 - (-30.0_f32 / 60.0).exp());
-        assert!((two_frames.x - one_frame.x).abs() < 0.001);
-        assert!((two_frames.right() - one_frame.right()).abs() < 0.001);
-        assert_eq!(
-            (0..40).fold(start, |rect, _| lerp_rect(rect, target, alpha)),
-            target
         );
     }
 

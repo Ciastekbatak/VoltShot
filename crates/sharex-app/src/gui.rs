@@ -66,11 +66,17 @@ pub fn launch_gui_with_fallback(
             ),
         };
     let start_minimized = minimized || config.start_minimized;
+    let window_icon = egui::IconData {
+        rgba: crate::tray::build_tray_icon_rgba(64),
+        width: 64,
+        height: 64,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ShareX (Rust)")
-            .with_inner_size([1160.0, 720.0])
-            .with_min_inner_size([860.0, 540.0])
+            .with_icon(std::sync::Arc::new(window_icon))
+            .with_inner_size([1180.0, 740.0])
+            .with_min_inner_size([880.0, 560.0])
             .with_visible(!start_minimized),
         ..Default::default()
     };
@@ -1206,7 +1212,9 @@ impl SharexGuiApp {
 
         egui::ScrollArea::vertical()
             .id_salt("sharex_sidebar_scroll")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
                 if sidebar_action_button(
                     ui,
                     Icon::Fullscreen,
@@ -1253,21 +1261,27 @@ impl SharexGuiApp {
                     self.start_overlay_with_mode(ctx, OverlayMode::ColorPicker);
                 }
 
-                ui.add_space(6.0_f32);
+                ui.add_space(8.0_f32);
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0_f32;
                     let selected_label = self
                         .monitors
                         .get(self.selected_monitor_idx)
-                        .map(|m| format!("{} ({}x{})", m.name, m.width, m.height))
+                        .map(friendly_monitor_label)
                         .unwrap_or_else(|| s.no_monitor.to_owned());
-                    let combo_width = (ui.available_width() - 44.0_f32).max(110.0_f32);
+                    let go_width = 40.0_f32;
+                    let combo_width = (ui.available_width() - go_width - 8.0_f32).max(110.0_f32);
                     egui::ComboBox::from_id_salt("sidebar_monitor")
                         .selected_text(selected_label)
                         .width(combo_width)
+                        .truncate()
                         .show_ui(ui, |ui| {
                             for (idx, m) in self.monitors.iter().enumerate() {
-                                let label = format!("{} ({}x{})", m.name, m.width, m.height);
-                                ui.selectable_value(&mut self.selected_monitor_idx, idx, label);
+                                ui.selectable_value(
+                                    &mut self.selected_monitor_idx,
+                                    idx,
+                                    friendly_monitor_label(m),
+                                );
                             }
                         });
                     let go_btn = egui::Button::new(
@@ -1277,7 +1291,8 @@ impl SharexGuiApp {
                     )
                     .fill(p.card_bg)
                     .stroke(Stroke::new(1.0_f32, p.border))
-                    .corner_radius(CornerRadius::same(6));
+                    .corner_radius(CornerRadius::same(6))
+                    .min_size(Vec2::new(go_width, 24.0_f32));
                     if ui.add(go_btn).clicked()
                         && let Some(m) = self.monitors.get(self.selected_monitor_idx)
                     {
@@ -1622,12 +1637,16 @@ impl SharexGuiApp {
 
         egui::ScrollArea::vertical()
             .id_salt("captures_gallery_scroll")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                let gap = 12.0_f32;
-                let avail_w = ui.available_width().max(260.0_f32);
-                let cols = (((avail_w + gap) / 276.0_f32).floor() as usize).clamp(1, 4);
-                let card_w = ((avail_w - gap * ((cols - 1) as f32)) / (cols as f32)).max(220.0_f32);
-                let thumb_h = (card_w * 0.56_f32).clamp(132.0_f32, 184.0_f32);
+                let gap = 14.0_f32;
+                let avail_w = (ui.available_width() - 4.0_f32).max(260.0_f32);
+                let cols = (((avail_w + gap) / 292.0_f32).floor() as usize).clamp(1, 4);
+                let card_outer_w = ((avail_w - gap * ((cols - 1) as f32)) / (cols as f32))
+                    .floor()
+                    .max(220.0_f32);
+                let inner_w = (card_outer_w - 20.0_f32).max(180.0_f32);
+                let thumb_h = (inner_w * 0.5625_f32).round().clamp(128.0_f32, 184.0_f32);
 
                 for row in visible.chunks(cols) {
                     ui.horizontal_top(|ui| {
@@ -1651,190 +1670,237 @@ impl SharexGuiApp {
                                 .corner_radius(CornerRadius::same(10))
                                 .inner_margin(Margin::same(10))
                                 .show(ui, |ui| {
-                                    ui.set_width(card_w - 20.0_f32);
-                                    let stage_size = Vec2::new(card_w - 20.0_f32, thumb_h);
-                                    let (stage_rect, stage_resp) =
-                                        ui.allocate_exact_size(stage_size, egui::Sense::click());
-                                    if stage_resp.clicked() {
-                                        self.select_capture(entry);
-                                    }
-                                    if stage_resp.double_clicked()
-                                        && let Some(path) = &entry.file_path
-                                    {
-                                        open_editor_path = Some(path.clone());
-                                    }
-                                    ui.painter().rect_filled(
-                                        stage_rect,
-                                        CornerRadius::same(7),
-                                        p.sidebar_bg,
-                                    );
-                                    ui.painter().rect_stroke(
-                                        stage_rect,
-                                        CornerRadius::same(7),
-                                        Stroke::new(1.0_f32, p.divider),
-                                        egui::StrokeKind::Inside,
-                                    );
+                                    ui.allocate_ui_with_layout(
+                                        Vec2::new(inner_w, 0.0_f32),
+                                        egui::Layout::top_down(egui::Align::Min),
+                                        |ui| {
+                                            ui.set_min_width(inner_w);
+                                            ui.set_max_width(inner_w);
 
-                                    let thumb_tex = entry
-                                        .file_path
-                                        .as_deref()
-                                        .and_then(|path| self.ensure_thumbnail(ctx, path));
-                                    if let Some(tex_id) = thumb_tex {
-                                        let inner = stage_rect.shrink(3.0_f32);
-                                        let aspect = if entry.height > 0 {
-                                            entry.width as f32 / entry.height as f32
-                                        } else {
-                                            inner.width() / inner.height().max(1.0_f32)
-                                        };
-                                        let fit_size =
-                                            if inner.width() / inner.height().max(1.0_f32) > aspect
+                                            let stage_size = Vec2::new(inner_w, thumb_h);
+                                            let (stage_rect, stage_resp) = ui.allocate_exact_size(
+                                                stage_size,
+                                                egui::Sense::click(),
+                                            );
+                                            if stage_resp.clicked() {
+                                                self.select_capture(entry);
+                                            }
+                                            if stage_resp.double_clicked()
+                                                && let Some(path) = &entry.file_path
                                             {
-                                                Vec2::new(
-                                                    (inner.height() * aspect).min(inner.width()),
-                                                    inner.height(),
-                                                )
-                                            } else {
-                                                Vec2::new(
-                                                    inner.width(),
-                                                    (inner.width() / aspect.max(0.01_f32))
-                                                        .min(inner.height()),
-                                                )
-                                            };
-                                        let img_rect =
-                                            egui::Rect::from_center_size(inner.center(), fit_size);
-                                        egui::Image::new((tex_id, fit_size))
-                                            .corner_radius(CornerRadius::same(5))
-                                            .paint_at(ui, img_rect);
-                                    } else {
-                                        ui.painter().text(
-                                            stage_rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            s.no_preview,
-                                            egui::FontId::proportional(11.5_f32),
-                                            p.text_muted,
-                                        );
-                                    }
+                                                open_editor_path = Some(path.clone());
+                                            }
+                                            ui.painter().rect_filled(
+                                                stage_rect,
+                                                CornerRadius::same(7),
+                                                p.sidebar_bg,
+                                            );
+                                            ui.painter().rect_stroke(
+                                                stage_rect,
+                                                CornerRadius::same(7),
+                                                Stroke::new(1.0_f32, p.divider),
+                                                egui::StrokeKind::Inside,
+                                            );
 
-                                    ui.add_space(8.0_f32);
-                                    ui.horizontal(|ui| {
-                                        let title = entry
-                                            .file_path
-                                            .as_ref()
-                                            .and_then(|fp| fp.file_name())
-                                            .map(|n| n.to_string_lossy().into_owned())
-                                            .unwrap_or_else(|| entry.id.as_str().to_owned());
-                                        let title_widget = egui::Label::new(
-                                            RichText::new(title)
-                                                .strong()
-                                                .size(12.5_f32)
-                                                .color(p.text_primary),
-                                        )
-                                        .truncate()
-                                        .sense(egui::Sense::click());
-                                        if ui
-                                            .add(title_widget)
-                                            .on_hover_text("Select capture")
-                                            .clicked()
-                                        {
-                                            self.select_capture(entry);
-                                        }
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
+                                            let thumb_tex = entry
+                                                .file_path
+                                                .as_deref()
+                                                .and_then(|path| self.ensure_thumbnail(ctx, path));
+                                            if let Some(tex_id) = thumb_tex {
+                                                let inner = stage_rect.shrink(3.0_f32);
+                                                let aspect = if entry.height > 0 {
+                                                    entry.width as f32 / entry.height as f32
+                                                } else {
+                                                    inner.width() / inner.height().max(1.0_f32)
+                                                };
+                                                let fit_size = if inner.width()
+                                                    / inner.height().max(1.0_f32)
+                                                    > aspect
+                                                {
+                                                    Vec2::new(
+                                                        (inner.height() * aspect)
+                                                            .min(inner.width()),
+                                                        inner.height(),
+                                                    )
+                                                } else {
+                                                    Vec2::new(
+                                                        inner.width(),
+                                                        (inner.width() / aspect.max(0.01_f32))
+                                                            .min(inner.height()),
+                                                    )
+                                                };
+                                                let img_rect = egui::Rect::from_center_size(
+                                                    inner.center(),
+                                                    fit_size,
+                                                );
+                                                egui::Image::new((tex_id, fit_size))
+                                                    .corner_radius(CornerRadius::same(5))
+                                                    .paint_at(ui, img_rect);
+                                            } else {
+                                                ui.painter().text(
+                                                    stage_rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    s.no_preview,
+                                                    egui::FontId::proportional(11.5_f32),
+                                                    p.text_muted,
+                                                );
+                                            }
+
+                                            ui.add_space(8.0_f32);
+                                            let title = entry
+                                                .file_path
+                                                .as_ref()
+                                                .and_then(|fp| fp.file_name())
+                                                .map(|n| n.to_string_lossy().into_owned())
+                                                .unwrap_or_else(|| entry.id.as_str().to_owned());
+                                            let dims_text =
+                                                format!("{}×{}", entry.width, entry.height);
+                                            let (meta_rect, meta_resp) = ui.allocate_exact_size(
+                                                Vec2::new(inner_w, 18.0_f32),
+                                                egui::Sense::click(),
+                                            );
+                                            if meta_resp.on_hover_text(&title).clicked() {
+                                                self.select_capture(entry);
+                                            }
+                                            let dims_galley = ui.painter().layout_no_wrap(
+                                                dims_text,
+                                                egui::FontId::monospace(10.5_f32),
+                                                p.text_muted,
+                                            );
+                                            let dims_w = dims_galley.size().x;
+                                            let dims_pos = egui::pos2(
+                                                meta_rect.max.x - dims_w,
+                                                meta_rect.center().y
+                                                    - dims_galley.size().y * 0.5_f32,
+                                            );
+                                            let title_max_w =
+                                                (inner_w - dims_w - 10.0_f32).max(40.0_f32);
+                                            let mut title_job = egui::text::LayoutJob::simple(
+                                                title,
+                                                egui::FontId::proportional(12.5_f32),
+                                                p.text_primary,
+                                                title_max_w,
+                                            );
+                                            title_job.wrap.max_rows = 1;
+                                            title_job.wrap.break_anywhere = true;
+                                            let title_galley = ui.painter().layout_job(title_job);
+                                            let title_clip = egui::Rect::from_min_max(
+                                                meta_rect.min,
+                                                egui::pos2(
+                                                    meta_rect.min.x + title_max_w,
+                                                    meta_rect.max.y,
+                                                ),
+                                            );
+                                            ui.painter().with_clip_rect(title_clip).galley(
+                                                egui::pos2(
+                                                    meta_rect.min.x,
+                                                    meta_rect.center().y
+                                                        - title_galley.size().y * 0.5_f32,
+                                                ),
+                                                title_galley,
+                                                p.text_primary,
+                                            );
+                                            ui.painter().galley(
+                                                dims_pos,
+                                                dims_galley,
+                                                p.text_muted,
+                                            );
+
+                                            if !entry.tags.is_empty() {
+                                                ui.add_space(4.0_f32);
+                                                self.render_capture_tags(ui, p, entry);
+                                            }
+
+                                            ui.add_space(4.0_f32);
+                                            ui.horizontal(|ui| {
+                                                ui.set_width(inner_w);
                                                 ui.label(
-                                                    RichText::new(format!(
-                                                        "{}×{}",
-                                                        entry.width, entry.height
-                                                    ))
-                                                    .monospace()
-                                                    .size(10.5_f32)
+                                                    RichText::new(
+                                                        entry
+                                                            .timestamp
+                                                            .format("%H:%M:%S")
+                                                            .to_string(),
+                                                    )
+                                                    .size(11.0_f32)
                                                     .color(p.text_muted),
                                                 );
-                                            },
-                                        );
-                                    });
-
-                                    self.render_capture_tags(ui, p, entry);
-
-                                    ui.add_space(4.0_f32);
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(
-                                                entry.timestamp.format("%H:%M:%S").to_string(),
-                                            )
-                                            .size(11.0_f32)
-                                            .color(p.text_muted),
-                                        );
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.spacing_mut().item_spacing.x = 2.0_f32;
-                                                if let Some(path) = &entry.file_path {
-                                                    let exists = path.exists();
-                                                    if exists
-                                                        && palette_icon_button(
-                                                            ui,
-                                                            Icon::Trash,
-                                                            s.delete_file,
-                                                            true,
-                                                            p,
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        delete_file_path = Some(path.clone());
-                                                    }
-                                                    if palette_icon_button(
-                                                        ui,
-                                                        Icon::Link,
-                                                        s.copy_path,
-                                                        false,
-                                                        p,
-                                                    )
-                                                    .clicked()
-                                                    {
-                                                        copy_text_val =
-                                                            Some(path.display().to_string());
-                                                    }
-                                                    if exists
-                                                        && palette_icon_button(
-                                                            ui,
-                                                            Icon::Copy,
-                                                            s.copy_image,
-                                                            false,
-                                                            p,
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        copy_img_path = Some(path.clone());
-                                                    }
-                                                    if exists
-                                                        && palette_icon_button(
-                                                            ui,
-                                                            Icon::Pin,
-                                                            s.pin_to_screen,
-                                                            false,
-                                                            p,
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        pin_file_path = Some(path.clone());
-                                                    }
-                                                    if exists
-                                                        && palette_icon_button(
-                                                            ui,
-                                                            Icon::Editor,
-                                                            s.edit,
-                                                            false,
-                                                            p,
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        open_editor_path = Some(path.clone());
-                                                    }
-                                                }
-                                            },
-                                        );
-                                    });
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.spacing_mut().item_spacing.x = 2.0_f32;
+                                                        if let Some(path) = &entry.file_path {
+                                                            let exists = path.exists();
+                                                            if exists
+                                                                && palette_icon_button(
+                                                                    ui,
+                                                                    Icon::Trash,
+                                                                    s.delete_file,
+                                                                    true,
+                                                                    p,
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                delete_file_path =
+                                                                    Some(path.clone());
+                                                            }
+                                                            if palette_icon_button(
+                                                                ui,
+                                                                Icon::Link,
+                                                                s.copy_path,
+                                                                false,
+                                                                p,
+                                                            )
+                                                            .clicked()
+                                                            {
+                                                                copy_text_val = Some(
+                                                                    path.display().to_string(),
+                                                                );
+                                                            }
+                                                            if exists
+                                                                && palette_icon_button(
+                                                                    ui,
+                                                                    Icon::Copy,
+                                                                    s.copy_image,
+                                                                    false,
+                                                                    p,
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                copy_img_path = Some(path.clone());
+                                                            }
+                                                            if exists
+                                                                && palette_icon_button(
+                                                                    ui,
+                                                                    Icon::Pin,
+                                                                    s.pin_to_screen,
+                                                                    false,
+                                                                    p,
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                pin_file_path = Some(path.clone());
+                                                            }
+                                                            if exists
+                                                                && palette_icon_button(
+                                                                    ui,
+                                                                    Icon::Editor,
+                                                                    s.edit,
+                                                                    false,
+                                                                    p,
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                open_editor_path =
+                                                                    Some(path.clone());
+                                                            }
+                                                        }
+                                                    },
+                                                );
+                                            });
+                                        },
+                                    );
                                 });
 
                             let is_hovered = card_resp.response.hovered();
@@ -2625,14 +2691,14 @@ impl eframe::App for SharexGuiApp {
 
         egui::SidePanel::left("sharex_sidebar")
             .resizable(false)
-            .exact_width(236.0_f32)
+            .exact_width(252.0_f32)
             .frame(
                 egui::Frame::NONE
                     .fill(p.sidebar_bg)
-                    .inner_margin(Margin::symmetric(14, 12)),
+                    .inner_margin(Margin::symmetric(12, 12)),
             )
             .show(ctx, |ui| {
-                let border_rect = ui.max_rect().expand2(Vec2::new(14.0_f32, 12.0_f32));
+                let border_rect = ui.max_rect().expand2(Vec2::new(12.0_f32, 12.0_f32));
                 ui.painter().with_clip_rect(border_rect).vline(
                     border_rect.max.x - 0.5_f32,
                     border_rect.y_range(),
@@ -2780,6 +2846,25 @@ fn capture_history_query(filter: &str) -> HistoryQuery {
     query
 }
 
+fn compact_hotkey_label(raw: &str) -> String {
+    raw.replace("PrintScreen", "PrtSc")
+        .replace("Control", "Ctrl")
+        .replace(" + ", "+")
+}
+
+fn friendly_monitor_label(monitor: &MonitorInfo) -> String {
+    let clean = monitor
+        .name
+        .strip_prefix(r"\\.\DISPLAY")
+        .map(|num| format!("Display {num}"))
+        .unwrap_or_else(|| monitor.name.clone());
+    if monitor.is_primary {
+        format!("{clean} · {}×{}", monitor.width, monitor.height)
+    } else {
+        format!("{clean} ({}×{})", monitor.width, monitor.height)
+    }
+}
+
 fn sidebar_primary_capture_button(
     ui: &mut egui::Ui,
     icon: Icon,
@@ -2787,12 +2872,12 @@ fn sidebar_primary_capture_button(
     hotkey: &str,
     p: &SharexPalette,
 ) -> bool {
-    let desired = Vec2::new(ui.available_width(), 35.0_f32);
+    let desired = Vec2::new(ui.available_width(), 36.0_f32);
     let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
     let bg = if resp.hovered() {
-        p.accent_hover
-    } else {
         p.accent
+    } else {
+        Color32::from_rgb(37, 99, 235)
     };
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(7), bg);
@@ -2801,21 +2886,15 @@ fn sidebar_primary_capture_button(
         Vec2::splat(14.0_f32),
     );
     paint_icon(painter, icon_rect, icon, Color32::WHITE);
-    painter.text(
-        egui::pos2(rect.min.x + 31.0_f32, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        label.trim_start_matches("+ "),
-        egui::FontId::proportional(13.0_f32),
-        Color32::WHITE,
-    );
 
-    let galley = painter.layout_no_wrap(
-        hotkey.to_owned(),
+    let short_key = compact_hotkey_label(hotkey);
+    let key_galley = painter.layout_no_wrap(
+        short_key,
         egui::FontId::monospace(9.5_f32),
-        Color32::from_rgba_unmultiplied(255, 255, 255, 215),
+        Color32::from_rgba_unmultiplied(255, 255, 255, 225),
     );
-    let badge_w = galley.size().x + 10.0_f32;
-    let badge_h = galley.size().y + 4.0_f32;
+    let badge_w = key_galley.size().x + 10.0_f32;
+    let badge_h = key_galley.size().y + 4.0_f32;
     let badge_rect = egui::Rect::from_min_size(
         egui::pos2(
             rect.max.x - badge_w - 8.0_f32,
@@ -2826,14 +2905,35 @@ fn sidebar_primary_capture_button(
     painter.rect_filled(
         badge_rect,
         CornerRadius::same(4),
-        Color32::from_rgba_unmultiplied(255, 255, 255, 32),
+        Color32::from_rgba_unmultiplied(0, 0, 0, 56),
     );
     painter.galley(
         egui::pos2(
             badge_rect.min.x + 5.0_f32,
-            badge_rect.center().y - galley.size().y * 0.5_f32,
+            badge_rect.center().y - key_galley.size().y * 0.5_f32,
         ),
-        galley,
+        key_galley,
+        Color32::WHITE,
+    );
+
+    let text_x = rect.min.x + 31.0_f32;
+    let max_label_w = (badge_rect.min.x - text_x - 8.0_f32).max(24.0_f32);
+    let mut job = egui::text::LayoutJob::simple(
+        label.trim_start_matches("+ ").to_owned(),
+        egui::FontId::proportional(13.0_f32),
+        Color32::WHITE,
+        max_label_w,
+    );
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let label_galley = painter.layout_job(job);
+    let clip = egui::Rect::from_min_max(
+        egui::pos2(text_x, rect.min.y),
+        egui::pos2(text_x + max_label_w, rect.max.y),
+    );
+    painter.with_clip_rect(clip).galley(
+        egui::pos2(text_x, rect.center().y - label_galley.size().y * 0.5_f32),
+        label_galley,
         Color32::WHITE,
     );
     resp.clicked()
@@ -2866,19 +2966,9 @@ fn sidebar_action_button(
             p.text_muted
         },
     );
-    painter.text(
-        egui::pos2(rect.min.x + 29.0_f32, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(12.5_f32),
-        p.text_primary,
-    );
 
-    let galley = painter.layout_no_wrap(
-        hotkey.to_owned(),
-        egui::FontId::monospace(9.5_f32),
-        p.text_muted,
-    );
+    let short_key = compact_hotkey_label(hotkey);
+    let galley = painter.layout_no_wrap(short_key, egui::FontId::monospace(9.5_f32), p.text_muted);
     let badge_w = galley.size().x + 8.0_f32;
     let badge_h = galley.size().y + 4.0_f32;
     let badge_rect = egui::Rect::from_min_size(
@@ -2902,6 +2992,27 @@ fn sidebar_action_button(
         ),
         galley,
         p.text_muted,
+    );
+
+    let text_x = rect.min.x + 29.0_f32;
+    let max_label_w = (badge_rect.min.x - text_x - 8.0_f32).max(24.0_f32);
+    let mut job = egui::text::LayoutJob::simple(
+        label.to_owned(),
+        egui::FontId::proportional(12.5_f32),
+        p.text_primary,
+        max_label_w,
+    );
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let label_galley = painter.layout_job(job);
+    let clip = egui::Rect::from_min_max(
+        egui::pos2(text_x, rect.min.y),
+        egui::pos2(text_x + max_label_w, rect.max.y),
+    );
+    painter.with_clip_rect(clip).galley(
+        egui::pos2(text_x, rect.center().y - label_galley.size().y * 0.5_f32),
+        label_galley,
+        p.text_primary,
     );
     resp.clicked()
 }
@@ -3072,5 +3183,21 @@ mod tests {
             assert_eq!(query.tag.as_deref(), tag);
             assert_eq!(query.limit, Some(HISTORY_LIMIT));
         }
+    }
+
+    #[test]
+    fn compact_hotkey_and_monitor_labels_stay_short() {
+        assert_eq!(compact_hotkey_label("Ctrl + PrintScreen"), "Ctrl+PrtSc");
+        assert_eq!(compact_hotkey_label("Shift + PrintScreen"), "Shift+PrtSc");
+        let monitor = MonitorInfo {
+            id: sharex_core::MonitorId::new(1),
+            name: r"\\.\DISPLAY2".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            is_primary: true,
+        };
+        assert_eq!(friendly_monitor_label(&monitor), "Display 2 · 1920×1080");
     }
 }
