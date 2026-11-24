@@ -1,0 +1,11 @@
+[package]
+name = "sharex-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure Rust non-destructive screenshot annotation document and RGBA rasterizer for ShareX in Rust."
+
+[dependencies]
+sharex-core = { path = "../sharex-core" }

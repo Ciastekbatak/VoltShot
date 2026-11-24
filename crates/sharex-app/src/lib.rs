@@ -1,6 +1,10 @@
 pub mod cli;
 pub mod clipboard;
+pub mod editor_ui;
 pub mod gui;
+pub mod hotkeys;
+pub mod region_overlay;
+pub mod theme;
 
 use chrono::Utc;
 use clap::Parser;

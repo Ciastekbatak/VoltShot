@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "CLI and native egui desktop application for ShareX in Rust."
+description = "ShareX-style native egui desktop application, global hotkeys, region overlay, image editor, and CLI."
 
 [[bin]]
 name = "sharex"
@@ -16,8 +16,10 @@ arboard.workspace = true
 chrono.workspace = true
 clap.workspace = true
 eframe.workspace = true
+global-hotkey.workspace = true
 sharex-capture = { path = "../sharex-capture" }
 sharex-core = { path = "../sharex-core" }
+sharex-editor = { path = "../sharex-editor" }
 sharex-uploaders = { path = "../sharex-uploaders" }
 
 [dev-dependencies]

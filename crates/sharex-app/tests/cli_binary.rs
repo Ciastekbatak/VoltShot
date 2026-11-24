@@ -1,11 +1,17 @@
+use sharex_core::AppConfig;
 use std::process::Command;
 use tempfile::tempdir;
 
 #[test]
-fn compiled_binary_serves_help_uploaders_config_and_history_commands() {
+fn compiled_binary_serves_help_uploaders_config_history_and_hotkeys_commands() {
     let bin = env!("CARGO_BIN_EXE_sharex");
     let dir = tempdir().expect("tempdir");
     let cfg_path = dir.path().join("config.toml");
+
+    let mut cfg = AppConfig::default_for_os();
+    cfg.output_dir = dir.path().join("shots");
+    cfg.history_path = dir.path().join("history.jsonl");
+    cfg.save(&cfg_path).expect("write isolated test config");
 
     let help = Command::new(bin)
         .arg("--help")
@@ -16,6 +22,7 @@ fn compiled_binary_serves_help_uploaders_config_and_history_commands() {
     assert!(help_text.contains("capture"));
     assert!(help_text.contains("monitors"));
     assert!(help_text.contains("history"));
+    assert!(help_text.contains("hotkeys"));
     assert!(help_text.contains("gui"));
 
     let uploaders = Command::new(bin)
@@ -51,4 +58,14 @@ fn compiled_binary_serves_help_uploaders_config_and_history_commands() {
         .expect("run sharex history list");
     assert!(history_out.status.success());
     assert!(String::from_utf8_lossy(&history_out.stdout).contains("No captures recorded yet."));
+
+    let hotkeys_out = Command::new(bin)
+        .args(["--config", cfg_path.to_str().expect("utf8"), "hotkeys"])
+        .output()
+        .expect("run sharex hotkeys");
+    assert!(hotkeys_out.status.success());
+    let hk_text = String::from_utf8_lossy(&hotkeys_out.stdout);
+    assert!(hk_text.contains("PrintScreen"));
+    assert!(hk_text.contains("Ctrl + PrintScreen"));
+    assert!(hk_text.contains("Alt + PrintScreen"));
 }

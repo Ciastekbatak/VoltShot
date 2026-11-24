@@ -1,62 +1,46 @@
 use crate::clipboard::SystemClipboard;
-use crate::default_mirror_dir;
+use crate::editor_ui::{EditorAction, EditorViewState};
+use crate::hotkeys::{HotkeyRuntime, HotkeyStatus};
+use crate::region_overlay::{OverlayOutcome, RegionOverlayState};
+use crate::theme::{SharexPalette, apply_sharex_theme, palette};
 use chrono::Utc;
-use eframe::egui;
+use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 use sharex_capture::XcapCapturer;
 use sharex_core::{
-    AppConfig, CapturePipeline, CaptureSource, CapturedImage, ClipboardSink, FileNameContext,
-    FileNamePattern, HistoryEntry, HistoryRepository, ImageFormat, JsonlHistoryStore, MonitorInfo,
-    PipelineDeps, Region, ScreenCapturer, TaskReport,
+    AppConfig, CaptureId, CapturePipeline, CaptureSource, CapturedImage, ClipboardSink,
+    EmptyUploaderLookup, FileNameContext, FileNamePattern, HistoryEntry, HistoryRepository,
+    HotkeyAction, HotkeyCombo, ImageFormat, JsonlHistoryStore, KeyCode, KeyModifiers, MonitorInfo,
+    PipelineDeps, ScreenCapturer, default_sharex_hotkeys, resolve_unique_path,
 };
-use sharex_uploaders::UploaderRegistry;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
-/// Starts the native desktop application window.
+/// Starts the ShareX-style native desktop application window with global hotkeys.
 pub fn launch_gui(config_path: PathBuf) -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("ShareX in Rust")
-            .with_inner_size([1040.0, 680.0])
-            .with_min_inner_size([760.0, 500.0]),
+            .with_title("ShareX (Rust)")
+            .with_inner_size([1160.0, 720.0])
+            .with_min_inner_size([860.0, 540.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "ShareX in Rust",
+        "ShareX (Rust)",
         options,
-        Box::new(move |_cc| Ok(Box::new(SharexGuiApp::new(config_path)))),
+        Box::new(move |cc| Ok(Box::new(SharexGuiApp::new(cc, config_path)))),
     )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActiveTab {
-    Preview,
-    History,
+enum ActiveView {
+    Captures,
+    Editor,
+    Hotkeys,
     Settings,
-}
-
-#[derive(Debug, Clone)]
-struct RegionInputs {
-    x: String,
-    y: String,
-    width: String,
-    height: String,
-}
-
-impl Default for RegionInputs {
-    fn default() -> Self {
-        Self {
-            x: "0".into(),
-            y: "0".into(),
-            width: "800".into(),
-            height: "600".into(),
-        }
-    }
-}
-
-struct LastCaptureView {
-    report: TaskReport,
-    texture: egui::TextureHandle,
 }
 
 struct SharexGuiApp {
@@ -65,63 +49,147 @@ struct SharexGuiApp {
     output_dir_input: String,
     monitors: Vec<MonitorInfo>,
     selected_monitor_idx: usize,
-    region_inputs: RegionInputs,
-    active_tab: ActiveTab,
+    active_view: ActiveView,
+    search_filter: String,
     history_entries: Vec<HistoryEntry>,
-    last_capture: Option<LastCaptureView>,
-    status_line: String,
+    selected_entry_id: Option<String>,
+    thumbnails: HashMap<PathBuf, egui::TextureHandle>,
+    failed_thumbs: HashMap<PathBuf, bool>,
+    editor: Option<EditorViewState>,
+    overlay: Option<RegionOverlayState>,
+    hotkeys: HotkeyRuntime,
     capturer: XcapCapturer,
     clipboard: SystemClipboard,
-    uploaders: UploaderRegistry,
+    status_line: String,
+    theme_applied_dark: bool,
 }
 
 impl SharexGuiApp {
-    fn new(config_path: PathBuf) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, config_path: PathBuf) -> Self {
         let (config, initial_status) = match AppConfig::load_or_default(&config_path) {
-            Ok(cfg) => (cfg, "Ready to capture.".to_owned()),
+            Ok(cfg) => (
+                cfg,
+                "Ready. Press PrintScreen or Ctrl+PrintScreen to capture.".to_owned(),
+            ),
             Err(err) => (
                 AppConfig::default_for_os(),
-                format!("Loaded defaults after config error: {err}"),
+                format!("Loaded default config after error: {err}"),
             ),
         };
 
+        apply_sharex_theme(&cc.egui_ctx, config.dark_theme);
+        let hotkeys = HotkeyRuntime::new(cc.egui_ctx.clone(), &config.hotkeys);
         let capturer = XcapCapturer::new();
         let monitors = capturer.list_monitors().unwrap_or_default();
         let history_entries = JsonlHistoryStore::new(&config.history_path)
-            .list(Some(50))
+            .list(Some(100))
             .unwrap_or_default();
-        let uploaders = UploaderRegistry::with_local_mirror(default_mirror_dir(&config));
         let output_dir_input = config.output_dir.display().to_string();
 
         Self {
             config_path,
+            theme_applied_dark: config.dark_theme,
             config,
             output_dir_input,
             monitors,
             selected_monitor_idx: 0,
-            region_inputs: RegionInputs::default(),
-            active_tab: ActiveTab::Preview,
+            active_view: ActiveView::Captures,
+            search_filter: String::new(),
             history_entries,
-            last_capture: None,
-            status_line: initial_status,
+            selected_entry_id: None,
+            thumbnails: HashMap::new(),
+            failed_thumbs: HashMap::new(),
+            editor: None,
+            overlay: None,
+            hotkeys,
             capturer,
             clipboard: SystemClipboard::new(),
-            uploaders,
+            status_line: initial_status,
         }
     }
 
-    fn run_capture(&mut self, ctx: &egui::Context, source: CaptureSource) {
+    fn persist_config_silent(&mut self) {
+        if let Err(err) = self.config.save(&self.config_path) {
+            self.status_line = format!("Failed to save config: {err}");
+        }
+    }
+
+    fn hotkey_hint(&self, action: HotkeyAction) -> String {
+        self.config
+            .hotkeys
+            .iter()
+            .find(|b| b.action == action && b.enabled)
+            .and_then(|b| b.combo)
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "Unbound".into())
+    }
+
+    fn trigger_hotkey_action(&mut self, ctx: &egui::Context, action: HotkeyAction) {
+        match action {
+            HotkeyAction::CaptureFullscreen => {
+                self.capture_source(ctx, CaptureSource::PrimaryMonitor);
+            }
+            HotkeyAction::CaptureRegion => {
+                self.start_region_overlay(ctx);
+            }
+            HotkeyAction::CaptureActiveWindow => {
+                self.capture_source(ctx, CaptureSource::ActiveWindow);
+            }
+            HotkeyAction::CaptureLastRegion => {
+                if let Some(region) = self.config.last_region {
+                    self.capture_source(ctx, CaptureSource::Region { region });
+                } else {
+                    self.status_line =
+                        "No last region saved yet. Starting region selection.".into();
+                    self.start_region_overlay(ctx);
+                }
+            }
+            HotkeyAction::OpenEditor => {
+                if self.editor.is_some() {
+                    self.active_view = ActiveView::Editor;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                } else if let Some(first_path) = self
+                    .history_entries
+                    .iter()
+                    .find_map(|e| e.file_path.clone())
+                {
+                    self.open_file_in_editor(ctx, &first_path);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                } else {
+                    self.status_line =
+                        "No screenshot available to open in the image editor.".into();
+                }
+            }
+        }
+    }
+
+    fn start_region_overlay(&mut self, ctx: &egui::Context) {
+        match self.capturer.capture_primary_snapshot() {
+            Ok(snapshot) => {
+                self.overlay = Some(RegionOverlayState::open(ctx, snapshot));
+                self.status_line =
+                    "Region capture active: drag to select, Enter for fullscreen, Esc to cancel."
+                        .into();
+            }
+            Err(err) => {
+                self.status_line = format!("Region capture failed: {err}");
+            }
+        }
+    }
+
+    fn capture_source(&mut self, ctx: &egui::Context, source: CaptureSource) {
         let history = JsonlHistoryStore::new(&self.config.history_path);
+        let mut run_cfg = self.config.clone();
+        run_cfg.pipeline.uploader_id = None;
+        let uploaders = EmptyUploaderLookup;
         let deps = PipelineDeps {
             capturer: &self.capturer,
             clipboard: &self.clipboard,
-            uploaders: &self.uploaders,
+            uploaders: &uploaders,
             history: &history,
         };
-        match CapturePipeline::execute(source, &self.config, &deps, Utc::now()) {
+        match CapturePipeline::execute(source, &run_cfg, &deps, Utc::now()) {
             Ok(report) => {
-                let texture =
-                    create_preview_texture(ctx, &report.image, report.capture_id.as_str());
                 let saved_note = report
                     .saved_path
                     .as_ref()
@@ -134,12 +202,136 @@ impl SharexGuiApp {
                     report.format,
                     saved_note
                 );
-                self.last_capture = Some(LastCaptureView { report, texture });
-                self.active_tab = ActiveTab::Preview;
+                if let Some(path) = &report.saved_path {
+                    self.thumbnails.remove(path);
+                    self.failed_thumbs.remove(path);
+                }
                 self.refresh_history();
+                self.selected_entry_id = Some(report.capture_id.as_str().to_owned());
+
+                if self.config.pipeline.open_in_editor {
+                    self.editor = Some(EditorViewState::open(
+                        ctx,
+                        report.image,
+                        report.saved_path,
+                        report.format,
+                    ));
+                    self.active_view = ActiveView::Editor;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
             }
             Err(err) => {
                 self.status_line = format!("Capture failed: {err}");
+            }
+        }
+    }
+
+    fn commit_captured_image(
+        &mut self,
+        ctx: &egui::Context,
+        image: CapturedImage,
+        source: CaptureSource,
+    ) {
+        let now = Utc::now();
+        let format = self.config.image_format;
+        let saved_path = if self.config.pipeline.save_to_file {
+            match self.write_new_capture_file(&image, format, now) {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    self.status_line = format!("Failed to save capture: {err}");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        if self.config.pipeline.copy_image_to_clipboard
+            && let Err(err) = self.clipboard.copy_image(&image)
+        {
+            self.status_line = format!("Saved capture, but clipboard copy failed: {err}");
+        }
+
+        if self.config.pipeline.copy_path_to_clipboard
+            && let Some(path) = &saved_path
+        {
+            let _ = self.clipboard.copy_text(&path.display().to_string());
+        }
+
+        let capture_id = CaptureId::from_timestamp(now, image.width() ^ image.height());
+        if self.config.pipeline.record_history {
+            let store = JsonlHistoryStore::new(&self.config.history_path);
+            let _ = store.append(&HistoryEntry {
+                id: capture_id.clone(),
+                timestamp: now,
+                source,
+                width: image.width(),
+                height: image.height(),
+                format,
+                file_path: saved_path.clone(),
+                upload_url: None,
+            });
+        }
+
+        self.refresh_history();
+        self.selected_entry_id = Some(capture_id.as_str().to_owned());
+        self.status_line = match &saved_path {
+            Some(p) => format!(
+                "Captured region {}x{} -> {}",
+                image.width(),
+                image.height(),
+                p.display()
+            ),
+            None => format!("Captured region {}x{}.", image.width(), image.height()),
+        };
+
+        if self.config.pipeline.open_in_editor {
+            self.editor = Some(EditorViewState::open(ctx, image, saved_path, format));
+            self.active_view = ActiveView::Editor;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+
+    fn write_new_capture_file(
+        &self,
+        image: &CapturedImage,
+        format: ImageFormat,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<PathBuf, String> {
+        let pattern =
+            FileNamePattern::parse(&self.config.file_name_pattern).map_err(|e| e.to_string())?;
+        let stem = pattern.expand(&FileNameContext {
+            timestamp: now,
+            app_name: "ShareX",
+            width: image.width(),
+            height: image.height(),
+        });
+        fs::create_dir_all(&self.config.output_dir).map_err(|e| e.to_string())?;
+        let path = resolve_unique_path(&self.config.output_dir, &stem, format.extension());
+        let bytes = image.encode(format).map_err(|e| e.to_string())?;
+        fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    fn open_file_in_editor(&mut self, ctx: &egui::Context, path: &Path) {
+        match CapturedImage::load_from_file(path) {
+            Ok(img) => {
+                let format = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(|e| e.parse::<ImageFormat>().ok())
+                    .unwrap_or(self.config.image_format);
+                self.editor = Some(EditorViewState::open(
+                    ctx,
+                    img,
+                    Some(path.to_path_buf()),
+                    format,
+                ));
+                self.active_view = ActiveView::Editor;
+                self.status_line = format!("Opened {} in image editor.", path.display());
+            }
+            Err(err) => {
+                self.status_line = format!("Could not open {}: {err}", path.display());
             }
         }
     }
@@ -151,222 +343,630 @@ impl SharexGuiApp {
                 if self.selected_monitor_idx >= self.monitors.len() {
                     self.selected_monitor_idx = 0;
                 }
-                self.status_line = format!("Detected {} monitor(s).", self.monitors.len());
             }
-            Err(err) => {
-                self.status_line = format!("Monitor refresh failed: {err}");
-            }
+            Err(err) => self.status_line = format!("Monitor refresh failed: {err}"),
         }
     }
 
     fn refresh_history(&mut self) {
         let store = JsonlHistoryStore::new(&self.config.history_path);
-        match store.list(Some(50)) {
+        match store.list(Some(100)) {
             Ok(entries) => self.history_entries = entries,
-            Err(err) => self.status_line = format!("History read failed: {err}"),
+            Err(err) => self.status_line = format!("History load failed: {err}"),
         }
     }
 
-    fn parse_region_inputs(&self) -> Result<Region, String> {
-        let spec = format!(
-            "{},{},{},{}",
-            self.region_inputs.x.trim(),
-            self.region_inputs.y.trim(),
-            self.region_inputs.width.trim(),
-            self.region_inputs.height.trim()
-        );
-        Region::parse(&spec).map_err(|err| err.to_string())
+    fn ensure_thumbnail(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureId> {
+        if let Some(tex) = self.thumbnails.get(path) {
+            return Some(tex.id());
+        }
+        if self.failed_thumbs.contains_key(path) || !path.exists() {
+            return None;
+        }
+        match CapturedImage::load_from_file(path) {
+            Ok(img) => {
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [img.width() as usize, img.height() as usize],
+                    img.rgba(),
+                );
+                let tex = ctx.load_texture(
+                    format!("thumb_{}", path.display()),
+                    color,
+                    egui::TextureOptions::LINEAR,
+                );
+                let id = tex.id();
+                self.thumbnails.insert(path.to_path_buf(), tex);
+                Some(id)
+            }
+            Err(_) => {
+                self.failed_thumbs.insert(path.to_path_buf(), true);
+                None
+            }
+        }
     }
 
-    fn render_sidebar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        ui.heading("ShareX in Rust");
+    fn render_sidebar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p: &SharexPalette) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("ShareX")
+                    .size(20.0)
+                    .strong()
+                    .color(p.text_primary),
+            );
+            ui.label(RichText::new("Rust").size(12.0).color(p.accent));
+        });
+        ui.add_space(6.0);
         ui.separator();
 
-        ui.label("Capture");
-        if ui.button("Fullscreen (Primary)").clicked() {
-            self.run_capture(ctx, CaptureSource::PrimaryMonitor);
+        ui.label(
+            RichText::new("CAPTURE")
+                .size(11.0)
+                .strong()
+                .color(p.text_muted),
+        );
+        if sidebar_action_button(
+            ui,
+            "Fullscreen",
+            &self.hotkey_hint(HotkeyAction::CaptureFullscreen),
+            p,
+        ) {
+            self.capture_source(ctx, CaptureSource::PrimaryMonitor);
+        }
+        if sidebar_action_button(
+            ui,
+            "Region",
+            &self.hotkey_hint(HotkeyAction::CaptureRegion),
+            p,
+        ) {
+            self.start_region_overlay(ctx);
+        }
+        if sidebar_action_button(
+            ui,
+            "Active window",
+            &self.hotkey_hint(HotkeyAction::CaptureActiveWindow),
+            p,
+        ) {
+            self.capture_source(ctx, CaptureSource::ActiveWindow);
+        }
+        if sidebar_action_button(
+            ui,
+            "Last region",
+            &self.hotkey_hint(HotkeyAction::CaptureLastRegion),
+            p,
+        ) {
+            self.trigger_hotkey_action(ctx, HotkeyAction::CaptureLastRegion);
         }
 
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             let selected_label = self
                 .monitors
                 .get(self.selected_monitor_idx)
                 .map(|m| format!("{} ({}x{})", m.name, m.width, m.height))
                 .unwrap_or_else(|| "No monitor".into());
-            egui::ComboBox::from_id_salt("monitor_picker")
+            egui::ComboBox::from_id_salt("sidebar_monitor")
                 .selected_text(selected_label)
-                .width(150.0)
+                .width(142.0)
                 .show_ui(ui, |ui| {
-                    for (idx, monitor) in self.monitors.iter().enumerate() {
-                        let label =
-                            format!("{} ({}x{})", monitor.name, monitor.width, monitor.height);
+                    for (idx, m) in self.monitors.iter().enumerate() {
+                        let label = format!("{} ({}x{})", m.name, m.width, m.height);
                         ui.selectable_value(&mut self.selected_monitor_idx, idx, label);
                     }
                 });
-            if ui.button("Refresh").clicked() {
-                self.refresh_monitors();
+            if ui.small_button("Go").clicked()
+                && let Some(m) = self.monitors.get(self.selected_monitor_idx)
+            {
+                self.capture_source(ctx, CaptureSource::Monitor { id: m.id });
             }
         });
 
-        if ui
-            .add_enabled(
-                !self.monitors.is_empty(),
-                egui::Button::new("Capture Selected Monitor"),
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(
+            RichText::new("AFTER CAPTURE TASKS")
+                .size(11.0)
+                .strong()
+                .color(p.text_muted),
+        );
+        let mut changed = false;
+        changed |= ui
+            .checkbox(&mut self.config.pipeline.save_to_file, "Save image to file")
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.config.pipeline.copy_image_to_clipboard,
+                "Copy image to clipboard",
             )
-            .clicked()
-            && let Some(monitor) = self.monitors.get(self.selected_monitor_idx)
-        {
-            self.run_capture(ctx, CaptureSource::Monitor { id: monitor.id });
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.config.pipeline.open_in_editor,
+                "Open in image editor",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.config.pipeline.copy_path_to_clipboard,
+                "Copy file path",
+            )
+            .changed();
+        if changed {
+            self.persist_config_silent();
         }
 
+        ui.add_space(6.0);
         ui.separator();
-        ui.label("Region (x, y, w, h)");
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.region_inputs.x).desired_width(42.0));
-            ui.add(egui::TextEdit::singleline(&mut self.region_inputs.y).desired_width(42.0));
-            ui.add(egui::TextEdit::singleline(&mut self.region_inputs.width).desired_width(48.0));
-            ui.add(egui::TextEdit::singleline(&mut self.region_inputs.height).desired_width(48.0));
-        });
-        if ui.button("Capture Region").clicked() {
-            match self.parse_region_inputs() {
-                Ok(region) => self.run_capture(ctx, CaptureSource::Region { region }),
-                Err(err) => self.status_line = format!("Invalid region: {err}"),
-            }
-        }
-
-        ui.separator();
-        ui.label("After capture");
-        ui.checkbox(&mut self.config.pipeline.save_to_file, "Save image to file");
-        ui.checkbox(
-            &mut self.config.pipeline.copy_image_to_clipboard,
-            "Copy image to clipboard",
+        ui.label(
+            RichText::new("WORKSPACE")
+                .size(11.0)
+                .strong()
+                .color(p.text_muted),
         );
-        ui.checkbox(
-            &mut self.config.pipeline.copy_path_to_clipboard,
-            "Copy path or URL",
-        );
-        ui.checkbox(&mut self.config.pipeline.record_history, "Record history");
 
-        ui.separator();
-        ui.label("Views");
-        ui.selectable_value(&mut self.active_tab, ActiveTab::Preview, "Preview");
-        if ui
-            .selectable_value(&mut self.active_tab, ActiveTab::History, "History")
-            .clicked()
-        {
+        if sidebar_nav_button(ui, "Captures", self.active_view == ActiveView::Captures, p) {
+            self.active_view = ActiveView::Captures;
             self.refresh_history();
         }
-        ui.selectable_value(&mut self.active_tab, ActiveTab::Settings, "Settings");
-    }
-
-    fn render_preview_tab(&mut self, ui: &mut egui::Ui) {
-        if let Some(view) = &self.last_capture {
-            ui.horizontal(|ui| {
-                ui.label(format!(
-                    "{} | {}x{} | {}",
-                    view.report.capture_id,
-                    view.report.image.width(),
-                    view.report.image.height(),
-                    view.report.format
-                ));
-                if let Some(path) = &view.report.saved_path
-                    && ui.button("Copy Path").clicked()
-                {
-                    let text = path.display().to_string();
-                    self.status_line = match self.clipboard.copy_text(&text) {
-                        Ok(()) => format!("Copied path: {text}"),
-                        Err(err) => format!("Clipboard error: {err}"),
-                    };
-                }
-            });
-
-            if let Some(url) = &view.report.upload_url {
-                ui.label(format!("Upload URL: {url}"));
-            }
-
-            ui.separator();
-            let available = ui.available_size();
-            let img_size = view.texture.size_vec2();
-            let scale = (available.x / img_size.x)
-                .min(available.y / img_size.y)
-                .clamp(0.1, 1.0);
-            ui.image((view.texture.id(), img_size * scale));
-        } else {
-            ui.centered_and_justified(|ui| {
-                ui.label("Trigger a capture from the left panel to preview it here.");
-            });
+        let editor_label = match &self.editor {
+            Some(ed) if ed.is_dirty() => "Image editor *",
+            Some(_) => "Image editor",
+            None => "Image editor (empty)",
+        };
+        if sidebar_nav_button(ui, editor_label, self.active_view == ActiveView::Editor, p) {
+            self.active_view = ActiveView::Editor;
+        }
+        if sidebar_nav_button(
+            ui,
+            "Hotkey settings",
+            self.active_view == ActiveView::Hotkeys,
+            p,
+        ) {
+            self.active_view = ActiveView::Hotkeys;
+        }
+        if sidebar_nav_button(
+            ui,
+            "Application settings",
+            self.active_view == ActiveView::Settings,
+            p,
+        ) {
+            self.active_view = ActiveView::Settings;
         }
     }
 
-    fn render_history_tab(&mut self, ui: &mut egui::Ui) {
+    fn render_captures_view(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p: &SharexPalette) {
         ui.horizontal(|ui| {
-            ui.heading("Capture History");
-            if ui.button("Refresh").clicked() {
-                self.refresh_history();
+            ui.heading("Captures");
+            ui.add_space(8.0);
+            let region_btn =
+                egui::Button::new(RichText::new("+ Capture Region").color(Color32::WHITE))
+                    .fill(p.accent);
+            if ui.add(region_btn).clicked() {
+                self.start_region_overlay(ctx);
             }
-            if ui.button("Clear").clicked() {
-                let store = JsonlHistoryStore::new(&self.config.history_path);
-                match store.clear() {
-                    Ok(()) => {
-                        self.history_entries.clear();
-                        self.status_line = "History cleared.".into();
-                    }
-                    Err(err) => self.status_line = format!("Failed to clear history: {err}"),
+            if ui.button("Fullscreen").clicked() {
+                self.capture_source(ctx, CaptureSource::PrimaryMonitor);
+            }
+            if ui.button("Open Screenshots Folder").clicked() {
+                let _ = fs::create_dir_all(&self.config.output_dir);
+                open_folder_in_os(&self.config.output_dir);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Refresh").clicked() {
+                    self.refresh_history();
+                    self.refresh_monitors();
                 }
-            }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search_filter)
+                        .hint_text("Filter captures...")
+                        .desired_width(180.0),
+                );
+            });
         });
         ui.separator();
 
-        if self.history_entries.is_empty() {
-            ui.label("No captures recorded yet.");
+        let query = self.search_filter.trim().to_ascii_lowercase();
+        let visible: Vec<HistoryEntry> = self
+            .history_entries
+            .iter()
+            .filter(|entry| {
+                if query.is_empty() {
+                    return true;
+                }
+                let path_match = entry.file_path.as_ref().is_some_and(|path| {
+                    path.to_string_lossy().to_ascii_lowercase().contains(&query)
+                });
+                path_match || entry.id.as_str().to_ascii_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect();
+
+        if visible.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(80.0);
+                    ui.label(
+                        RichText::new("No screenshots yet")
+                            .size(18.0)
+                            .strong()
+                            .color(p.text_primary),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Press {} for fullscreen, {} for interactive region capture, or {} for active window.",
+                            self.hotkey_hint(HotkeyAction::CaptureFullscreen),
+                            self.hotkey_hint(HotkeyAction::CaptureRegion),
+                            self.hotkey_hint(HotkeyAction::CaptureActiveWindow),
+                        ))
+                        .color(p.text_muted),
+                    );
+                });
+            });
             return;
         }
 
-        let mut copy_target: Option<String> = None;
+        let mut open_editor_path: Option<PathBuf> = None;
+        let mut copy_img_path: Option<PathBuf> = None;
+        let mut copy_text_val: Option<String> = None;
+        let mut delete_file_path: Option<PathBuf> = None;
+
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for entry in &self.history_entries {
-                ui.group(|ui| {
+            for entry in &visible {
+                let is_selected = self
+                    .selected_entry_id
+                    .as_deref()
+                    .is_some_and(|id| id == entry.id.as_str());
+                let frame = egui::Frame::NONE
+                    .fill(p.card_bg)
+                    .stroke(Stroke::new(
+                        if is_selected { 1.5_f32 } else { 1.0_f32 },
+                        if is_selected { p.accent } else { p.border },
+                    ))
+                    .corner_radius(CornerRadius::same(5))
+                    .inner_margin(Margin::same(10));
+
+                frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "{} | {}x{} {}",
-                            entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
-                            entry.width,
-                            entry.height,
-                            entry.format
-                        ));
-                        let target = entry
-                            .upload_url
-                            .clone()
-                            .or_else(|| entry.file_path.as_ref().map(|p| p.display().to_string()));
-                        if let Some(text) = target {
-                            if ui.button("Copy").clicked() {
-                                copy_target = Some(text.clone());
+                        let thumb_size = Vec2::new(128.0, 76.0);
+                        let thumb_tex = entry
+                            .file_path
+                            .as_deref()
+                            .and_then(|path| self.ensure_thumbnail(ctx, path));
+                        if let Some(tex_id) = thumb_tex {
+                            let img_resp = ui.add(
+                                egui::Image::new((tex_id, thumb_size))
+                                    .corner_radius(CornerRadius::same(3))
+                                    .sense(egui::Sense::click()),
+                            );
+                            if img_resp.clicked() {
+                                self.selected_entry_id = Some(entry.id.as_str().to_owned());
                             }
-                            ui.label(text);
+                            if img_resp.double_clicked()
+                                && let Some(path) = &entry.file_path
+                            {
+                                open_editor_path = Some(path.clone());
+                            }
+                        } else {
+                            let (rect, _) =
+                                ui.allocate_exact_size(thumb_size, egui::Sense::hover());
+                            ui.painter()
+                                .rect_filled(rect, CornerRadius::same(3), p.sidebar_bg);
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "No preview",
+                                egui::FontId::proportional(11.0),
+                                p.text_muted,
+                            );
                         }
+
+                        ui.add_space(8.0);
+                        ui.vertical(|ui| {
+                            let title = entry
+                                .file_path
+                                .as_ref()
+                                .and_then(|fp| fp.file_name())
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| entry.id.as_str().to_owned());
+                            ui.label(
+                                RichText::new(title)
+                                    .strong()
+                                    .size(14.0)
+                                    .color(p.text_primary),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}x{} {} | {}",
+                                    entry.width,
+                                    entry.height,
+                                    entry.format.extension().to_ascii_uppercase(),
+                                    entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+                                ))
+                                .size(12.0)
+                                .color(p.text_muted),
+                            );
+                            if let Some(path) = &entry.file_path {
+                                ui.label(
+                                    RichText::new(path.display().to_string())
+                                        .size(11.0)
+                                        .color(p.text_muted),
+                                );
+                            }
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if let Some(path) = &entry.file_path {
+                                    let exists = path.exists();
+                                    if ui.add_enabled(exists, egui::Button::new("Edit")).clicked() {
+                                        open_editor_path = Some(path.clone());
+                                    }
+                                    if ui
+                                        .add_enabled(exists, egui::Button::new("Copy Image"))
+                                        .clicked()
+                                    {
+                                        copy_img_path = Some(path.clone());
+                                    }
+                                    if ui.button("Copy Path").clicked() {
+                                        copy_text_val = Some(path.display().to_string());
+                                    }
+                                    if ui
+                                        .add_enabled(exists, egui::Button::new("Delete File"))
+                                        .clicked()
+                                    {
+                                        delete_file_path = Some(path.clone());
+                                    }
+                                }
+                            });
+                        });
                     });
                 });
+                ui.add_space(6.0);
             }
         });
 
-        if let Some(text) = copy_target {
+        if let Some(path) = open_editor_path {
+            self.open_file_in_editor(ctx, &path);
+        }
+        if let Some(path) = copy_img_path {
+            self.status_line = match CapturedImage::load_from_file(&path)
+                .and_then(|img| self.clipboard.copy_image(&img))
+            {
+                Ok(()) => format!("Copied image {} to clipboard.", path.display()),
+                Err(err) => format!("Copy image failed: {err}"),
+            };
+        }
+        if let Some(text) = copy_text_val {
             self.status_line = match self.clipboard.copy_text(&text) {
-                Ok(()) => format!("Copied: {text}"),
+                Ok(()) => format!("Copied path: {text}"),
                 Err(err) => format!("Clipboard error: {err}"),
+            };
+        }
+        if let Some(path) = delete_file_path {
+            self.status_line = match fs::remove_file(&path) {
+                Ok(()) => {
+                    self.thumbnails.remove(&path);
+                    self.failed_thumbs.remove(&path);
+                    format!("Deleted {}", path.display())
+                }
+                Err(err) => format!("Delete failed: {err}"),
             };
         }
     }
 
-    fn render_settings_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
+    fn render_editor_view(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p: &SharexPalette) {
+        let Some(editor) = self.editor.as_mut() else {
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(80.0);
+                    ui.label(
+                        RichText::new("No image loaded in the editor")
+                            .size(18.0)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Double-click any screenshot in Captures, or enable 'Open in image editor' before taking a screenshot.")
+                            .color(p.text_muted),
+                    );
+                });
+            });
+            return;
+        };
+
+        let action = editor.show(ctx, ui, p);
+        match action {
+            EditorAction::None => {}
+            EditorAction::CopyImage(img) => {
+                self.status_line = match self.clipboard.copy_image(&img) {
+                    Ok(()) => "Copied edited image to clipboard.".into(),
+                    Err(err) => format!("Clipboard error: {err}"),
+                };
+            }
+            EditorAction::Save {
+                image,
+                target_path,
+                format,
+            } => {
+                let save_result = match target_path {
+                    Some(path) => image
+                        .encode(format)
+                        .map_err(|e| e.to_string())
+                        .and_then(|bytes| fs::write(&path, bytes).map_err(|e| e.to_string()))
+                        .map(|()| path),
+                    None => self.write_new_capture_file(&image, format, Utc::now()),
+                };
+                match save_result {
+                    Ok(path) => {
+                        self.thumbnails.remove(&path);
+                        self.failed_thumbs.remove(&path);
+                        if let Some(ed) = self.editor.as_mut() {
+                            ed.set_saved(path.clone());
+                        }
+                        self.status_line = format!("Saved edited screenshot to {}", path.display());
+                        self.refresh_history();
+                    }
+                    Err(err) => self.status_line = format!("Save failed: {err}"),
+                }
+            }
+            EditorAction::SaveAsCopy { image, format } => {
+                match self.write_new_capture_file(&image, format, Utc::now()) {
+                    Ok(path) => {
+                        let now = Utc::now();
+                        let store = JsonlHistoryStore::new(&self.config.history_path);
+                        let _ = store.append(&HistoryEntry {
+                            id: CaptureId::from_timestamp(now, image.width()),
+                            timestamp: now,
+                            source: CaptureSource::PrimaryMonitor,
+                            width: image.width(),
+                            height: image.height(),
+                            format,
+                            file_path: Some(path.clone()),
+                            upload_url: None,
+                        });
+                        if let Some(ed) = self.editor.as_mut() {
+                            ed.set_saved(path.clone());
+                        }
+                        self.status_line = format!("Saved edited copy to {}", path.display());
+                        self.refresh_history();
+                    }
+                    Err(err) => self.status_line = format!("Save copy failed: {err}"),
+                }
+            }
+            EditorAction::Close => {
+                self.editor = None;
+                self.active_view = ActiveView::Captures;
+            }
+        }
+    }
+
+    fn render_hotkeys_view(&mut self, ui: &mut egui::Ui, p: &SharexPalette) {
+        ui.horizontal(|ui| {
+            ui.heading("Hotkey settings");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let apply_btn =
+                    egui::Button::new(RichText::new("Apply & Save").color(Color32::WHITE))
+                        .fill(p.accent);
+                if ui.add(apply_btn).clicked() {
+                    self.hotkeys.sync(&self.config.hotkeys);
+                    self.persist_config_silent();
+                    self.status_line =
+                        format!("Applied hotkeys ({} active).", self.hotkeys.active_count());
+                }
+                if ui.button("Reset ShareX Defaults").clicked() {
+                    self.config.hotkeys = default_sharex_hotkeys();
+                    self.hotkeys.sync(&self.config.hotkeys);
+                    self.persist_config_silent();
+                    self.status_line = "Restored default ShareX keybinds.".into();
+                }
+            });
+        });
+        ui.label(
+            RichText::new("Global hotkeys work even while ShareX is minimized or behind other applications. If Windows Snipping Tool owns PrintScreen, bind another key or disable 'Use the Print screen key to open screen capture' in Windows Accessibility settings.")
+                .size(12.0)
+                .color(p.text_muted),
+        );
         ui.separator();
 
-        egui::Grid::new("settings_grid")
+        for binding in &mut self.config.hotkeys {
+            let status = self.hotkeys.status_for(&binding.id);
+            egui::Frame::NONE
+                .fill(p.card_bg)
+                .stroke(Stroke::new(1.0_f32, p.border))
+                .corner_radius(CornerRadius::same(4))
+                .inner_margin(Margin::same(10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut binding.enabled, "");
+                        ui.add_sized(
+                            [170.0, 22.0],
+                            egui::Label::new(
+                                RichText::new(binding.action.label()).strong().size(13.0),
+                            ),
+                        );
+
+                        let mut combo = binding.combo.unwrap_or_else(|| {
+                            HotkeyCombo::new(KeyModifiers::NONE, KeyCode::PrintScreen)
+                        });
+                        let mut edited = false;
+
+                        if ui.selectable_label(combo.modifiers.ctrl, "Ctrl").clicked() {
+                            combo.modifiers.ctrl = !combo.modifiers.ctrl;
+                            edited = true;
+                        }
+                        if ui.selectable_label(combo.modifiers.alt, "Alt").clicked() {
+                            combo.modifiers.alt = !combo.modifiers.alt;
+                            edited = true;
+                        }
+                        if ui
+                            .selectable_label(combo.modifiers.shift, "Shift")
+                            .clicked()
+                        {
+                            combo.modifiers.shift = !combo.modifiers.shift;
+                            edited = true;
+                        }
+
+                        egui::ComboBox::from_id_salt(format!("hotkey_key_{}", binding.id))
+                            .selected_text(match binding.combo {
+                                Some(c) => c.key.display_name(),
+                                None => "Unbound",
+                            })
+                            .width(120.0)
+                            .show_ui(ui, |ui| {
+                                for key in KeyCode::ALL {
+                                    if ui
+                                        .selectable_label(
+                                            binding.combo.is_some_and(|c| c.key == key),
+                                            key.display_name(),
+                                        )
+                                        .clicked()
+                                    {
+                                        combo.key = key;
+                                        edited = true;
+                                    }
+                                }
+                            });
+
+                        if edited {
+                            binding.combo = Some(combo);
+                        }
+                        if ui.small_button("Clear").clicked() {
+                            binding.combo = None;
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (badge_text, badge_color) = match status {
+                                HotkeyStatus::Active => ("Active".into(), p.success),
+                                HotkeyStatus::Disabled => ("Disabled".into(), p.text_muted),
+                                HotkeyStatus::Unbound => ("Unbound".into(), p.warning),
+                                HotkeyStatus::Error(msg) => (format!("Conflict: {msg}"), p.danger),
+                            };
+                            ui.label(RichText::new(badge_text).size(12.0).color(badge_color));
+                        });
+                    });
+                });
+            ui.add_space(4.0);
+        }
+    }
+
+    fn render_settings_view(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p: &SharexPalette) {
+        ui.heading("Application settings");
+        ui.separator();
+
+        egui::Grid::new("sharex_settings_grid")
             .num_columns(2)
-            .spacing([12.0, 8.0])
+            .spacing([14.0, 10.0])
             .show(ui, |ui| {
-                ui.label("Output directory");
-                ui.add(egui::TextEdit::singleline(&mut self.output_dir_input).desired_width(380.0));
+                ui.label("Screenshots folder");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.output_dir_input).desired_width(380.0),
+                    );
+                    if ui.button("Open").clicked() {
+                        let target = PathBuf::from(self.output_dir_input.trim());
+                        let _ = fs::create_dir_all(&target);
+                        open_folder_in_os(&target);
+                    }
+                });
                 ui.end_row();
 
                 ui.label("Filename pattern");
@@ -390,11 +990,11 @@ impl SharexGuiApp {
                     ),
                     Err(err) => format!("Invalid pattern: {err}"),
                 };
-                ui.label(preview);
+                ui.label(RichText::new(preview).monospace().color(p.text_muted));
                 ui.end_row();
 
                 ui.label("Image format");
-                egui::ComboBox::from_id_salt("format_picker")
+                egui::ComboBox::from_id_salt("settings_format_picker")
                     .selected_text(self.config.image_format.extension().to_ascii_uppercase())
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.config.image_format, ImageFormat::Png, "PNG");
@@ -411,33 +1011,34 @@ impl SharexGuiApp {
                     });
                 ui.end_row();
 
-                ui.label("Uploader");
-                let current_uploader = self
-                    .config
-                    .pipeline
-                    .uploader_id
-                    .as_deref()
-                    .unwrap_or("None")
-                    .to_owned();
-                egui::ComboBox::from_id_salt("uploader_picker")
-                    .selected_text(current_uploader)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.config.pipeline.uploader_id, None, "None");
-                        for meta in self.uploaders.list_metadata() {
-                            ui.selectable_value(
-                                &mut self.config.pipeline.uploader_id,
-                                Some(meta.id.to_owned()),
-                                format!("{} ({})", meta.name, meta.id),
-                            );
-                        }
-                    });
+                ui.label("Theme");
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.config.dark_theme, "ShareX Dark")
+                        .clicked()
+                    {
+                        self.config.dark_theme = true;
+                    }
+                    if ui
+                        .selectable_label(!self.config.dark_theme, "Light")
+                        .clicked()
+                    {
+                        self.config.dark_theme = false;
+                    }
+                });
                 ui.end_row();
             });
 
-        ui.add_space(12.0);
-        if ui.button("Save Settings").clicked() {
+        if self.config.dark_theme != self.theme_applied_dark {
+            apply_sharex_theme(ctx, self.config.dark_theme);
+            self.theme_applied_dark = self.config.dark_theme;
+        }
+
+        ui.add_space(14.0);
+        let save_btn =
+            egui::Button::new(RichText::new("Save Settings").color(Color32::WHITE)).fill(p.accent);
+        if ui.add(save_btn).clicked() {
             self.config.output_dir = PathBuf::from(self.output_dir_input.trim());
-            self.uploaders = UploaderRegistry::with_local_mirror(default_mirror_dir(&self.config));
             self.status_line = match self.config.save(&self.config_path) {
                 Ok(()) => format!("Saved settings to {}", self.config_path.display()),
                 Err(err) => format!("Failed to save settings: {err}"),
@@ -448,33 +1049,167 @@ impl SharexGuiApp {
 
 impl eframe::App for SharexGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.label(&self.status_line);
-        });
+        ctx.request_repaint_after(Duration::from_millis(120));
 
-        egui::SidePanel::left("sidebar")
-            .resizable(false)
-            .exact_width(245.0)
+        let pending_actions = self.hotkeys.poll_actions();
+        for action in pending_actions {
+            self.trigger_hotkey_action(ctx, action);
+        }
+
+        if let Some(overlay) = self.overlay.as_mut() {
+            match overlay.show(ctx) {
+                OverlayOutcome::Pending => {}
+                OverlayOutcome::Cancelled => {
+                    self.overlay = None;
+                    self.status_line = "Region capture cancelled.".into();
+                }
+                OverlayOutcome::Captured {
+                    image,
+                    global_region,
+                } => {
+                    self.overlay = None;
+                    self.config.last_region = Some(global_region);
+                    self.persist_config_silent();
+                    self.commit_captured_image(
+                        ctx,
+                        image,
+                        CaptureSource::Region {
+                            region: global_region,
+                        },
+                    );
+                }
+            }
+        }
+
+        let p = palette(self.config.dark_theme);
+
+        egui::TopBottomPanel::bottom("sharex_status_bar")
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.sidebar_bg)
+                    .stroke(Stroke::new(1.0_f32, p.border))
+                    .inner_margin(Margin::symmetric(10, 5)),
+            )
             .show(ctx, |ui| {
-                self.render_sidebar(ctx, ui);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "Hotkeys: {}/{} active",
+                            self.hotkeys.active_count(),
+                            self.config.hotkeys.len()
+                        ))
+                        .size(12.0)
+                        .color(if self.hotkeys.active_count() > 0 {
+                            p.success
+                        } else {
+                            p.warning
+                        }),
+                    );
+                    ui.separator();
+                    ui.label(
+                        RichText::new(&self.status_line)
+                            .size(12.0)
+                            .color(p.text_muted),
+                    );
+                });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
-            ActiveTab::Preview => self.render_preview_tab(ui),
-            ActiveTab::History => self.render_history_tab(ui),
-            ActiveTab::Settings => self.render_settings_tab(ui),
-        });
+        egui::SidePanel::left("sharex_sidebar")
+            .resizable(false)
+            .exact_width(220.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.sidebar_bg)
+                    .stroke(Stroke::new(1.0_f32, p.border))
+                    .inner_margin(Margin::same(10)),
+            )
+            .show(ctx, |ui| {
+                self.render_sidebar(ctx, ui, &p);
+            });
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.panel_bg)
+                    .inner_margin(Margin::same(12)),
+            )
+            .show(ctx, |ui| match self.active_view {
+                ActiveView::Captures => self.render_captures_view(ctx, ui, &p),
+                ActiveView::Editor => self.render_editor_view(ctx, ui, &p),
+                ActiveView::Hotkeys => self.render_hotkeys_view(ui, &p),
+                ActiveView::Settings => self.render_settings_view(ctx, ui, &p),
+            });
     }
 }
 
-fn create_preview_texture(
-    ctx: &egui::Context,
-    image: &CapturedImage,
-    name: &str,
-) -> egui::TextureHandle {
-    let color = egui::ColorImage::from_rgba_unmultiplied(
-        [image.width() as usize, image.height() as usize],
-        image.rgba(),
+fn sidebar_action_button(ui: &mut egui::Ui, label: &str, hotkey: &str, p: &SharexPalette) -> bool {
+    let desired = Vec2::new(ui.available_width(), 28.0);
+    let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let bg = if resp.hovered() {
+        p.hover_bg
+    } else {
+        p.card_bg
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(4), bg);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(4),
+        Stroke::new(1.0_f32, if resp.hovered() { p.accent } else { p.border }),
+        egui::StrokeKind::Inside,
     );
-    ctx.load_texture(name, color, egui::TextureOptions::LINEAR)
+    ui.painter().text(
+        egui::pos2(rect.min.x + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        p.text_primary,
+    );
+    ui.painter().text(
+        egui::pos2(rect.max.x - 8.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        hotkey,
+        egui::FontId::monospace(10.5),
+        p.text_muted,
+    );
+    resp.clicked()
+}
+
+fn sidebar_nav_button(ui: &mut egui::Ui, label: &str, active: bool, p: &SharexPalette) -> bool {
+    let desired = Vec2::new(ui.available_width(), 28.0);
+    let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let bg = if active {
+        p.accent
+    } else if resp.hovered() {
+        p.hover_bg
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(4), bg);
+    ui.painter().text(
+        egui::pos2(rect.min.x + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        if active {
+            Color32::WHITE
+        } else {
+            p.text_primary
+        },
+    );
+    resp.clicked()
+}
+
+fn open_folder_in_os(path: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("explorer").arg(path).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open").arg(path).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = Command::new("xdg-open").arg(path).spawn();
+    }
 }

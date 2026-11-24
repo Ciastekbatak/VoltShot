@@ -42,18 +42,24 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigCommand,
     },
+    /// List configured global hotkeys.
+    Hotkeys,
     /// List registered uploaders.
     Uploaders,
 }
 
 #[derive(Debug, Args)]
 pub struct CaptureArgs {
+    /// Capture the currently focused application window.
+    #[arg(long, conflicts_with_all = ["monitor", "region"])]
+    pub active_window: bool,
+
     /// Capture a specific monitor by numeric id from `sharex monitors`.
-    #[arg(long, conflicts_with = "region")]
+    #[arg(long, conflicts_with_all = ["region", "active_window"])]
     pub monitor: Option<u32>,
 
     /// Capture a rectangular region specified as `x,y,width,height`.
-    #[arg(long, conflicts_with = "monitor")]
+    #[arg(long, conflicts_with_all = ["monitor", "active_window"])]
     pub region: Option<String>,
 
     /// Override output directory for saved captures.
@@ -141,7 +147,9 @@ pub fn execute_headless(
             Ok(out.trim_end().to_owned())
         }
         Command::Capture(args) => {
-            let source = if let Some(id) = args.monitor {
+            let source = if args.active_window {
+                CaptureSource::ActiveWindow
+            } else if let Some(id) = args.monitor {
                 CaptureSource::Monitor {
                     id: MonitorId::new(id),
                 }
@@ -258,6 +266,22 @@ pub fn execute_headless(
             }
             ConfigCommand::Path => Ok(config_path.display().to_string()),
         },
+        Command::Hotkeys => {
+            let mut out = String::new();
+            for binding in &config.hotkeys {
+                let key = binding
+                    .combo
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "Unbound".into());
+                let state = if binding.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                let _ = writeln!(out, "{} | {} | {}", binding.action.label(), key, state);
+            }
+            Ok(out.trim_end().to_owned())
+        }
         Command::Uploaders => {
             let entries = uploaders.list_metadata();
             if entries.is_empty() {

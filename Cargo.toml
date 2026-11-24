@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/sharex-core",
     "crates/sharex-capture",
+    "crates/sharex-editor",
     "crates/sharex-uploaders",
     "crates/sharex-app",
 ]
@@ -20,6 +21,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 directories = "5"
 eframe = "0.31"
+global-hotkey = "0.10"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
