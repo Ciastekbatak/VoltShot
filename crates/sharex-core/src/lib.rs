@@ -7,6 +7,7 @@ pub mod hotkeys;
 pub mod naming;
 pub mod pipeline;
 pub mod ports;
+pub mod workflows;
 
 pub use config::{AppConfig, PipelineConfig};
 pub use domain::{
@@ -24,4 +25,8 @@ pub use pipeline::{CapturePipeline, PipelineDeps, TaskReport};
 pub use ports::{
     ClipboardSink, EmptyUploaderLookup, NoopClipboard, ScreenCapturer, UploadRequest, UploadResult,
     Uploader, UploaderLookup,
+};
+pub use workflows::{
+    TaskOverrides, WatchFolderRule, WatchFolderScanner, WatchedFileEvent, WorkflowPreset,
+    WorkflowRegistry, resolve_effective_config,
 };
