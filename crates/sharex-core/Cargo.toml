@@ -1,0 +1,20 @@
+[package]
+name = "sharex-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure domain model, filename formatting, configuration, history, and capture pipeline for ShareX in Rust."
+
+[dependencies]
+chrono.workspace = true
+directories.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

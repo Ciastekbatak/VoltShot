@@ -1,0 +1,14 @@
+[package]
+name = "sharex-uploaders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Uploader registry and built-in destinations for ShareX in Rust."
+
+[dependencies]
+sharex-core = { path = "../sharex-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

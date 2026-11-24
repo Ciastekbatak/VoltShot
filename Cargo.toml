@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sharex-core",
+    "crates/sharex-capture",
+    "crates/sharex-uploaders",
+    "crates/sharex-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/sharex-in-rust/sharex-in-rust"
+rust-version = "1.85"
+
+[workspace.dependencies]
+arboard = { version = "3", features = ["image-data"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+directories = "5"
+eframe = "0.31"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+toml = "0.8"
+xcap = "0.9"

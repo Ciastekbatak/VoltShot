@@ -1,0 +1,406 @@
+use chrono::{DateTime, Utc};
+use clap::{Args, Parser, Subcommand};
+use sharex_core::{
+    AppConfig, CapturePipeline, CaptureSource, ClipboardSink, CoreError, HistoryRepository,
+    ImageFormat, JsonlHistoryStore, MonitorId, NoopClipboard, PipelineDeps, Region, ScreenCapturer,
+};
+use sharex_uploaders::UploaderRegistry;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+/// ShareX in Rust command-line interface.
+#[derive(Debug, Parser)]
+#[command(
+    name = "sharex",
+    version,
+    about = "Screen capture and sharing tool in Rust"
+)]
+pub struct Cli {
+    /// Override the TOML config file path.
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Launch the native desktop window.
+    Gui,
+    /// List available displays.
+    Monitors,
+    /// Capture a screen, monitor, or region and run the after-capture pipeline.
+    Capture(CaptureArgs),
+    /// Inspect or clear capture history.
+    History {
+        #[command(subcommand)]
+        action: HistoryCommand,
+    },
+    /// Inspect application configuration.
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
+    },
+    /// List registered uploaders.
+    Uploaders,
+}
+
+#[derive(Debug, Args)]
+pub struct CaptureArgs {
+    /// Capture a specific monitor by numeric id from `sharex monitors`.
+    #[arg(long, conflicts_with = "region")]
+    pub monitor: Option<u32>,
+
+    /// Capture a rectangular region specified as `x,y,width,height`.
+    #[arg(long, conflicts_with = "monitor")]
+    pub region: Option<String>,
+
+    /// Override output directory for saved captures.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    /// Override output image format (`png`, `jpg`, `webp`).
+    #[arg(long)]
+    pub format: Option<ImageFormat>,
+
+    /// Override ShareX filename pattern.
+    #[arg(long)]
+    pub pattern: Option<String>,
+
+    /// Skip writing the capture to disk.
+    #[arg(long)]
+    pub no_save: bool,
+
+    /// Copy the captured image to the clipboard.
+    #[arg(long)]
+    pub copy_image: bool,
+
+    /// Copy the saved file path or upload URL to the clipboard.
+    #[arg(long)]
+    pub copy_path: bool,
+
+    /// Disable all clipboard writes for this run.
+    #[arg(long)]
+    pub no_clipboard: bool,
+
+    /// Upload the capture using a registered uploader id.
+    #[arg(long)]
+    pub uploader: Option<String>,
+
+    /// Skip appending an entry to capture history.
+    #[arg(long)]
+    pub no_history: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HistoryCommand {
+    /// Print recent captures newest-first.
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Delete all recorded history entries.
+    Clear,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Print the active configuration as TOML.
+    Show,
+    /// Print the resolved configuration file path.
+    Path,
+}
+
+/// Executes non-GUI CLI subcommands against injected platform boundaries.
+pub fn execute_headless(
+    command: Command,
+    config_path: &Path,
+    mut config: AppConfig,
+    capturer: &dyn ScreenCapturer,
+    clipboard: &dyn ClipboardSink,
+    uploaders: &UploaderRegistry,
+    now: DateTime<Utc>,
+) -> Result<String, CoreError> {
+    match command {
+        Command::Gui => Ok(String::new()),
+        Command::Monitors => {
+            let monitors = capturer.list_monitors()?;
+            if monitors.is_empty() {
+                return Ok("No monitors detected.".into());
+            }
+            let mut out = String::new();
+            for m in monitors {
+                let marker = if m.is_primary { " [primary]" } else { "" };
+                let _ = writeln!(
+                    out,
+                    "id={} name=\"{}\" geometry={}x{}{:+}{:+}{}",
+                    m.id, m.name, m.width, m.height, m.x, m.y, marker
+                );
+            }
+            Ok(out.trim_end().to_owned())
+        }
+        Command::Capture(args) => {
+            let source = if let Some(id) = args.monitor {
+                CaptureSource::Monitor {
+                    id: MonitorId::new(id),
+                }
+            } else if let Some(spec) = args.region.as_deref() {
+                CaptureSource::Region {
+                    region: Region::parse(spec)?,
+                }
+            } else {
+                CaptureSource::PrimaryMonitor
+            };
+
+            if let Some(dir) = args.output {
+                config.output_dir = dir;
+            }
+            if let Some(fmt) = args.format {
+                config.image_format = fmt;
+            }
+            if let Some(pattern) = args.pattern {
+                config.file_name_pattern = pattern;
+            }
+            if args.no_save {
+                config.pipeline.save_to_file = false;
+            }
+            if args.copy_image {
+                config.pipeline.copy_image_to_clipboard = true;
+            }
+            if args.copy_path {
+                config.pipeline.copy_path_to_clipboard = true;
+            }
+            if args.no_clipboard {
+                config.pipeline.copy_image_to_clipboard = false;
+                config.pipeline.copy_path_to_clipboard = false;
+            }
+            if let Some(uploader_id) = args.uploader {
+                config.pipeline.uploader_id = Some(uploader_id);
+            }
+            if args.no_history {
+                config.pipeline.record_history = false;
+            }
+
+            let noop = NoopClipboard;
+            let active_clipboard: &dyn ClipboardSink =
+                if args.no_clipboard { &noop } else { clipboard };
+            let history = JsonlHistoryStore::new(&config.history_path);
+
+            let deps = PipelineDeps {
+                capturer,
+                clipboard: active_clipboard,
+                uploaders,
+                history: &history,
+            };
+            let report = CapturePipeline::execute(source, &config, &deps, now)?;
+
+            let mut out = format!(
+                "Captured {} ({}x{}, {})",
+                report.capture_id,
+                report.image.width(),
+                report.image.height(),
+                report.format
+            );
+            if let Some(path) = report.saved_path {
+                let _ = write!(out, "\nSaved: {}", path.display());
+            }
+            if let Some(url) = report.upload_url {
+                let _ = write!(out, "\nUploaded: {url}");
+            }
+            if report.copied_image {
+                out.push_str("\nClipboard: image copied");
+            }
+            if let Some(text) = report.copied_text {
+                let _ = write!(out, "\nClipboard text: {text}");
+            }
+            Ok(out)
+        }
+        Command::History { action } => {
+            let store = JsonlHistoryStore::new(&config.history_path);
+            match action {
+                HistoryCommand::List { limit } => {
+                    let entries = store.list(Some(limit))?;
+                    if entries.is_empty() {
+                        return Ok("No captures recorded yet.".into());
+                    }
+                    let mut out = String::new();
+                    for entry in entries {
+                        let target = entry
+                            .upload_url
+                            .as_deref()
+                            .map(str::to_owned)
+                            .or_else(|| entry.file_path.map(|p| p.display().to_string()))
+                            .unwrap_or_else(|| "(unsaved)".into());
+                        let _ = writeln!(
+                            out,
+                            "{} | {} | {}x{} {} | {}",
+                            entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
+                            entry.id,
+                            entry.width,
+                            entry.height,
+                            entry.format,
+                            target
+                        );
+                    }
+                    Ok(out.trim_end().to_owned())
+                }
+                HistoryCommand::Clear => {
+                    store.clear()?;
+                    Ok("Capture history cleared.".into())
+                }
+            }
+        }
+        Command::Config { action } => match action {
+            ConfigCommand::Show => {
+                let rendered = toml_preview(&config)?;
+                Ok(rendered)
+            }
+            ConfigCommand::Path => Ok(config_path.display().to_string()),
+        },
+        Command::Uploaders => {
+            let entries = uploaders.list_metadata();
+            if entries.is_empty() {
+                return Ok("No uploaders registered.".into());
+            }
+            let mut out = String::new();
+            for item in entries {
+                let _ = writeln!(out, "{} ({}): {}", item.id, item.name, item.description);
+            }
+            Ok(out.trim_end().to_owned())
+        }
+    }
+}
+
+fn toml_preview(config: &AppConfig) -> Result<String, CoreError> {
+    let mut out = String::new();
+    let _ = writeln!(out, "output_dir = \"{}\"", config.output_dir.display());
+    let _ = writeln!(out, "file_name_pattern = \"{}\"", config.file_name_pattern);
+    let _ = writeln!(out, "image_format = \"{}\"", config.image_format);
+    let _ = writeln!(out, "history_path = \"{}\"", config.history_path.display());
+    let _ = writeln!(out, "save_to_file = {}", config.pipeline.save_to_file);
+    let _ = writeln!(
+        out,
+        "copy_image_to_clipboard = {}",
+        config.pipeline.copy_image_to_clipboard
+    );
+    let _ = writeln!(
+        out,
+        "copy_path_to_clipboard = {}",
+        config.pipeline.copy_path_to_clipboard
+    );
+    let _ = writeln!(out, "record_history = {}", config.pipeline.record_history);
+    if let Some(uploader_id) = &config.pipeline.uploader_id {
+        let _ = writeln!(out, "uploader_id = \"{uploader_id}\"");
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use sharex_core::{CapturedImage, MonitorInfo};
+    use tempfile::tempdir;
+
+    struct StubCapturer;
+
+    impl ScreenCapturer for StubCapturer {
+        fn list_monitors(&self) -> Result<Vec<MonitorInfo>, CoreError> {
+            Ok(vec![MonitorInfo {
+                id: MonitorId::new(7),
+                name: "Display 1".into(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                is_primary: true,
+            }])
+        }
+
+        fn capture(&self, _source: &CaptureSource) -> Result<CapturedImage, CoreError> {
+            CapturedImage::from_rgba(4, 3, [20, 40, 60, 255].repeat(12))
+        }
+    }
+
+    #[test]
+    fn cli_capture_saves_uploads_and_appears_in_history_list() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut config = AppConfig::default_for_os();
+        config.output_dir = dir.path().join("shots");
+        config.history_path = dir.path().join("history.jsonl");
+        config.file_name_pattern = "CliTest_%y%mo%d".into();
+
+        let uploaders = UploaderRegistry::with_local_mirror(dir.path().join("mirror"));
+        let capturer = StubCapturer;
+        let clipboard = NoopClipboard;
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 24, 12, 30, 0)
+            .single()
+            .expect("valid ts");
+
+        let parsed = Cli::try_parse_from([
+            "sharex",
+            "capture",
+            "--format",
+            "png",
+            "--no-clipboard",
+            "--uploader",
+            "local-mirror",
+        ])
+        .expect("parse capture cli");
+
+        let capture_out = execute_headless(
+            parsed.command.expect("capture subcommand"),
+            &config_path,
+            config.clone(),
+            &capturer,
+            &clipboard,
+            &uploaders,
+            now,
+        )
+        .expect("capture command succeeds");
+
+        assert!(capture_out.contains("4x3, png"));
+        assert!(capture_out.contains("CliTest_20261124.png"));
+        assert!(capture_out.contains("Uploaded: file:///"));
+
+        let list_out = execute_headless(
+            Command::History {
+                action: HistoryCommand::List { limit: 10 },
+            },
+            &config_path,
+            config,
+            &capturer,
+            &clipboard,
+            &uploaders,
+            now,
+        )
+        .expect("history list succeeds");
+
+        assert!(list_out.contains("4x3 png"));
+        assert!(list_out.contains("file:///"));
+    }
+
+    #[test]
+    fn cli_monitors_prints_primary_display_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let config = AppConfig::default_for_os();
+        let uploaders = UploaderRegistry::new();
+        let out = execute_headless(
+            Command::Monitors,
+            &dir.path().join("config.toml"),
+            config,
+            &StubCapturer,
+            &NoopClipboard,
+            &uploaders,
+            Utc::now(),
+        )
+        .expect("monitors command succeeds");
+
+        assert!(out.contains("id=7"));
+        assert!(out.contains("1920x1080"));
+        assert!(out.contains("[primary]"));
+    }
+}

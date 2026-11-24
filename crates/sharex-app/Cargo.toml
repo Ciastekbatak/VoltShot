@@ -1,0 +1,24 @@
+[package]
+name = "sharex-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "CLI and native egui desktop application for ShareX in Rust."
+
+[[bin]]
+name = "sharex"
+path = "src/main.rs"
+
+[dependencies]
+arboard.workspace = true
+chrono.workspace = true
+clap.workspace = true
+eframe.workspace = true
+sharex-capture = { path = "../sharex-capture" }
+sharex-core = { path = "../sharex-core" }
+sharex-uploaders = { path = "../sharex-uploaders" }
+
+[dev-dependencies]
+tempfile.workspace = true

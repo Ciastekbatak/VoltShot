@@ -1,0 +1,12 @@
+[package]
+name = "sharex-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Cross-platform OS screen capture adapter for ShareX in Rust."
+
+[dependencies]
+sharex-core = { path = "../sharex-core" }
+xcap.workspace = true
