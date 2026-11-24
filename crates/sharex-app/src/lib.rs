@@ -16,7 +16,9 @@ pub mod thumb_cache;
 pub mod tools_ui;
 pub mod tray;
 pub mod uploaders_ui;
+pub mod watcher_runtime;
 pub mod win_focus;
+pub mod workflows_ui;
 
 use chrono::Utc;
 use clap::Parser;

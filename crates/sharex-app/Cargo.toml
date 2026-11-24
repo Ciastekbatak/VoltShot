@@ -16,6 +16,7 @@ arboard.workspace = true
 chrono.workspace = true
 clap.workspace = true
 eframe.workspace = true
+serde.workspace = true
 sharex-capture = { path = "../sharex-capture" }
 sharex-core = { path = "../sharex-core" }
 sharex-editor = { path = "../sharex-editor" }
@@ -23,6 +24,7 @@ sharex-effects = { path = "../sharex-effects" }
 sharex-media = { path = "../sharex-media" }
 sharex-tools = { path = "../sharex-tools" }
 sharex-uploaders = { path = "../sharex-uploaders" }
+toml.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tray-icon = "0.21"

@@ -4104,6 +4104,7 @@ dependencies = [
  "clap",
  "eframe",
  "global-hotkey",
+ "serde",
  "sharex-capture",
  "sharex-core",
  "sharex-editor",
@@ -4112,6 +4113,7 @@ dependencies = [
  "sharex-tools",
  "sharex-uploaders",
  "tempfile",
+ "toml 0.8.2",
  "tray-icon",
  "windows-sys 0.59.0",
 ]
