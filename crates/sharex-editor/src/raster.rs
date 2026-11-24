@@ -314,19 +314,13 @@ impl Canvas {
         }
     }
 
-    fn apply_magnifier(
-        &mut self,
-        base: &CapturedImage,
-        center: Point,
-        radius: f32,
-        zoom: f32,
-        border: RgbaColor,
-    ) {
+    fn apply_magnifier(&mut self, center: Point, radius: f32, zoom: f32, border: RgbaColor) {
         if radius <= 0.0 || !radius.is_finite() {
             return;
         }
         let zoom = zoom.max(1.0);
         let border_radius = (radius - 2.0).max(0.0);
+        let snapshot = self.rgba.clone();
         let x0 = (center.x - radius).floor().max(0.0) as i32;
         let y0 = (center.y - radius).floor().max(0.0) as i32;
         let x1 = (center.x + radius).ceil().min(self.width as f32) as i32;
@@ -343,7 +337,7 @@ impl Canvas {
                 let sx = ((center.x + dx / zoom).floor() as i32).clamp(0, self.width - 1);
                 let src = (sy as usize * self.width as usize + sx as usize) * 4;
                 let dst = (y as usize * self.width as usize + x as usize) * 4;
-                self.rgba[dst..dst + 4].copy_from_slice(&base.rgba()[src..src + 4]);
+                self.rgba[dst..dst + 4].copy_from_slice(&snapshot[src..src + 4]);
                 if distance_squared >= border_radius * border_radius {
                     self.blend_pixel(x, y, border);
                 }
@@ -666,7 +660,7 @@ pub fn render_document(doc: &EditorDocument) -> Result<CapturedImage, CoreError>
                 zoom,
                 border_color,
             } => {
-                canvas.apply_magnifier(base, *center, *radius, *zoom, *border_color);
+                canvas.apply_magnifier(*center, *radius, *zoom, *border_color);
             }
             AnnotationKind::Spotlight { rect, dim_alpha } => {
                 canvas.apply_spotlight(*rect, *dim_alpha);
@@ -809,6 +803,27 @@ mod tests {
         let offset = (12 * 25 + 12) * 4;
         rgba[offset..offset + 4].copy_from_slice(&feature);
         let mut doc = EditorDocument::new(CapturedImage::from_rgba(25, 25, rgba).unwrap());
+        doc.push_annotation(AnnotationKind::Magnifier {
+            center: Point::new(12.5, 12.5),
+            radius: 7.0,
+            zoom: 3.0,
+            border_color: RgbaColor::BLUE,
+        });
+
+        let flat = doc.flatten().unwrap();
+        assert_eq!(pixel_at(&flat, 11, 12), feature);
+        assert_eq!(pixel_at(&flat, 12, 12), feature);
+        assert_eq!(pixel_at(&flat, 13, 13), feature);
+        assert_eq!(pixel_at(&flat, 16, 12), background);
+        assert_eq!(pixel_at(&flat, 18, 12), [59, 130, 246, 255]);
+        assert_eq!(pixel_at(&flat, 20, 12), background);
+    }
+
+    #[test]
+    fn magnifier_over_redaction_never_leaks_original_base_pixels() {
+        let secret = [235, 64, 52, 255];
+        let cover = [52, 199, 89, 255];
+        let mut doc = EditorDocument::new(solid_image(25, 25, RgbaColor::RED));
         doc.push_annotation(AnnotationKind::Rectangle {
             rect: RectF::from_points(Point::new(0.0, 0.0), Point::new(25.0, 25.0)),
             color: RgbaColor::GREEN,
@@ -823,12 +838,9 @@ mod tests {
         });
 
         let flat = doc.flatten().unwrap();
-        assert_eq!(pixel_at(&flat, 11, 12), feature);
-        assert_eq!(pixel_at(&flat, 12, 12), feature);
-        assert_eq!(pixel_at(&flat, 13, 13), feature);
-        assert_eq!(pixel_at(&flat, 16, 12), background);
+        assert_eq!(pixel_at(&flat, 12, 12), cover);
+        assert_ne!(pixel_at(&flat, 12, 12), secret);
         assert_eq!(pixel_at(&flat, 18, 12), [59, 130, 246, 255]);
-        assert_eq!(pixel_at(&flat, 20, 12), [52, 199, 89, 255]);
     }
 
     #[test]

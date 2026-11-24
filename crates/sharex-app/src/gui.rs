@@ -154,8 +154,7 @@ impl SharexGuiApp {
         let sqlite_history = match SqliteHistoryStore::open(&sqlite_path) {
             Ok(store) => {
                 if sqlite_path != config.history_path
-                    && config.history_path.exists()
-                    && let Err(err) = store.migrate_from_jsonl(&config.history_path)
+                    && let Err(err) = store.migrate_from_jsonl_once(&config.history_path)
                 {
                     initial_status.push_str(&format!(" History import failed: {err}"));
                 }
@@ -1561,6 +1560,13 @@ impl eframe::App for SharexGuiApp {
                     }
                 }
             }
+        }
+
+        if let Some(msg) = self.recording.poll_finalize() {
+            self.status_line = msg;
+        }
+        if self.recording.is_finalizing() {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         self.pins.show_all(ctx);

@@ -28,6 +28,10 @@ const SCHEMA: &str = "
         tag TEXT NOT NULL,
         PRIMARY KEY (capture_id, tag)
     );
+    CREATE TABLE IF NOT EXISTS history_meta (
+        key TEXT PRIMARY KEY NOT NULL,
+        value TEXT NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS captures_timestamp ON captures(CAST(timestamp AS INTEGER), timestamp);
     CREATE INDEX IF NOT EXISTS captures_format_timestamp
         ON captures(format, CAST(timestamp AS INTEGER), timestamp);
@@ -79,6 +83,39 @@ impl SqliteHistoryStore {
         for entry in entries {
             imported += usize::from(insert_capture(&transaction, &entry)?);
         }
+        transaction.commit()?;
+        Ok(imported)
+    }
+
+    /// Imports a JSON Lines snapshot at most once for this SQLite database so cleared entries stay cleared.
+    pub fn migrate_from_jsonl_once(&self, jsonl_path: &Path) -> Result<usize, CoreError> {
+        let mut connection = self.connection()?;
+        let already_migrated: Option<String> = connection
+            .query_row(
+                "SELECT value FROM history_meta WHERE key = 'jsonl_migrated'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        if already_migrated.is_some() {
+            return Ok(0);
+        }
+
+        let entries = if jsonl_path.exists() {
+            JsonlHistoryStore::new(jsonl_path).read_entries()?
+        } else {
+            Vec::new()
+        };
+
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut imported = 0;
+        for entry in entries {
+            imported += usize::from(insert_capture(&transaction, &entry)?);
+        }
+        transaction.execute(
+            "INSERT OR REPLACE INTO history_meta (key, value) VALUES ('jsonl_migrated', '1')",
+            [],
+        )?;
         transaction.commit()?;
         Ok(imported)
     }

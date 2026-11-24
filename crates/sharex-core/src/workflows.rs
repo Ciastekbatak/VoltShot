@@ -198,6 +198,7 @@ impl WatchFolderScanner {
 
     pub fn scan(&mut self, rules: &[WatchFolderRule]) -> Result<Vec<WatchedFileEvent>, CoreError> {
         let mut events = Vec::new();
+        let mut next_seen = self.seen.clone();
 
         for rule in rules {
             if !rule.enabled {
@@ -230,8 +231,8 @@ impl WatchFolderScanner {
                 };
                 let key = (rule.id.clone(), path.clone());
 
-                if self.seen.get(&key) != Some(&signature) {
-                    self.seen.insert(key, signature);
+                if next_seen.get(&key) != Some(&signature) {
+                    next_seen.insert(key, signature);
                     events.push(WatchedFileEvent {
                         rule_id: rule.id.clone(),
                         path,
@@ -240,10 +241,11 @@ impl WatchFolderScanner {
                 }
             }
 
-            self.seen
+            next_seen
                 .retain(|(rule_id, path), _| rule_id != &rule.id || present_paths.contains(path));
         }
 
+        self.seen = next_seen;
         Ok(events)
     }
 }
@@ -484,5 +486,41 @@ mod tests {
 
         let fourth_scan = scanner.scan(&rules).expect("fourth scan");
         assert!(fourth_scan.is_empty());
+    }
+
+    #[test]
+    fn failed_scan_preserves_previous_seen_state_for_later_delivery() {
+        let good_dir = tempdir().expect("good dir");
+        let missing_dir = good_dir.path().join("does-not-exist");
+        let png_path = good_dir.path().join("new.png");
+        fs::write(&png_path, b"png-bytes").expect("write png");
+
+        let failing_rules = vec![
+            WatchFolderRule {
+                id: "good".into(),
+                folder: good_dir.path().to_path_buf(),
+                extensions: vec!["png".into()],
+                move_after_process: None,
+                enabled: true,
+                workflow_id: None,
+            },
+            WatchFolderRule {
+                id: "broken".into(),
+                folder: missing_dir,
+                extensions: vec!["png".into()],
+                move_after_process: None,
+                enabled: true,
+                workflow_id: None,
+            },
+        ];
+
+        let mut scanner = WatchFolderScanner::new();
+        assert!(scanner.scan(&failing_rules).is_err());
+
+        let recovered_events = scanner
+            .scan(&failing_rules[..1])
+            .expect("scan succeeds once broken rule removed");
+        assert_eq!(recovered_events.len(), 1);
+        assert_eq!(recovered_events[0].path, png_path);
     }
 }

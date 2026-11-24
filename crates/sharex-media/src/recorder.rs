@@ -1,15 +1,26 @@
-use crate::config::{CapturePlatform, RecordingConfig};
-use crate::ffmpeg::{MediaError, build_recording_args, find_ffmpeg};
+use crate::config::{CapturePlatform, RecordingConfig, RecordingFormat};
+use crate::ffmpeg::{
+    MediaError, build_gif_spool_args, build_gif_transcode_args, build_recording_args, find_ffmpeg,
+};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+const GIF_FINALIZE_TIMEOUT: Duration = Duration::from_secs(120);
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_CAPTURED_STDERR_BYTES: usize = 16 * 1024;
+
+struct GifSpoolJob {
+    ffmpeg_bin: PathBuf,
+    spool_path: PathBuf,
+    output_path: PathBuf,
+    fps: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordingState {
@@ -153,6 +164,7 @@ pub struct ScreenRecorder {
     machine: RecordingStateMachine,
     child: Option<Child>,
     stderr_handle: Option<JoinHandle<String>>,
+    gif_spool: Option<GifSpoolJob>,
     platform: CapturePlatform,
 }
 
@@ -172,6 +184,7 @@ impl ScreenRecorder {
             machine: RecordingStateMachine::new(),
             child: None,
             stderr_handle: None,
+            gif_spool: None,
             platform,
         }
     }
@@ -195,7 +208,6 @@ impl ScreenRecorder {
             });
         }
 
-        let args = build_recording_args(config, self.platform)?;
         let ffmpeg_bin = find_ffmpeg(config.ffmpeg_path.as_deref())?;
 
         if let Some(parent) = config.output_path.parent()
@@ -204,9 +216,25 @@ impl ScreenRecorder {
             fs::create_dir_all(parent)?;
         }
 
+        let (args, gif_spool) = if config.format == RecordingFormat::Gif {
+            let spool_path = make_gif_spool_path(&config.output_path);
+            let args = build_gif_spool_args(config, self.platform, &spool_path)?;
+            let job = GifSpoolJob {
+                ffmpeg_bin: ffmpeg_bin.clone(),
+                spool_path,
+                output_path: config.output_path.clone(),
+                fps: config.fps,
+            };
+            (args, Some(job))
+        } else {
+            (build_recording_args(config, self.platform)?, None)
+        };
+
         let mut command = Command::new(&ffmpeg_bin);
         command.args(&args);
-        self.spawn_command(command, config.output_path.clone())
+        self.spawn_command(command, config.output_path.clone())?;
+        self.gif_spool = gif_spool;
+        Ok(())
     }
 
     fn spawn_command(
@@ -243,7 +271,11 @@ impl ScreenRecorder {
             });
         }
 
+        let gif_spool = self.gif_spool.take();
         let Some(mut child) = self.child.take() else {
+            if let Some(job) = gif_spool {
+                let _ = fs::remove_file(&job.spool_path);
+            }
             let reason = "recording process handle is missing".to_owned();
             self.machine.fail(reason.clone())?;
             return Err(MediaError::ProcessFailed(reason));
@@ -257,17 +289,30 @@ impl ScreenRecorder {
         let status = wait_with_timeout(&mut child, GRACEFUL_STOP_TIMEOUT)?;
         let stderr = self.collect_stderr();
 
-        if status.success() {
-            self.machine.finish(Instant::now())
-        } else {
+        if !status.success() {
+            if let Some(job) = gif_spool {
+                let _ = fs::remove_file(&job.spool_path);
+            }
             let detail = if stderr.is_empty() {
                 format!("exited with status {status}")
             } else {
                 format!("exited with status {status}: {stderr}")
             };
             self.machine.fail(detail.clone())?;
-            Err(MediaError::ProcessFailed(detail))
+            return Err(MediaError::ProcessFailed(detail));
         }
+
+        if let Some(job) = gif_spool {
+            let transcode_result = finalize_spooled_gif(&job);
+            let _ = fs::remove_file(&job.spool_path);
+            if let Err(err) = transcode_result {
+                let detail = err.to_string();
+                self.machine.fail(detail)?;
+                return Err(err);
+            }
+        }
+
+        self.machine.finish(Instant::now())
     }
 
     pub fn abort(&mut self) -> Result<PathBuf, MediaError> {
@@ -285,6 +330,9 @@ impl ScreenRecorder {
             let _ = child.wait();
         }
         let _ = self.collect_stderr();
+        if let Some(job) = self.gif_spool.take() {
+            let _ = fs::remove_file(&job.spool_path);
+        }
 
         if let Err(err) = fs::remove_file(&output_path)
             && err.kind() != ErrorKind::NotFound
@@ -315,6 +363,53 @@ impl Drop for ScreenRecorder {
             let _ = child.wait();
         }
         let _ = self.collect_stderr();
+        if let Some(job) = self.gif_spool.take() {
+            let _ = fs::remove_file(&job.spool_path);
+        }
+    }
+}
+
+fn make_gif_spool_path(output_path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let file_name = format!(".sharex-gif-spool-{pid}-{nanos}-{seq}.mkv");
+    output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(
+            || std::env::temp_dir().join(&file_name),
+            |parent| parent.join(&file_name),
+        )
+}
+
+fn finalize_spooled_gif(job: &GifSpoolJob) -> Result<(), MediaError> {
+    let args = build_gif_transcode_args(&job.spool_path, &job.output_path, job.fps);
+    let mut child = Command::new(&job.ffmpeg_bin)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stderr_handle = child.stderr.take().map(spawn_stderr_drain);
+    let status = wait_with_timeout(&mut child, GIF_FINALIZE_TIMEOUT)?;
+    let stderr = stderr_handle
+        .and_then(|handle| handle.join().ok())
+        .map(|text| text.trim().to_owned())
+        .unwrap_or_default();
+    if status.success() {
+        Ok(())
+    } else {
+        let detail = if stderr.is_empty() {
+            format!("GIF transcode exited with status {status}")
+        } else {
+            format!("GIF transcode exited with status {status}: {stderr}")
+        };
+        Err(MediaError::ProcessFailed(detail))
     }
 }
 

@@ -20,9 +20,104 @@ use clap::Parser;
 use cli::{Cli, Command, execute_headless};
 use clipboard::SystemClipboard;
 use sharex_capture::XcapCapturer;
-use sharex_core::{AppConfig, CoreError};
+use sharex_core::{
+    AppConfig, CaptureId, CoreError, HistoryEntry, HistoryQuery, HistoryRepository,
+    JsonlHistoryStore, SqliteHistoryStore,
+};
 use sharex_uploaders::UploaderRegistry;
 use std::path::{Path, PathBuf};
+
+/// Shared history backend used by both the desktop GUI and headless CLI.
+pub enum AppHistoryStore {
+    Sqlite {
+        store: SqliteHistoryStore,
+        legacy_jsonl: PathBuf,
+    },
+    Jsonl(JsonlHistoryStore),
+}
+
+impl AppHistoryStore {
+    /// Opens the shared SQLite history store alongside `history_path`, migrating legacy JSONL once.
+    pub fn open(history_path: &Path) -> (Self, Option<String>) {
+        let sqlite_path = history_path.with_extension("sqlite");
+        match SqliteHistoryStore::open(&sqlite_path) {
+            Ok(store) => {
+                let warning = if sqlite_path != history_path {
+                    store
+                        .migrate_from_jsonl_once(history_path)
+                        .err()
+                        .map(|err| format!("History import failed: {err}"))
+                } else {
+                    None
+                };
+                (
+                    Self::Sqlite {
+                        store,
+                        legacy_jsonl: history_path.to_path_buf(),
+                    },
+                    warning,
+                )
+            }
+            Err(err) => (
+                Self::Jsonl(JsonlHistoryStore::new(history_path)),
+                Some(format!("Using JSONL history. SQLite open failed: {err}")),
+            ),
+        }
+    }
+}
+
+impl HistoryRepository for AppHistoryStore {
+    fn append(&self, entry: &HistoryEntry) -> Result<(), CoreError> {
+        match self {
+            Self::Sqlite { store, .. } => store.append(entry),
+            Self::Jsonl(store) => store.append(entry),
+        }
+    }
+
+    fn list(&self, limit: Option<usize>) -> Result<Vec<HistoryEntry>, CoreError> {
+        match self {
+            Self::Sqlite { store, .. } => store.list(limit),
+            Self::Jsonl(store) => store.list(limit),
+        }
+    }
+
+    fn clear(&self) -> Result<(), CoreError> {
+        match self {
+            Self::Sqlite {
+                store,
+                legacy_jsonl,
+            } => {
+                store.clear()?;
+                if legacy_jsonl.exists() {
+                    let _ = JsonlHistoryStore::new(legacy_jsonl).clear();
+                }
+                Ok(())
+            }
+            Self::Jsonl(store) => store.clear(),
+        }
+    }
+
+    fn search(&self, query: &HistoryQuery) -> Result<Vec<HistoryEntry>, CoreError> {
+        match self {
+            Self::Sqlite { store, .. } => store.search(query),
+            Self::Jsonl(store) => store.search(query),
+        }
+    }
+
+    fn set_tags(&self, id: &CaptureId, tags: &[String]) -> Result<bool, CoreError> {
+        match self {
+            Self::Sqlite { store, .. } => store.set_tags(id, tags),
+            Self::Jsonl(store) => store.set_tags(id, tags),
+        }
+    }
+
+    fn delete(&self, id: &CaptureId) -> Result<bool, CoreError> {
+        match self {
+            Self::Sqlite { store, .. } => store.delete(id),
+            Self::Jsonl(store) => store.delete(id),
+        }
+    }
+}
 
 /// Entry point shared by the `sharex` binary.
 pub fn run() -> Result<(), String> {

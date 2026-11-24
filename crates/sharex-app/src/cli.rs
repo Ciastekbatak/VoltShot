@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use sharex_core::{
     AppConfig, CapturePipeline, CaptureSource, ClipboardSink, CoreError, HistoryRepository,
-    ImageFormat, JsonlHistoryStore, MonitorId, NoopClipboard, PipelineDeps, Region, ScreenCapturer,
+    ImageFormat, MonitorId, NoopClipboard, PipelineDeps, Region, ScreenCapturer,
 };
 use sharex_uploaders::UploaderRegistry;
 use std::fmt::Write as _;
@@ -203,7 +203,7 @@ pub fn execute_headless(
             let noop = NoopClipboard;
             let active_clipboard: &dyn ClipboardSink =
                 if args.no_clipboard { &noop } else { clipboard };
-            let history = JsonlHistoryStore::new(&config.history_path);
+            let (history, _) = crate::AppHistoryStore::open(&config.history_path);
 
             let deps = PipelineDeps {
                 capturer,
@@ -235,7 +235,7 @@ pub fn execute_headless(
             Ok(out)
         }
         Command::History { action } => {
-            let store = JsonlHistoryStore::new(&config.history_path);
+            let (store, _) = crate::AppHistoryStore::open(&config.history_path);
             match action {
                 HistoryCommand::List { limit } => {
                     let entries = store.list(Some(limit))?;
@@ -507,5 +507,62 @@ mod tests {
             capturer.seen.lock().expect("lock").as_slice(),
             &[CaptureSource::ActiveMonitor]
         );
+    }
+
+    #[test]
+    fn cli_history_clear_wipes_sqlite_and_prevents_jsonl_resurrection() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut config = AppConfig::portable_for_dir(dir.path());
+        config.pipeline.save_to_file = false;
+        config.pipeline.copy_image_to_clipboard = false;
+        config.pipeline.record_history = true;
+
+        let uploaders = UploaderRegistry::new();
+        let now = Utc::now();
+        execute_headless(
+            Command::Capture(CaptureArgs {
+                monitor: None,
+                active_monitor: false,
+                active_window: false,
+                region: None,
+                format: None,
+                output: None,
+                pattern: None,
+                uploader: None,
+                no_save: true,
+                copy_image: false,
+                copy_path: false,
+                no_clipboard: true,
+                no_history: false,
+            }),
+            &config_path,
+            config.clone(),
+            &StubCapturer,
+            &NoopClipboard,
+            &uploaders,
+            now,
+        )
+        .expect("capture records to shared sqlite");
+
+        let (reopened, _) = crate::AppHistoryStore::open(&config.history_path);
+        assert_eq!(reopened.list(None).expect("list").len(), 1);
+
+        let cleared = execute_headless(
+            Command::History {
+                action: HistoryCommand::Clear,
+            },
+            &config_path,
+            config.clone(),
+            &StubCapturer,
+            &NoopClipboard,
+            &uploaders,
+            now,
+        )
+        .expect("history clear succeeds");
+        assert!(cleared.contains("cleared"));
+
+        let (after_clear, _) = crate::AppHistoryStore::open(&config.history_path);
+        assert!(after_clear.list(None).expect("list after clear").is_empty());
     }
 }

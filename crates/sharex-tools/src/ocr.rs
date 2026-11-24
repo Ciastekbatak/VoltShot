@@ -268,7 +268,14 @@ impl TempPngFile {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let path = temp_dir.join(format!("sharex-ocr-{pid}-{nanos}-{seq}.png"));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
+            let mut open_options = OpenOptions::new();
+            open_options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                open_options.mode(0o600);
+            }
+            match open_options.open(&path) {
                 Ok(mut file) => {
                     let guard = Self { path };
                     file.write_all(png_bytes)?;

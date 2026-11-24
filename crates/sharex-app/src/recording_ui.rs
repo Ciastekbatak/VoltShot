@@ -3,13 +3,20 @@ use crate::theme::SharexPalette;
 use chrono::Utc;
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
 use sharex_core::{ClipboardSink, resolve_unique_path};
-use sharex_media::{RecordingConfig, RecordingFormat, RecordingState, ScreenRecorder, find_ffmpeg};
+use sharex_media::{
+    MediaError, RecordingConfig, RecordingFormat, RecordingState, ScreenRecorder, find_ffmpeg,
+};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Duration;
+
+type FinalizeResult = (ScreenRecorder, Result<(PathBuf, Duration), MediaError>);
 
 /// Screen & GIF recording workspace panel state backed by `sharex_media::ScreenRecorder`.
 pub struct RecordingPanelState {
     recorder: ScreenRecorder,
+    finalizing: Option<Receiver<FinalizeResult>>,
     format: RecordingFormat,
     fps: u32,
     crf: u8,
@@ -29,6 +36,7 @@ impl RecordingPanelState {
     pub fn new() -> Self {
         Self {
             recorder: ScreenRecorder::new(),
+            finalizing: None,
             format: RecordingFormat::Mp4H264,
             fps: 30,
             crf: 23,
@@ -43,6 +51,37 @@ impl RecordingPanelState {
         self.recorder.state().is_recording()
     }
 
+    pub fn is_finalizing(&self) -> bool {
+        self.finalizing.is_some()
+    }
+
+    pub fn poll_finalize(&mut self) -> Option<String> {
+        let receiver = self.finalizing.as_ref()?;
+        match receiver.try_recv() {
+            Ok((recorder, result)) => {
+                self.finalizing = None;
+                self.recorder = recorder;
+                let msg = match result {
+                    Ok((path, duration)) => format!(
+                        "Saved recording ({}) to {}",
+                        format_elapsed(duration),
+                        path.display()
+                    ),
+                    Err(err) => format!("Recording stop failed: {err}"),
+                };
+                self.last_message = Some(msg.clone());
+                Some(msg)
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.finalizing = None;
+                let msg = "Recording finalization worker terminated unexpectedly.".to_owned();
+                self.last_message = Some(msg.clone());
+                Some(msg)
+            }
+        }
+    }
+
     pub fn build_config(&self, output_dir: &Path) -> RecordingConfig {
         let stem = format!("ShareX_Rec_{}", Utc::now().format("%Y-%m-%d_%H-%M-%S"));
         let output_path = resolve_unique_path(output_dir, &stem, self.format.extension());
@@ -55,14 +94,16 @@ impl RecordingPanelState {
         config
     }
 
-    /// Stops the active recording or starts a recording in the requested format.
+    /// Stops the active recording (off the UI thread) or starts a recording in the requested format.
     pub fn toggle_hotkey_recording(
         &mut self,
         format: RecordingFormat,
         output_dir: &Path,
     ) -> String {
-        let message = if self.is_recording() {
-            self.stop_recording()
+        let message = if self.is_finalizing() {
+            "Recording is already finalizing...".to_owned()
+        } else if self.is_recording() {
+            self.stop_recording_async()
         } else {
             if !self.ffmpeg_checked {
                 self.check_ffmpeg();
@@ -80,6 +121,9 @@ impl RecordingPanelState {
     }
 
     fn start_recording(&mut self, output_dir: &Path) -> String {
+        if self.is_finalizing() {
+            return "Wait for the previous recording to finish finalizing.".into();
+        }
         if self.ffmpeg_path.is_none() {
             return "FFmpeg was not found. Install FFmpeg, then select Re-check.".into();
         }
@@ -100,14 +144,23 @@ impl RecordingPanelState {
         }
     }
 
-    fn stop_recording(&mut self) -> String {
-        match self.recorder.stop() {
-            Ok((path, duration)) => format!(
-                "Saved recording ({}) to {}",
-                format_elapsed(duration),
-                path.display()
-            ),
-            Err(err) => format!("Recording stop failed: {err}"),
+    fn stop_recording_async(&mut self) -> String {
+        if !self.is_recording() {
+            return "No active recording to stop.".into();
+        }
+        let mut recorder = std::mem::take(&mut self.recorder);
+        let (tx, rx) = mpsc::channel();
+        match thread::Builder::new()
+            .name("sharex-record-finalize".into())
+            .spawn(move || {
+                let result = recorder.stop();
+                let _ = tx.send((recorder, result));
+            }) {
+            Ok(_) => {
+                self.finalizing = Some(rx);
+                "Stopping and finalizing recording...".into()
+            }
+            Err(err) => format!("Failed to spawn finalizer thread: {err}"),
         }
     }
 
@@ -120,14 +173,15 @@ impl RecordingPanelState {
         output_dir: &Path,
         clipboard: &dyn ClipboardSink,
     ) -> Option<String> {
-        let mut status_msg = None;
+        let mut status_msg = self.poll_finalize();
 
         if !self.ffmpeg_checked {
             self.check_ffmpeg();
         }
 
         let is_recording = self.recorder.state().is_recording();
-        if is_recording {
+        let is_finalizing = self.is_finalizing();
+        if is_recording || is_finalizing {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
@@ -141,6 +195,9 @@ impl RecordingPanelState {
                         .strong()
                         .color(p.danger),
                 );
+            } else if is_finalizing {
+                ui.spinner();
+                ui.label(RichText::new("Finalizing...").strong().color(p.warning));
             }
         });
         ui.separator();
@@ -173,7 +230,7 @@ impl RecordingPanelState {
             });
 
         ui.add_space(10.0);
-        ui.add_enabled_ui(!is_recording, |ui| {
+        ui.add_enabled_ui(!is_recording && !is_finalizing, |ui| {
             egui::Grid::new("recording_settings_grid")
                 .num_columns(2)
                 .spacing([14.0, 10.0])
@@ -216,7 +273,7 @@ impl RecordingPanelState {
 
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            let can_start = !is_recording && self.ffmpeg_path.is_some();
+            let can_start = !is_recording && !is_finalizing && self.ffmpeg_path.is_some();
             let start_btn =
                 egui::Button::new(RichText::new("Start Recording").color(Color32::WHITE))
                     .fill(p.accent);
@@ -228,15 +285,21 @@ impl RecordingPanelState {
 
             let stop_btn = egui::Button::new(RichText::new("Stop & Save").color(Color32::WHITE))
                 .fill(p.success);
-            if ui.add_enabled(is_recording, stop_btn).clicked() {
-                let message = self.stop_recording();
+            if ui
+                .add_enabled(is_recording && !is_finalizing, stop_btn)
+                .clicked()
+            {
+                let message = self.stop_recording_async();
                 self.last_message = Some(message.clone());
                 status_msg = Some(message);
             }
 
             let abort_btn =
                 egui::Button::new(RichText::new("Abort").color(Color32::WHITE)).fill(p.danger);
-            if ui.add_enabled(is_recording, abort_btn).clicked() {
+            if ui
+                .add_enabled(is_recording && !is_finalizing, abort_btn)
+                .clicked()
+            {
                 match self.recorder.abort() {
                     Ok(_) => {
                         let msg = "Recording aborted and partial file discarded.".to_owned();

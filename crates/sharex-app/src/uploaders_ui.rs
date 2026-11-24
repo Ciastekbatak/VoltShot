@@ -21,22 +21,51 @@ enum UploadTarget {
     Pastebin(String),
 }
 
+enum UploadPayload {
+    File(std::path::PathBuf),
+    Text { file_name: String, contents: String },
+}
+
 impl UploadTarget {
-    fn upload(self, path: &Path) -> Result<UploadResult, CoreError> {
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| CoreError::UploadFailed("The capture has no file name.".into()))?
-            .to_string_lossy()
-            .into_owned();
-        let mime_type = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .and_then(|ext| ext.parse::<ImageFormat>().ok())
-            .map_or("application/octet-stream", ImageFormat::mime_type);
-        let request = UploadRequest {
-            file_name,
-            mime_type: mime_type.into(),
-            bytes: fs::read(path)?,
+    fn upload(self, payload: UploadPayload) -> Result<UploadResult, CoreError> {
+        let request = match payload {
+            UploadPayload::File(path) => {
+                let file_name = path
+                    .file_name()
+                    .ok_or_else(|| CoreError::UploadFailed("The capture has no file name.".into()))?
+                    .to_string_lossy()
+                    .into_owned();
+                let mime_type = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .and_then(|ext| ext.parse::<ImageFormat>().ok())
+                    .map_or("application/octet-stream", ImageFormat::mime_type);
+                UploadRequest {
+                    file_name,
+                    mime_type: mime_type.into(),
+                    bytes: fs::read(&path)?,
+                }
+            }
+            UploadPayload::Text {
+                file_name,
+                contents,
+            } => {
+                if contents.trim().is_empty() {
+                    return Err(CoreError::ConfigError(
+                        "Enter UTF-8 text to upload to a text destination.".into(),
+                    ));
+                }
+                let clean_name = if file_name.trim().is_empty() {
+                    "snippet.txt".to_owned()
+                } else {
+                    file_name.trim().to_owned()
+                };
+                UploadRequest {
+                    file_name: clean_name,
+                    mime_type: "text/plain; charset=utf-8".into(),
+                    bytes: contents.into_bytes(),
+                }
+            }
         };
         let result = match self {
             Self::Uploader(uploader) => uploader.upload(&request),
@@ -58,7 +87,7 @@ impl UploadTarget {
     }
 }
 
-/// Configures and runs manual uploads of saved captures.
+/// Configures and runs manual uploads of saved captures and text snippets.
 pub struct UploadersPanelState {
     destination: &'static str,
     mirror_folder: String,
@@ -67,6 +96,8 @@ pub struct UploadersPanelState {
     gist_token: String,
     gist_public: bool,
     pastebin_key: String,
+    text_file_name: String,
+    text_payload: String,
     sxcu_json: String,
     custom_uploaders: CustomUploaderStore,
     pending: Option<Receiver<Result<UploadResult, CoreError>>>,
@@ -84,12 +115,18 @@ impl UploadersPanelState {
             gist_token: String::new(),
             gist_public: false,
             pastebin_key: String::new(),
+            text_file_name: "snippet.txt".into(),
+            text_payload: String::new(),
             sxcu_json: String::new(),
             custom_uploaders: CustomUploaderStore::new(),
             pending: None,
             status: None,
             url: None,
         }
+    }
+
+    fn is_text_destination(&self) -> bool {
+        matches!(self.destination, "github-gist" | "pastebin")
     }
 
     fn load_custom_uploader(&mut self) -> Result<(), CoreError> {
@@ -131,13 +168,28 @@ impl UploadersPanelState {
     }
 
     fn start_upload(&mut self, path: &Path) -> Result<(), CoreError> {
+        self.start_upload_payload(UploadPayload::File(path.to_path_buf()))
+    }
+
+    fn start_text_upload(&mut self) -> Result<(), CoreError> {
+        if self.text_payload.trim().is_empty() {
+            return Err(CoreError::ConfigError(
+                "Enter UTF-8 text to upload to a text destination.".into(),
+            ));
+        }
+        self.start_upload_payload(UploadPayload::Text {
+            file_name: self.text_file_name.clone(),
+            contents: self.text_payload.clone(),
+        })
+    }
+
+    fn start_upload_payload(&mut self, payload: UploadPayload) -> Result<(), CoreError> {
         let target = self.upload_target()?;
-        let path = path.to_path_buf();
         let (sender, receiver) = mpsc::channel();
         thread::Builder::new()
             .name("sharex-upload".into())
             .spawn(move || {
-                let _ = sender.send(target.upload(&path));
+                let _ = sender.send(target.upload(payload));
             })?;
         self.pending = Some(receiver);
         self.status = None;
@@ -212,7 +264,24 @@ impl UploadersPanelState {
                 self.show_destination_settings(ui);
                 ui.separator();
 
-                if let Some((path, selected)) = capture {
+                if self.is_text_destination() {
+                    ui.label("Filename");
+                    ui.text_edit_singleline(&mut self.text_file_name);
+                    ui.label("Text snippet (UTF-8)");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.text_payload)
+                            .code_editor()
+                            .hint_text("Paste code, logs, or notes to upload...")
+                            .desired_rows(6)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if ui.button("Upload Text Snippet").clicked()
+                        && let Err(err) = self.start_text_upload()
+                    {
+                        self.url = None;
+                        self.status = Some(Err(format!("Upload failed: {err}")));
+                    }
+                } else if let Some((path, selected)) = capture {
                     ui.label(path.display().to_string());
                     let button = if selected {
                         "Upload Selected Capture"
@@ -363,5 +432,22 @@ mod tests {
             fs::read(mirror.join("capture.png")).unwrap(),
             b"capture contents"
         );
+    }
+
+    #[test]
+    fn text_destinations_require_non_empty_utf8_snippet() {
+        let mut panel = UploadersPanelState::new(Path::new("mirror"));
+        panel.destination = "github-gist";
+        panel.gist_token = "ghp_test".into();
+        assert!(panel.is_text_destination());
+        assert!(panel.start_text_upload().is_err());
+
+        panel.destination = "pastebin";
+        panel.pastebin_key = "dev_key".into();
+        assert!(panel.is_text_destination());
+        assert!(panel.start_text_upload().is_err());
+
+        panel.destination = LOCAL_MIRROR;
+        assert!(!panel.is_text_destination());
     }
 }

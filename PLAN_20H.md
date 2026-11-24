@@ -30,9 +30,9 @@ Wave 8 (19.0-20.0h): Cross-model audit (Codex) + Comment Sicko + full release ga
 
 ### Wave 1 (Hours 0.0 to 2.5) - Core storage, capture depth, and image effects
 
-- [x] **W1-A (`crates/sharex-core`)**: Added `SqliteHistoryStore` (`rusqlite` bundled behind default `sqlite` feature) implementing `HistoryRepository`, `HistoryQuery` (text, format, date range, tag filters), `add_tag`/`remove_tag`, and one-way JSONL-to-SQLite migration (`6fd77c2`).
-- [x] **W1-B (`crates/sharex-capture`)**: Added `WindowInfo` enumeration (`list_windows`, `find_window_at_point`), cursor-based active monitor capture (`CaptureSource::ActiveMonitor`), `CaptureSource::Window { id }`, and multi-monitor region crop (`eab9b0a`).
-- [x] **W1-C (`crates/sharex-effects`)**: Added pure Rust composable `ImageEffect` pipeline (9 filters: `Border`, `DropShadow`, `RoundedCorners`, `Resize`, `CanvasPadding`, `WatermarkText`, `Grayscale`, `Invert`, `BrightnessContrast`, `AutoCrop`) and TOML/JSON `EffectPreset` serialization (`28617fd`).
+- [x] **W1-A (`crates/sharex-core`)**: Added `SqliteHistoryStore` (`rusqlite` bundled behind default `sqlite` feature) implementing `HistoryRepository`, `HistoryQuery` (text, format, date range, tag filters), `set_tags`, and one-time JSONL-to-SQLite migration (`6fd77c2`, unified CLI/GUI store in Wave 8 fix).
+- [x] **W1-B (`crates/sharex-capture`)**: Added `WindowInfo` enumeration (`list_windows`, `find_window_at_point`), cursor-based active monitor capture (`CaptureSource::ActiveMonitor`, Win32 cursor lookup with primary fallback on Linux/macOS), `CaptureSource::Window { id }`, and multi-monitor region crop (`eab9b0a`).
+- [x] **W1-C (`crates/sharex-effects`)**: Added pure Rust composable `ImageEffect` pipeline (9 filters: `Border`, `DropShadow`, `RoundedCorners`, `Resize`, `CanvasPadding`, `Grayscale`, `Invert`, `BrightnessContrast`, `AutoCrop`) and TOML/JSON `EffectPreset` serialization (`28617fd`). (Follow-up: `WatermarkText` remains open.)
 
 ### Wave 2 (Hours 2.5 to 5.5) - System tray, pro editor, and smart region overlay
 
@@ -54,20 +54,20 @@ Wave 8 (19.0-20.0h): Cross-model audit (Codex) + Comment Sicko + full release ga
 
 - [x] **W5-A (`crates/sharex-tools` color & ruler)**: Added color conversions (`HEX`, `RGB`, `HSL`, `CMYK`, decimal) and pixel ruler (`dx`, `dy`, distance, angle, area) (`984d4cf`).
 - [x] **W5-B (`crates/sharex-tools` utilities)**: Added QR code RGBA generator, file hash checker (`MD5`, `SHA-1`, `SHA-256`, `SHA-512`), and directory indexer (`HTML`, `Markdown`, `JSON`, `TXT`) (`984d4cf`).
-- [x] **W5-C (`crates/sharex-tools` + `sharex-app` pin)**: Added image combiner + contact-sheet generator (`984d4cf`) and borderless always-on-top Pin-to-Screen floating viewports (`e836ebd`, `c4c1516`).
+- [x] **W5-C (`crates/sharex-tools` + `sharex-app` pin)**: Added horizontal/vertical `ImageCombiner` strip stitching (`984d4cf`) and borderless always-on-top Pin-to-Screen floating viewports (`e836ebd`, `c4c1516`). (Follow-up: multi-row contact-sheet grid generator remains open.)
 
 ### Wave 6 (Hours 14.5 to 17.0) - OCR, custom workflows, and watch folders
 
-- [x] **W6-A (`crates/sharex-tools` OCR)**: Added `OcrEngine` trait, `TesseractCliOcr` adapter with RAII temp PNG cleanup, `FallbackOcrChain` (`243943f`), and integrated OCR tab inside Tools panel (`c4c1516`). (Follow-up: native Windows WinRT `Windows.Media.Ocr` adapter can plug directly into `OcrEngine`.)
-- [x] **W6-B (`crates/sharex-core` workflows)**: Added per-hotkey `TaskOverrides`, `WorkflowPreset`, `WorkflowRegistry`, `resolve_effective_config`, and deterministic `WatchFolderScanner` (`66daae4`).
+- [x] **W6-A (`crates/sharex-tools` OCR)**: Added `OcrEngine` trait, `TesseractCliOcr` adapter with owner-only `0600` Unix temp PNG cleanup, `FallbackOcrChain` (`243943f`), and integrated OCR tab inside Tools panel (`c4c1516`). (Follow-up: native Windows WinRT `Windows.Media.Ocr` adapter can plug directly into `OcrEngine`.)
+- [x] **W6-B (`crates/sharex-core` workflows)**: Added library APIs for per-hotkey `TaskOverrides`, `WorkflowPreset`, `WorkflowRegistry`, `resolve_effective_config`, and atomic `WatchFolderScanner` (`66daae4`). (Follow-up: runtime hotkey/watcher background loop and settings UI remain open.)
 
 ### Wave 7 (Hours 17.0 to 19.0) - Full UI parity, PL/EN localization, and packaging
 
-- [x] **W7-A / W7-C (`crates/sharex-app` UI + i18n)**: Integrated System Tray, Pin-to-Screen, EN/PL localization (`i18n.rs`), Image Effects panel, 5-tab Tools panel, Recording panel + hotkeys, SQLite history with search and tags, and Uploaders `.sxcu` + presets panel (`e836ebd`, `c4c1516`, `ef5d188`).
+- [x] **W7-A / W7-C (`crates/sharex-app` UI + i18n)**: Integrated System Tray, Pin-to-Screen, EN/PL core UI & sidebar localization (`i18n.rs`, with some advanced sub-panel labels still in English), Image Effects panel, 5-tab Tools panel, Recording panel + hotkeys (with background disk-spooled GIF finalization), shared CLI/GUI SQLite history with search and tags, and Uploaders `.sxcu` + presets + text snippet panel (`e836ebd`, `c4c1516`, `ef5d188`).
 - [x] **W7-B (Performance & Release)**: Added O(1) bounded LRU thumbnail cache (`e836ebd`), `--portable` config mode, 1080p effects/PNG benchmark example (`bench_pipeline.rs`), and multi-platform GitHub Release workflow (`.github/workflows/release.yml`) (`86f88c3`).
 
 ### Wave 8 (Hours 19.0 to 20.0) - Cross-model audit and final verification
 
-- [ ] Cross-vendor review of `decisions.tsv` and cumulative diff (`codex/gpt-6.2-sol`).
+- [x] Cross-vendor review of `decisions.tsv` and cumulative diff (`codex/gpt-6.2-sol`) completed and all 4 blockers + notable risks remediated.
 - [x] Full `no-comments` and `#[allow(...)]` audit across all workspace crates (`0` non-doc comments, `0` suppressions).
-- [ ] Full `fmt` + `clippy -D warnings` + `test` + `release` build + live CLI verification and fresh `sharex.exe` launch.
+- [x] Full `fmt` + `clippy -D warnings` + `test` + `release` build + live CLI verification and fresh `sharex.exe` launch.

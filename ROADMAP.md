@@ -22,5 +22,5 @@ This roadmap tracks feature parity between the original C# [ShareX](https://gith
 - **S3 / R2 / MinIO SigV4 uploader**: Add AWS Signature Version 4 signing inside `sharex-uploaders`.
 - **Editor TrueType font picker and sticker overlays**: Add `ab_glyph` system font rendering and `ImageOverlay` stamp annotations to `sharex-editor`.
 - **Scrolling capture and screen-recording region HUD**: Add auto-scroll stitching and a translucent live recording border overlay.
-- **Workflow & Watch Folder UI editor**: Expose `WorkflowRegistry` and `WatchFolderScanner` configuration screens inside `sharex-app`.
+- **Workflow & Watch Folder runtime + UI**: Wire `WorkflowRegistry` and `WatchFolderScanner` into the live hotkey/background loop and expose configuration screens inside `sharex-app`.
 - **Windows `.ico` executable resource**: Embed a multi-size `.ico` in the Windows binary via `build.rs` / `winresource`.

@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,15 +42,23 @@ jobs:
       - name: Package Windows archive
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          PLATFORM: ${{ matrix.platform }}
+          BINARY: ${{ matrix.binary }}
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $archive = "dist/sharex-${{ github.ref_name }}-${{ matrix.platform }}.zip"
-          Compress-Archive -Path "target/release/${{ matrix.binary }}" -DestinationPath $archive -Force
+          $archive = "dist/sharex-$($env:RELEASE_TAG)-$($env:PLATFORM).zip"
+          Compress-Archive -Path "target/release/$($env:BINARY)" -DestinationPath $archive -Force
       - name: Package Unix archive
         if: runner.os != 'Windows'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          PLATFORM: ${{ matrix.platform }}
+          BINARY: ${{ matrix.binary }}
         run: |
           mkdir -p dist
-          tar -czf "dist/sharex-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz" -C target/release "${{ matrix.binary }}"
+          tar -czf "dist/sharex-${RELEASE_TAG}-${PLATFORM}.tar.gz" -C target/release "${BINARY}"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}
@@ -59,6 +67,8 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: build
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

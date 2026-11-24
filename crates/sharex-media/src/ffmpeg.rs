@@ -165,10 +165,12 @@ pub fn build_recording_args(
                 }
                 _ => unreachable!("validated by VideoEncoder::resolve"),
             }
-            if let Some(crop) = macos_crop {
-                args.push("-vf".to_owned());
-                args.push(crop);
-            }
+            let vf = match macos_crop {
+                Some(crop) => format!("{crop},scale=trunc(iw/2)*2:trunc(ih/2)*2"),
+                None => "scale=trunc(iw/2)*2:trunc(ih/2)*2".to_owned(),
+            };
+            args.push("-vf".to_owned());
+            args.push(vf);
             args.push("-pix_fmt".to_owned());
             args.push("yuv420p".to_owned());
             args.push("-movflags".to_owned());
@@ -195,11 +197,11 @@ pub fn build_recording_args(
         RecordingFormat::Gif => {
             let filtergraph = match macos_crop {
                 Some(crop) => format!(
-                    "{crop},fps={},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+                    "{crop},fps={},split[s0][s1];[s0]palettegen=stats_mode=single[p];[s1][p]paletteuse=new=1",
                     config.fps
                 ),
                 None => format!(
-                    "fps={},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+                    "fps={},split[s0][s1];[s0]palettegen=stats_mode=single[p];[s1][p]paletteuse=new=1",
                     config.fps
                 ),
             };
@@ -212,6 +214,42 @@ pub fn build_recording_args(
 
     args.push(config.output_path.to_string_lossy().into_owned());
     Ok(args)
+}
+
+/// Builds low-RAM disk-spooled capture arguments for Stage 1 of a two-stage GIF recording.
+pub fn build_gif_spool_args(
+    config: &RecordingConfig,
+    platform: CapturePlatform,
+    spool_path: &Path,
+) -> Result<Vec<String>, MediaError> {
+    let mut spool_config = config.clone();
+    spool_config.format = RecordingFormat::Mp4H264;
+    spool_config.encoder = VideoEncoder::Libx264;
+    spool_config.crf = 18;
+    spool_config.output_path = spool_path.to_path_buf();
+
+    let mut args = build_recording_args(&spool_config, platform)?;
+    if let Some(pos) = args.iter().position(|arg| arg == "veryfast") {
+        args[pos] = "ultrafast".to_owned();
+    }
+    if let Some(pos) = args.iter().position(|arg| arg == "-movflags") {
+        args.drain(pos..=pos + 1);
+    }
+    Ok(args)
+}
+
+/// Builds Stage 2 offline palette-optimized GIF transcode arguments from a spooled recording.
+pub fn build_gif_transcode_args(spool_path: &Path, output_path: &Path, fps: u32) -> Vec<String> {
+    vec![
+        "-y".to_owned(),
+        "-i".to_owned(),
+        spool_path.to_string_lossy().into_owned(),
+        "-vf".to_owned(),
+        format!("fps={fps},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"),
+        "-loop".to_owned(),
+        "0".to_owned(),
+        output_path.to_string_lossy().into_owned(),
+    ]
 }
 
 #[cfg(test)]
@@ -257,6 +295,8 @@ mod tests {
                 "p4",
                 "-cq",
                 "18",
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                 "-pix_fmt",
                 "yuv420p",
                 "-movflags",
@@ -290,6 +330,8 @@ mod tests {
                 "veryfast",
                 "-crf",
                 "23",
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                 "-pix_fmt",
                 "yuv420p",
                 "-movflags",
@@ -366,7 +408,7 @@ mod tests {
                 "-i",
                 "1:none",
                 "-vf",
-                "crop=640:480:40:80,fps=15,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+                "crop=640:480:40:80,fps=15,split[s0][s1];[s0]palettegen=stats_mode=single[p];[s1][p]paletteuse=new=1",
                 "-loop",
                 "0",
                 "demo.gif",
@@ -396,10 +438,41 @@ mod tests {
                 "-i",
                 "desktop",
                 "-vf",
-                "fps=12,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+                "fps=12,split[s0][s1];[s0]palettegen=stats_mode=single[p];[s1][p]paletteuse=new=1",
                 "-loop",
                 "0",
                 "demo.gif",
+            ]
+        );
+    }
+
+    #[test]
+    fn gif_spool_and_transcode_args_avoid_live_ram_buffering_and_force_even_dimensions() {
+        let mut config = RecordingConfig::new("clip.gif");
+        config.format = RecordingFormat::Gif;
+        config.fps = 15;
+        config.region = Some(Region::new(0, 0, 65, 64).expect("odd width region"));
+
+        let spool = Path::new("tmp_spool.mkv");
+        let spool_args = build_gif_spool_args(&config, CapturePlatform::WindowsGdiGrab, spool)
+            .expect("spool args");
+        assert!(spool_args.contains(&"ultrafast".to_owned()));
+        assert!(spool_args.contains(&"scale=trunc(iw/2)*2:trunc(ih/2)*2".to_owned()));
+        assert!(!spool_args.contains(&"-movflags".to_owned()));
+        assert_eq!(spool_args.last().map(String::as_str), Some("tmp_spool.mkv"));
+
+        let transcode_args = build_gif_transcode_args(spool, Path::new("clip.gif"), 15);
+        assert_eq!(
+            transcode_args,
+            vec![
+                "-y",
+                "-i",
+                "tmp_spool.mkv",
+                "-vf",
+                "fps=15,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+                "-loop",
+                "0",
+                "clip.gif",
             ]
         );
     }
