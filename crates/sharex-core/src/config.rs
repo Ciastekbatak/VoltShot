@@ -57,7 +57,7 @@ pub struct AppConfig {
     pub dark_theme: bool,
     #[serde(default = "default_true")]
     pub show_toasts: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub close_to_tray: bool,
     #[serde(default)]
     pub start_minimized: bool,
@@ -89,7 +89,7 @@ impl AppConfig {
             last_region: None,
             dark_theme: true,
             show_toasts: true,
-            close_to_tray: false,
+            close_to_tray: true,
             start_minimized: false,
             play_capture_sound: false,
             ui_language: default_ui_language(),
@@ -114,7 +114,7 @@ impl AppConfig {
             last_region: None,
             dark_theme: true,
             show_toasts: true,
-            close_to_tray: false,
+            close_to_tray: true,
             start_minimized: false,
             play_capture_sound: false,
             ui_language: default_ui_language(),
@@ -204,7 +204,7 @@ record_history = true
         .expect("legacy config");
         assert!(cfg.dark_theme);
         assert!(cfg.show_toasts);
-        assert!(!cfg.close_to_tray);
+        assert!(cfg.close_to_tray);
         assert!(!cfg.start_minimized);
         assert!(!cfg.play_capture_sound);
         assert_eq!(cfg.ui_language, "en");

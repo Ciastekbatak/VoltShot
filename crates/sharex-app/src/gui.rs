@@ -78,7 +78,11 @@ pub fn launch_gui_with_fallback(
         ..Default::default()
     };
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(mut create) = wgpu_options.wgpu_setup {
-        create.power_preference = eframe::egui_wgpu::wgpu::PowerPreference::LowPower;
+        #[cfg(target_os = "windows")]
+        {
+            create.instance_descriptor.backends = eframe::egui_wgpu::wgpu::Backends::DX12;
+        }
+        create.power_preference = eframe::egui_wgpu::wgpu::PowerPreference::HighPerformance;
         let base_desc = create.device_descriptor;
         create.device_descriptor = std::sync::Arc::new(move |adapter| {
             let mut desc = base_desc(adapter);
@@ -194,6 +198,8 @@ struct SharexGuiApp {
     run_at_startup: bool,
     hotkeys: HotkeyRuntime,
     last_hotkey_retry: Instant,
+    started_at: Instant,
+    startup_trimmed: bool,
     capturer: XcapCapturer,
     clipboard: SystemClipboard,
     status_line: String,
@@ -327,6 +333,8 @@ impl SharexGuiApp {
             run_at_startup: AutostartManager::is_enabled(AUTOSTART_APP_NAME),
             hotkeys,
             last_hotkey_retry: Instant::now(),
+            started_at: Instant::now(),
+            startup_trimmed: false,
             capturer,
             clipboard: SystemClipboard::new(),
             status_line: initial_status,
@@ -2701,6 +2709,15 @@ impl eframe::App for SharexGuiApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.startup_trimmed {
+            if self.started_at.elapsed() >= Duration::from_millis(1500) {
+                self.startup_trimmed = true;
+                crate::win_focus::trim_working_set();
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
+        }
+
         self.uploaders.poll_upload(&self.clipboard);
 
         if self.hotkeys.has_conflicts() {
@@ -2720,6 +2737,7 @@ impl eframe::App for SharexGuiApp {
             && self.tray.is_available()
         {
             self.thumbnails.clear();
+            crate::win_focus::trim_working_set();
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }

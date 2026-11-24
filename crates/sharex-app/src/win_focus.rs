@@ -2,8 +2,9 @@
 mod imp {
     use std::ptr;
     use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
     use windows_sys::Win32::System::Threading::{
-        AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
+        AttachThreadInput, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -21,6 +22,12 @@ mod imp {
     pub fn release_cursor_clip() {
         unsafe {
             ClipCursor(ptr::null());
+        }
+    }
+
+    pub fn trim_working_set() {
+        unsafe {
+            SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, 0);
         }
     }
 
@@ -129,6 +136,8 @@ mod imp {
 
     pub fn release_cursor_clip() {}
 
+    pub fn trim_working_set() {}
+
     pub struct OverlayFocusGuard;
 
     impl OverlayFocusGuard {
@@ -142,4 +151,4 @@ mod imp {
     }
 }
 
-pub use imp::{OverlayFocusGuard, allow_self_foreground, release_cursor_clip};
+pub use imp::{OverlayFocusGuard, allow_self_foreground, release_cursor_clip, trim_working_set};
