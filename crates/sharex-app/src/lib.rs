@@ -3,8 +3,11 @@ pub mod clipboard;
 pub mod editor_ui;
 pub mod gui;
 pub mod hotkeys;
+pub mod i18n;
+pub mod pin_window;
 pub mod region_overlay;
 pub mod theme;
+pub mod thumb_cache;
 pub mod win_focus;
 
 use chrono::Utc;
