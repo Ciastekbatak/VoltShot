@@ -60,6 +60,10 @@ pub fn install_extended_unicode_fonts(ctx: &egui::Context) {
 }
 
 fn install_fonts_with_fallbacks(ctx: &egui::Context, include_extended: bool) {
+    ctx.set_fonts(build_font_definitions(include_extended));
+}
+
+fn build_font_definitions(include_extended: bool) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
 
     if let Some(bytes) = load_first_existing(PROPORTIONAL_CANDIDATES) {
@@ -67,9 +71,14 @@ fn install_fonts_with_fallbacks(ctx: &egui::Context, include_extended: bool) {
             "native_ui".to_owned(),
             Arc::new(FontData::from_owned(bytes)),
         );
-        let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
-        proportional.retain(|name| name != "Ubuntu-Light");
-        proportional.insert(0, "native_ui".to_owned());
+        for list in fonts.families.values_mut() {
+            list.retain(|name| name != "Ubuntu-Light");
+        }
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "native_ui".to_owned());
         fonts.font_data.remove("Ubuntu-Light");
     }
 
@@ -78,9 +87,14 @@ fn install_fonts_with_fallbacks(ctx: &egui::Context, include_extended: bool) {
             "native_mono".to_owned(),
             Arc::new(FontData::from_owned(bytes)),
         );
-        let monospace = fonts.families.entry(FontFamily::Monospace).or_default();
-        monospace.retain(|name| name != "Hack");
-        monospace.insert(0, "native_mono".to_owned());
+        for list in fonts.families.values_mut() {
+            list.retain(|name| name != "Hack");
+        }
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .insert(0, "native_mono".to_owned());
         fonts.font_data.remove("Hack");
     }
 
@@ -99,7 +113,7 @@ fn install_fonts_with_fallbacks(ctx: &egui::Context, include_extended: bool) {
         }
     }
 
-    ctx.set_fonts(fonts);
+    fonts
 }
 
 fn load_first_existing(candidates: &[&str]) -> Option<Vec<u8>> {
@@ -116,5 +130,21 @@ mod tests {
     #[test]
     fn load_first_existing_skips_missing_paths() {
         assert!(load_first_existing(&["/definitely/missing/font.ttf"]).is_none());
+    }
+
+    #[test]
+    fn every_referenced_family_font_exists_in_font_data() {
+        for extended in [false, true] {
+            let defs = build_font_definitions(extended);
+            for (family, names) in &defs.families {
+                assert!(!names.is_empty(), "empty font family {family:?}");
+                for name in names {
+                    assert!(
+                        defs.font_data.contains_key(name),
+                        "family {family:?} references missing font '{name}'"
+                    );
+                }
+            }
+        }
     }
 }
