@@ -171,6 +171,7 @@ mod windows {
                                 return;
                             }
                             ctx.request_repaint();
+                            crate::win_focus::wake_hidden_main_window();
                         }
 
                         if stop_rx.recv_timeout(POLL_INTERVAL)

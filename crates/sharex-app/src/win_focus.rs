@@ -1,17 +1,88 @@
+/// Title of the main ShareX-RS desktop window used for Win32 window lookups.
+pub const MAIN_WINDOW_TITLE: &str = "ShareX (Rust)";
+
 #[cfg(target_os = "windows")]
 mod imp {
+    use super::MAIN_WINDOW_TITLE;
     use std::ptr;
-    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND,
+    };
     use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
     use windows_sys::Win32::System::Threading::{
-        AttachThreadInput, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
+        AttachThreadInput, CreateMutexW, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AllowSetForegroundWindow, BringWindowToTop, ClipCursor, FindWindowW, GetForegroundWindow,
-        GetWindowThreadProcessId, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-        SetForegroundWindow, SetWindowPos,
+        GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, PostMessageW, SW_RESTORE, SW_SHOW,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
+        WM_PAINT,
     };
+
+    const SINGLE_INSTANCE_MUTEX: &str = "Local\\ShareX_Rust_SingleInstance_v1";
+
+    /// Holds the OS single-instance lock for the lifetime of the desktop GUI process.
+    pub struct SingleInstanceGuard(HANDLE);
+
+    impl Drop for SingleInstanceGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    pub fn acquire_single_instance() -> Option<SingleInstanceGuard> {
+        let name: Vec<u16> = SINGLE_INSTANCE_MUTEX
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Some(SingleInstanceGuard(ptr::null_mut()));
+        }
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe {
+                CloseHandle(handle);
+            }
+            focus_existing_main_window();
+            return None;
+        }
+        Some(SingleInstanceGuard(handle))
+    }
+
+    fn focus_existing_main_window() {
+        let wide: Vec<u16> = MAIN_WINDOW_TITLE
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let hwnd = unsafe { FindWindowW(ptr::null(), wide.as_ptr()) };
+        if !hwnd.is_null() {
+            unsafe {
+                ShowWindow(hwnd, SW_SHOW);
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+                PostMessageW(hwnd, WM_PAINT, 0, 0);
+            }
+        }
+    }
+
+    pub fn is_main_window_hidden() -> bool {
+        let hwnd = find_own_window_by_title(MAIN_WINDOW_TITLE);
+        !hwnd.is_null() && unsafe { IsWindowVisible(hwnd) } == 0
+    }
+
+    pub fn wake_hidden_main_window() {
+        let hwnd = find_own_window_by_title(MAIN_WINDOW_TITLE);
+        if !hwnd.is_null() && unsafe { IsWindowVisible(hwnd) } == 0 {
+            unsafe {
+                PostMessageW(hwnd, WM_PAINT, 0, 0);
+            }
+        }
+    }
 
     pub fn allow_self_foreground() {
         unsafe {
@@ -132,6 +203,18 @@ mod imp {
 
 #[cfg(not(target_os = "windows"))]
 mod imp {
+    pub struct SingleInstanceGuard;
+
+    pub fn acquire_single_instance() -> Option<SingleInstanceGuard> {
+        Some(SingleInstanceGuard)
+    }
+
+    pub fn is_main_window_hidden() -> bool {
+        false
+    }
+
+    pub fn wake_hidden_main_window() {}
+
     pub fn allow_self_foreground() {}
 
     pub fn release_cursor_clip() {}
@@ -151,4 +234,7 @@ mod imp {
     }
 }
 
-pub use imp::{OverlayFocusGuard, allow_self_foreground, release_cursor_clip, trim_working_set};
+pub use imp::{
+    OverlayFocusGuard, SingleInstanceGuard, acquire_single_instance, allow_self_foreground,
+    is_main_window_hidden, release_cursor_clip, trim_working_set, wake_hidden_main_window,
+};

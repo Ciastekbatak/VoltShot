@@ -59,6 +59,9 @@ pub fn launch_gui_with_fallback(
     fallback_config: AppConfig,
     minimized: bool,
 ) -> Result<(), eframe::Error> {
+    let Some(_single_instance) = crate::win_focus::acquire_single_instance() else {
+        return Ok(());
+    };
     let (config, config_warning) =
         match crate::load_config_with_fallback(&config_path, fallback_config.clone()) {
             Ok(config) => (config, None),
@@ -200,6 +203,7 @@ struct SharexGuiApp {
     last_hotkey_retry: Instant,
     started_at: Instant,
     startup_trimmed: bool,
+    hidden_pump: HiddenWindowPumper,
     capturer: XcapCapturer,
     clipboard: SystemClipboard,
     status_line: String,
@@ -335,6 +339,7 @@ impl SharexGuiApp {
             last_hotkey_retry: Instant::now(),
             started_at: Instant::now(),
             startup_trimmed: false,
+            hidden_pump: HiddenWindowPumper::spawn(),
             capturer,
             clipboard: SystemClipboard::new(),
             status_line: initial_status,
@@ -2749,8 +2754,23 @@ impl eframe::App for SharexGuiApp {
 
         self.update_overlay(ctx);
         if self.overlay.is_some() {
+            self.hidden_pump
+                .set_interval_ms(if crate::win_focus::is_main_window_hidden() {
+                    8
+                } else {
+                    0
+                });
             return;
         }
+        let needs_hidden_pump = crate::win_focus::is_main_window_hidden()
+            && (self.recording.is_recording()
+                || self.recording.is_finalizing()
+                || !self.pins.is_empty()
+                || self.toasts.active_count() > 0
+                || self.ocr_pending.is_some()
+                || self.uploaders.is_uploading());
+        self.hidden_pump
+            .set_interval_ms(if needs_hidden_pump { 50 } else { 0 });
         self.poll_ocr(ctx);
         self.poll_capture_uploads(ctx);
         self.poll_watcher(ctx);
@@ -2927,6 +2947,68 @@ pub(crate) fn capture_overlay_snapshot(
     capturer
         .capture_virtual_desktop()
         .or_else(|_| capturer.capture_primary_snapshot())
+}
+
+struct HiddenWindowPumper {
+    state: std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+}
+
+impl HiddenWindowPumper {
+    fn spawn() -> Self {
+        let state = std::sync::Arc::new((std::sync::Mutex::new(0_u64), std::sync::Condvar::new()));
+        let shared = std::sync::Arc::clone(&state);
+        let _ = thread::Builder::new()
+            .name("sharex-hidden-pump".into())
+            .spawn(move || {
+                let (lock, cvar) = &*shared;
+                let mut guard = match lock.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                loop {
+                    while *guard == 0 {
+                        guard = match cvar.wait(guard) {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                    }
+                    let delay = *guard;
+                    if delay == u64::MAX {
+                        return;
+                    }
+                    let (next, _) = match cvar.wait_timeout(guard, Duration::from_millis(delay)) {
+                        Ok(res) => res,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard = next;
+                    if *guard > 0 && *guard != u64::MAX {
+                        drop(guard);
+                        crate::win_focus::wake_hidden_main_window();
+                        guard = match lock.lock() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                    }
+                }
+            });
+        Self { state }
+    }
+
+    fn set_interval_ms(&self, ms: u64) {
+        let (lock, cvar) = &*self.state;
+        if let Ok(mut guard) = lock.lock()
+            && *guard != ms
+        {
+            *guard = ms;
+            cvar.notify_one();
+        }
+    }
+}
+
+impl Drop for HiddenWindowPumper {
+    fn drop(&mut self) {
+        self.set_interval_ms(u64::MAX);
+    }
 }
 
 fn show_main_window(ctx: &egui::Context) {

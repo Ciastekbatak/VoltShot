@@ -188,16 +188,19 @@ mod platform {
                             pre_snapshot,
                         });
                         ctx.request_repaint();
+                        win_focus::wake_hidden_main_window();
                     }
                 }
                 WM_SYNC_HOTKEYS => {
                     apply_win32_bindings(&desired, &statuses, &mut registered);
                     ctx.request_repaint();
+                    win_focus::wake_hidden_main_window();
                 }
                 WM_RETRY_CONFLICTS
                     if retry_conflicted_win32_bindings(&desired, &statuses, &mut registered) =>
                 {
                     ctx.request_repaint();
+                    win_focus::wake_hidden_main_window();
                 }
                 _ => {}
             }
