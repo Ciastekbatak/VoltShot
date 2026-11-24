@@ -6,21 +6,18 @@ This roadmap tracks feature parity between the original C# [ShareX](https://gith
 
 | Subsystem | Original C# project | Rust crate | Status |
 | --- | --- | --- | --- |
-| Core types, naming, config, hotkeys, workflows | `ShareX.HelpersLib` | `sharex-core` | Complete (config, portable mode, 7 default hotkeys, `WorkflowRegistry`, `WatchFolderScanner`) |
-| Capture history | `ShareX.HistoryLib` | `sharex-core` | Complete (bundled `SqliteHistoryStore`, tags, search queries, JSONL auto-migration) |
-| Screen capture and region overlay | `ShareX.ScreenCaptureLib` | `sharex-capture`, `sharex-app` | Complete (fullscreen, active monitor, active window, multi-monitor crop, 11x11 pixel loupe, hover window snapping) |
-| Annotation editor | `ShareX.ImageEditor` | `sharex-editor`, `sharex-app` | Complete (16 tools incl. Balloon/Magnifier/Spotlight, resize, `.sxed` JSON, undo/redo, PNG/JPEG/WebP save) |
-| Image effects pipeline | `ShareX.ImageEffectsLib` | `sharex-effects`, `sharex-app` | Complete (9 pure-Rust filters, TOML/JSON presets, live after-capture execution, 1080p benchmark) |
-| Uploader destinations | `ShareX.UploadersLib` | `sharex-uploaders`, `sharex-app` | Complete (`.sxcu` engine, template evaluator, Imgur/Discord/Gist/Pastebin presets, Local Mirror, retry queue, Uploaders UI) |
-| Screen and GIF recording | `ShareX.ScreenRecordingLib` | `sharex-media`, `sharex-app` | Complete (FFmpeg builder for MP4/WebM/2-pass GIF, Recording panel, `Ctrl+Shift+PrtSc` / `Alt+Shift+PrtSc` hotkeys) |
-| Extra utilities (Color, Ruler, QR, Hash, Indexer, Combiner, OCR) | `ShareX.Tools`, `ShareX.IndexerLib` | `sharex-tools`, `sharex-app` | Complete (5-tab Tools UI, Pin-to-Screen floating windows, `OcrEngine` + Tesseract CLI) |
-| Desktop UI, Tray, i18n, Release CI | `ShareX` | `sharex-app`, `.github/workflows/release.yml` | Complete (dark/light UI, `tray-icon`, EN/PL localization, LRU cache, `--portable`, multi-OS release workflow) |
+| Core types, naming, config, hotkeys, workflows | `ShareX.HelpersLib` | `sharex-core` | Complete (config, portable mode, 9 default hotkeys, `WorkflowRegistry`, `WatchFolderScanner`) |
+| Capture history | `ShareX.HistoryLib` | `sharex-core` | Complete (shared CLI/GUI `SqliteHistoryStore`, tags, `#tag` search, one-time JSONL migration) |
+| Screen capture & multi-monitor overlays | `ShareX.ScreenCaptureLib` | `sharex-capture`, `sharex-app` | Complete (DXGI Desktop Duplication + `xcap` fallback, multi-monitor virtual desktop, scrolling stitcher, 4 overlay modes: Capture/OCR/RecordingRegion/ColorPicker) |
+| Annotation editor | `ShareX.ImageEditor` | `sharex-editor`, `sharex-app` | Complete (18 tools incl. SpeechBalloon, Magnifier, Spotlight, SmartEraser, ImageOverlay stamps, `ab_glyph` TTF, corner resize handles, `.sxed` JSON, canvas resize) |
+| Image effects pipeline | `ShareX.ImageEffectsLib` | `sharex-effects`, `sharex-app` | Complete (13 rayon-parallel filters, O(1) shadow blur ~5ms @ 1080p, interactive 11-effect UI builder, TOML import/export) |
+| Uploader destinations & URL shorteners | `ShareX.UploadersLib` | `sharex-uploaders`, `sharex-app` | Complete (`.sxcu`, AWS S3/R2/MinIO SigV4, Imgur/Discord/Gist/Pastebin/Local Mirror, `is.gd`/`TinyURL`/`.sxcu` shorteners, persistent settings, retry queue) |
+| Screen & GIF recording | `ShareX.ScreenRecordingLib` | `sharex-media`, `sharex-app` | Complete (NVENC/QSV/AMF auto-detection, audio devices, region recording, 2-stage disk-spooled GIF, floating Recording HUD, global hotkeys) |
+| Utilities & native OCR | `ShareX.Tools`, `ShareX.IndexerLib` | `sharex-tools`, `sharex-app` | Complete (native Windows WinRT OCR + Tesseract fallback, QR encode/decode, Color, Ruler, Hash, Indexer, Combiner + Contact Sheet, Pin-to-Screen) |
+| Desktop shell, Tray, Toasts, i18n, Packaging | `ShareX` | `sharex-app`, `.github/workflows/release.yml` | Complete (`wgpu` DX12, console-free Windows GUI, embedded `.ico`, Tray, Close-to-Tray, Toasts, Autostart, shutter sound, Workflows/Watchers UI, EN/PL i18n, CI releases) |
 
-## Remaining follow-up milestones for contributors
+## Future stretch enhancements
 
-- **Native Windows WinRT OCR adapter**: Implement `OcrEngine` against `Windows.Media.Ocr` as primary backend ahead of `TesseractCliOcr` in `FallbackOcrChain`.
-- **S3 / R2 / MinIO SigV4 uploader**: Add AWS Signature Version 4 signing inside `sharex-uploaders`.
-- **Editor TrueType font picker and sticker overlays**: Add `ab_glyph` system font rendering and `ImageOverlay` stamp annotations to `sharex-editor`.
-- **Scrolling capture and screen-recording region HUD**: Add auto-scroll stitching and a translucent live recording border overlay.
-- **Workflow & Watch Folder runtime + UI**: Wire `WorkflowRegistry` and `WatchFolderScanner` into the live hotkey/background loop and expose configuration screens inside `sharex-app`.
-- **Windows `.ico` executable resource**: Embed a multi-size `.ico` in the Windows binary via `build.rs` / `winresource`.
+- Interactive Scrolling Capture auto-scroll driver (`SendInput` mouse wheel loop wired into UI).
+- Native Linux Wayland (`xdg-desktop-portal` ScreenCast) and macOS ScreenCaptureKit backends.
+- Signed Windows MSI / winget installer package alongside portable ZIP archives.
