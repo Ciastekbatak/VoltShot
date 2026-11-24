@@ -1,8 +1,10 @@
 use crate::raster::render_document;
+use serde::{Deserialize, Serialize};
 use sharex_core::{CapturedImage, CoreError, Region};
+use std::collections::HashSet;
 
 /// RGBA color value used by annotations and editor controls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RgbaColor {
     pub r: u8,
     pub g: u8,
@@ -48,7 +50,7 @@ pub const SHAREX_PALETTE: [RgbaColor; 9] = [
 ];
 
 /// 2D image-space coordinate in pixels.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub x: f32,
     pub y: f32,
@@ -61,7 +63,7 @@ impl Point {
 }
 
 /// Normalized image-space rectangle (`width >= 0`, `height >= 0`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RectF {
     pub x: f32,
     pub y: f32,
@@ -105,6 +107,15 @@ impl RectF {
             ..self
         }
     }
+
+    fn is_valid(self) -> bool {
+        self.x.is_finite()
+            && self.y.is_finite()
+            && self.width >= 0.0
+            && self.height >= 0.0
+            && self.right().is_finite()
+            && self.bottom().is_finite()
+    }
 }
 
 /// Active tool in the ShareX image editor toolbar.
@@ -122,11 +133,14 @@ pub enum EditorTool {
     StepNumber,
     Pixelate,
     Blur,
+    SpeechBalloon,
+    Magnifier,
+    Spotlight,
     Crop,
 }
 
 impl EditorTool {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 16] = [
         Self::Select,
         Self::Rectangle,
         Self::FilledRectangle,
@@ -139,6 +153,9 @@ impl EditorTool {
         Self::StepNumber,
         Self::Pixelate,
         Self::Blur,
+        Self::SpeechBalloon,
+        Self::Magnifier,
+        Self::Spotlight,
         Self::Crop,
     ];
 
@@ -156,6 +173,9 @@ impl EditorTool {
             Self::StepNumber => "Step",
             Self::Pixelate => "Pixelate",
             Self::Blur => "Blur",
+            Self::SpeechBalloon => "Balloon",
+            Self::Magnifier => "Magnifier",
+            Self::Spotlight => "Spotlight",
             Self::Crop => "Crop",
         }
     }
@@ -174,13 +194,16 @@ impl EditorTool {
             Self::StepNumber => "N",
             Self::Pixelate => "P",
             Self::Blur => "B",
+            Self::SpeechBalloon => "Q",
+            Self::Magnifier => "M",
+            Self::Spotlight => "S",
             Self::Crop => "C",
         }
     }
 }
 
 /// Strongly typed annotation payload stored in an `EditorDocument`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AnnotationKind {
     Rectangle {
         rect: RectF,
@@ -236,10 +259,29 @@ pub enum AnnotationKind {
         rect: RectF,
         radius: u32,
     },
+    SpeechBalloon {
+        rect: RectF,
+        tail: Point,
+        text: String,
+        fill: RgbaColor,
+        border: RgbaColor,
+        text_color: RgbaColor,
+        font_size: f32,
+    },
+    Magnifier {
+        center: Point,
+        radius: f32,
+        zoom: f32,
+        border_color: RgbaColor,
+    },
+    Spotlight {
+        rect: RectF,
+        dim_alpha: u8,
+    },
 }
 
 /// Identified annotation layer inside an `EditorDocument`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Annotation {
     pub id: u64,
     pub kind: AnnotationKind,
@@ -251,7 +293,12 @@ impl Annotation {
             AnnotationKind::Rectangle { rect, .. }
             | AnnotationKind::Ellipse { rect, .. }
             | AnnotationKind::Pixelate { rect, .. }
-            | AnnotationKind::Blur { rect, .. } => *rect,
+            | AnnotationKind::Blur { rect, .. }
+            | AnnotationKind::Spotlight { rect, .. } => *rect,
+            AnnotationKind::SpeechBalloon { rect, tail, .. } => RectF::from_points(
+                Point::new(rect.x.min(tail.x), rect.y.min(tail.y)),
+                Point::new(rect.right().max(tail.x), rect.bottom().max(tail.y)),
+            ),
             AnnotationKind::Line { start, end, .. } | AnnotationKind::Arrow { start, end, .. } => {
                 RectF::from_points(*start, *end)
             }
@@ -298,7 +345,8 @@ impl Annotation {
                     height,
                 }
             }
-            AnnotationKind::StepNumber { center, radius, .. } => RectF {
+            AnnotationKind::StepNumber { center, radius, .. }
+            | AnnotationKind::Magnifier { center, radius, .. } => RectF {
                 x: center.x - *radius,
                 y: center.y - *radius,
                 width: *radius * 2.0,
@@ -316,8 +364,14 @@ impl Annotation {
             AnnotationKind::Rectangle { rect, .. }
             | AnnotationKind::Ellipse { rect, .. }
             | AnnotationKind::Pixelate { rect, .. }
-            | AnnotationKind::Blur { rect, .. } => {
+            | AnnotationKind::Blur { rect, .. }
+            | AnnotationKind::Spotlight { rect, .. } => {
                 *rect = rect.translate(dx, dy);
+            }
+            AnnotationKind::SpeechBalloon { rect, tail, .. } => {
+                *rect = rect.translate(dx, dy);
+                tail.x += dx;
+                tail.y += dy;
             }
             AnnotationKind::Line { start, end, .. } | AnnotationKind::Arrow { start, end, .. } => {
                 start.x += dx;
@@ -336,11 +390,58 @@ impl Annotation {
                 position.x += dx;
                 position.y += dy;
             }
-            AnnotationKind::StepNumber { center, .. } => {
+            AnnotationKind::StepNumber { center, .. }
+            | AnnotationKind::Magnifier { center, .. } => {
                 center.x += dx;
                 center.y += dy;
             }
         }
+    }
+
+    fn resize(&mut self, new_rect: RectF) -> bool {
+        match &mut self.kind {
+            AnnotationKind::Rectangle { rect, .. }
+            | AnnotationKind::Ellipse { rect, .. }
+            | AnnotationKind::Pixelate { rect, .. }
+            | AnnotationKind::Blur { rect, .. }
+            | AnnotationKind::Spotlight { rect, .. } => {
+                if *rect == new_rect {
+                    return false;
+                }
+                *rect = new_rect;
+            }
+            AnnotationKind::SpeechBalloon { rect, tail, .. } => {
+                if *rect == new_rect {
+                    return false;
+                }
+                fn scale_offset(offset: f32, from: f32, to: f32) -> f32 {
+                    if from > 0.0 {
+                        offset / from * to
+                    } else {
+                        offset
+                    }
+                }
+                *tail = Point::new(
+                    new_rect.x + scale_offset(tail.x - rect.x, rect.width, new_rect.width),
+                    new_rect.y + scale_offset(tail.y - rect.y, rect.height, new_rect.height),
+                );
+                *rect = new_rect;
+            }
+            AnnotationKind::Magnifier { center, radius, .. } => {
+                let new_center = Point::new(
+                    new_rect.x + new_rect.width * 0.5,
+                    new_rect.y + new_rect.height * 0.5,
+                );
+                let new_radius = new_rect.width.min(new_rect.height) * 0.5;
+                if *center == new_center && *radius == new_radius {
+                    return false;
+                }
+                *center = new_center;
+                *radius = new_radius;
+            }
+            _ => return false,
+        }
+        true
     }
 }
 
@@ -444,8 +545,11 @@ impl EditorDocument {
         if matches!(kind, AnnotationKind::StepNumber { .. }) {
             self.next_step_number = self.next_step_number.saturating_add(1);
         }
+        while self.annotations.iter().any(|item| item.id == self.next_id) {
+            self.next_id = self.next_id.wrapping_add(1).max(1);
+        }
         let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        self.next_id = self.next_id.wrapping_add(1).max(1);
         self.annotations.push(Annotation { id, kind });
         self.selected_id = Some(id);
         id
@@ -463,6 +567,67 @@ impl EditorDocument {
         } else {
             false
         }
+    }
+
+    /// Resizes an annotation in one undoable edit. For a balloon, the rectangle is its body.
+    pub fn resize_annotation(&mut self, id: u64, new_rect: RectF) -> bool {
+        if !new_rect.is_valid() {
+            return false;
+        }
+        let Some(index) = self.annotations.iter().position(|item| item.id == id) else {
+            return false;
+        };
+        let mut resized = self.annotations[index].clone();
+        if !resized.resize(new_rect) {
+            return false;
+        }
+        self.begin_move_undo();
+        self.annotations[index] = resized;
+        true
+    }
+
+    /// Exports the ordered annotation layers as a JSON array for an .sxed project.
+    pub fn export_annotations_json(&self) -> Result<String, CoreError> {
+        serde_json::to_string_pretty(&self.annotations).map_err(|err| {
+            CoreError::ConfigError(format!("cannot export .sxed annotations: {err}"))
+        })
+    }
+
+    /// Replaces the annotation layers in one undoable edit, using the current base image.
+    pub fn import_annotations_json(&mut self, json: &str) -> Result<usize, CoreError> {
+        let annotations: Vec<Annotation> = serde_json::from_str(json).map_err(|err| {
+            CoreError::ConfigError(format!("cannot import .sxed annotations: {err}"))
+        })?;
+        let mut ids = HashSet::with_capacity(annotations.len());
+        for item in &annotations {
+            if item.id == 0 || !ids.insert(item.id) {
+                return Err(CoreError::ConfigError(format!(
+                    "invalid or duplicate .sxed annotation ID {}",
+                    item.id
+                )));
+            }
+        }
+        let count = annotations.len();
+        if annotations == self.annotations {
+            return Ok(count);
+        }
+        let next_step_number = annotations
+            .iter()
+            .filter_map(|item| match item.kind {
+                AnnotationKind::StepNumber { number, .. } => Some(number),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        if let Some(max_id) = ids.into_iter().max() {
+            self.next_id = self.next_id.max(max_id.saturating_add(1));
+        }
+        self.record_undo();
+        self.annotations = annotations;
+        self.selected_id = None;
+        self.next_step_number = next_step_number;
+        Ok(count)
     }
 
     pub fn delete_selected(&mut self) -> bool {
@@ -531,5 +696,149 @@ impl EditorDocument {
     /// Flattens the base image and all annotations into a single RGBA image.
     pub fn flatten(&self) -> Result<CapturedImage, CoreError> {
         render_document(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn document() -> EditorDocument {
+        EditorDocument::new(CapturedImage::from_rgba(32, 32, vec![255; 32 * 32 * 4]).unwrap())
+    }
+
+    #[test]
+    fn resize_and_project_json_round_trip_with_undo_and_redo() {
+        let original = RectF::from_points(Point::new(3.0, 4.0), Point::new(13.0, 14.0));
+        let resized = RectF::from_points(Point::new(6.0, 8.0), Point::new(26.0, 28.0));
+        let mut source = document();
+        let balloon = source.push_annotation(AnnotationKind::SpeechBalloon {
+            rect: original,
+            tail: Point::new(8.0, 18.0),
+            text: "Note".into(),
+            fill: RgbaColor::WHITE,
+            border: RgbaColor::RED,
+            text_color: RgbaColor::BLACK,
+            font_size: 12.0,
+        });
+        source.push_annotation(AnnotationKind::Spotlight {
+            rect: original,
+            dim_alpha: 150,
+        });
+        source.push_annotation(AnnotationKind::Magnifier {
+            center: Point::new(12.0, 15.0),
+            radius: 4.0,
+            zoom: 2.0,
+            border_color: RgbaColor::GREEN,
+        });
+        source.push_annotation(AnnotationKind::StepNumber {
+            center: Point::new(10.0, 15.0),
+            number: 7,
+            color: RgbaColor::BLUE,
+            radius: 3.0,
+        });
+        let before = source.annotations().to_vec();
+        assert!(source.resize_annotation(balloon, resized));
+        assert!(!source.resize_annotation(balloon, resized));
+        assert!(matches!(
+            &source.annotations()[0].kind,
+            AnnotationKind::SpeechBalloon { rect, tail, .. }
+                if *rect == resized && *tail == Point::new(16.0, 36.0)
+        ));
+        assert!(source.undo());
+        assert_eq!(source.annotations(), before);
+        assert!(source.redo());
+
+        let json = source.export_annotations_json().unwrap();
+        let mut imported = document();
+        imported.push_annotation(AnnotationKind::Blur {
+            rect: original,
+            radius: 2,
+        });
+        let prior = imported.annotations().to_vec();
+        assert_eq!(imported.import_annotations_json(&json).unwrap(), 4);
+        assert_eq!(imported.annotations(), source.annotations());
+        assert_eq!(imported.next_step_number(), 8);
+        assert_eq!(imported.export_annotations_json().unwrap(), json);
+        assert!(imported.undo());
+        assert_eq!(imported.annotations(), prior);
+        assert_eq!(imported.next_step_number(), 1);
+        assert!(imported.redo());
+        assert_eq!(imported.annotations(), source.annotations());
+        assert_eq!(imported.next_step_number(), 8);
+        let new_id = imported.push_annotation(AnnotationKind::Pixelate {
+            rect: original,
+            block_size: 2,
+        });
+        assert!(source.annotations().iter().all(|item| item.id != new_id));
+    }
+
+    #[test]
+    fn resize_updates_shape_and_effect_bounds_and_rejects_other_kinds() {
+        let rect = RectF::from_points(Point::new(1.0, 2.0), Point::new(5.0, 6.0));
+        let new_rect = rect.translate(4.0, 5.0);
+        let mut doc = document();
+        for kind in [
+            AnnotationKind::Rectangle {
+                rect,
+                color: RgbaColor::RED,
+                stroke_width: 1.0,
+                filled: false,
+            },
+            AnnotationKind::Ellipse {
+                rect,
+                color: RgbaColor::RED,
+                stroke_width: 1.0,
+            },
+            AnnotationKind::Pixelate {
+                rect,
+                block_size: 4,
+            },
+            AnnotationKind::Blur { rect, radius: 2 },
+            AnnotationKind::Spotlight {
+                rect,
+                dim_alpha: 150,
+            },
+            AnnotationKind::Magnifier {
+                center: Point::new(3.0, 4.0),
+                radius: 2.0,
+                zoom: 2.0,
+                border_color: RgbaColor::GREEN,
+            },
+        ] {
+            let id = doc.push_annotation(kind);
+            assert!(doc.resize_annotation(id, new_rect));
+            assert_eq!(doc.annotations().last().unwrap().bounds(), new_rect);
+        }
+        let line = doc.push_annotation(AnnotationKind::Line {
+            start: Point::new(1.0, 2.0),
+            end: Point::new(5.0, 6.0),
+            color: RgbaColor::RED,
+            stroke_width: 1.0,
+        });
+        assert!(!doc.resize_annotation(line, new_rect));
+        assert!(!doc.resize_annotation(999, new_rect));
+        assert!(doc.undo());
+        assert_eq!(doc.annotations().len(), 6);
+    }
+
+    #[test]
+    fn invalid_project_import_leaves_annotations_and_history_intact() {
+        let mut doc = document();
+        let rect = RectF::from_points(Point::new(0.0, 0.0), Point::new(5.0, 5.0));
+        doc.push_annotation(AnnotationKind::Spotlight {
+            rect,
+            dim_alpha: 100,
+        });
+        let item = serde_json::to_string(&doc.annotations()[0]).unwrap();
+        assert!(doc.undo());
+        assert!(
+            doc.import_annotations_json(&format!("[{item},{item}]"))
+                .is_err()
+        );
+        assert!(doc.import_annotations_json("not JSON").is_err());
+        assert!(doc.annotations().is_empty());
+        assert!(doc.redo());
+        assert_eq!(doc.annotations().len(), 1);
     }
 }

@@ -3564,6 +3564,8 @@ dependencies = [
 name = "sharex-editor"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "sharex-core",
 ]
 

@@ -30,14 +30,16 @@ impl Canvas {
             return;
         }
         let alpha = f32::from(color.a) / 255.0;
-        let inv = 1.0 - alpha;
-        self.rgba[idx] =
-            (f32::from(color.r) * alpha + f32::from(self.rgba[idx]) * inv).round() as u8;
-        self.rgba[idx + 1] =
-            (f32::from(color.g) * alpha + f32::from(self.rgba[idx + 1]) * inv).round() as u8;
-        self.rgba[idx + 2] =
-            (f32::from(color.b) * alpha + f32::from(self.rgba[idx + 2]) * inv).round() as u8;
-        self.rgba[idx + 3] = 255;
+        let remaining = f32::from(self.rgba[idx + 3]) / 255.0 * (1.0 - alpha);
+        let combined = alpha + remaining;
+        for (channel, source) in self.rgba[idx..idx + 3]
+            .iter_mut()
+            .zip([color.r, color.g, color.b])
+        {
+            *channel = ((f32::from(source) * alpha + f32::from(*channel) * remaining) / combined)
+                .round() as u8;
+        }
+        self.rgba[idx + 3] = (combined * 255.0).round() as u8;
     }
 
     fn fill_rect(&mut self, rect: RectF, color: RgbaColor) {
@@ -229,31 +231,148 @@ impl Canvas {
     }
 
     fn draw_text_line(&mut self, origin: Point, text: &str, color: RgbaColor, font_size: f32) {
-        let scale = ((font_size / 7.0).round() as i32).max(1);
-        let mut cursor_x = origin.x.round() as i32;
-        let start_y = origin.y.round() as i32;
+        let scale = (font_size / 7.0).round().max(1.0);
+        let mut cursor_x = origin.x.round();
+        let start_y = origin.y.round();
 
         for ch in text.chars() {
+            if cursor_x >= self.width as f32 {
+                break;
+            }
             let rows = glyph_5x7(ch);
             for (row_idx, bits) in rows.iter().enumerate() {
                 for col_idx in 0..5 {
                     if (bits >> (4 - col_idx)) & 1 == 1 {
-                        let px = cursor_x + col_idx * scale;
-                        let py = start_y + (row_idx as i32) * scale;
-                        for dy in 0..scale {
-                            for dx in 0..scale {
-                                self.blend_pixel(px + dx, py + dy, color);
-                            }
-                        }
+                        self.fill_rect(
+                            RectF {
+                                x: cursor_x + col_idx as f32 * scale,
+                                y: start_y + row_idx as f32 * scale,
+                                width: scale,
+                                height: scale,
+                            },
+                            color,
+                        );
                     }
                 }
             }
-            cursor_x += 6 * scale;
+            cursor_x += 6.0 * scale;
+        }
+    }
+
+    fn draw_balloon(&mut self, rect: RectF, tail: Point, fill: RgbaColor, border: RgbaColor) {
+        let (outline, _) = speech_balloon_outline(rect, tail);
+        let edges = || {
+            outline
+                .iter()
+                .copied()
+                .zip(outline.iter().copied().cycle().skip(1))
+        };
+        let top = rect.y.min(tail.y).floor().max(0.0) as i32;
+        let bottom = rect.bottom().max(tail.y).ceil().min(self.height as f32) as i32;
+        let mut crossings = Vec::with_capacity(4);
+        for y in top..bottom {
+            let py = y as f32 + 0.5;
+            crossings.clear();
+            for (a, b) in edges() {
+                if (a.y > py) != (b.y > py) {
+                    crossings.push(a.x + (b.x - a.x) * ((py - a.y) / (b.y - a.y)));
+                }
+            }
+            crossings.sort_unstable_by(f32::total_cmp);
+            for pair in crossings.chunks_exact(2) {
+                let left = (pair[0] - 0.5).ceil().max(0.0) as i32;
+                let right = (pair[1] - 0.5).ceil().min(self.width as f32) as i32;
+                for x in left..right {
+                    self.blend_pixel(x, y, fill);
+                }
+            }
+        }
+        for (a, b) in edges() {
+            self.stroke_segment(a, b, border, 2.0);
+        }
+    }
+
+    fn draw_balloon_text(&mut self, rect: RectF, text: &str, color: RgbaColor, font_size: f32) {
+        let padding = 6.0;
+        let inner_height = rect.height - 2.0 * padding;
+        let max_scale = (inner_height / 7.0).floor();
+        if !max_scale.is_finite() || max_scale < 1.0 {
+            return;
+        }
+        let scale = (font_size / 7.0).round().clamp(1.0, max_scale);
+        let max_chars = ((rect.width - 2.0 * padding + scale) / (6.0 * scale)) as usize;
+        let line_height = 8.0 * scale;
+        let lines = text
+            .lines()
+            .take(((inner_height + scale) / line_height) as usize);
+        let text_height = lines.clone().count() as f32 * line_height - scale;
+        let top = rect.y + (rect.height - text_height) * 0.5;
+        for (index, line) in lines.enumerate() {
+            let line: String = line.chars().take(max_chars).collect();
+            let origin = Point::new(rect.x + padding, top + index as f32 * line_height);
+            self.draw_text_line(origin, &line, color, 7.0 * scale);
+        }
+    }
+
+    fn apply_magnifier(
+        &mut self,
+        base: &CapturedImage,
+        center: Point,
+        radius: f32,
+        zoom: f32,
+        border: RgbaColor,
+    ) {
+        if radius <= 0.0 || !radius.is_finite() {
+            return;
+        }
+        let zoom = zoom.max(1.0);
+        let border_radius = (radius - 2.0).max(0.0);
+        let x0 = (center.x - radius).floor().max(0.0) as i32;
+        let y0 = (center.y - radius).floor().max(0.0) as i32;
+        let x1 = (center.x + radius).ceil().min(self.width as f32) as i32;
+        let y1 = (center.y + radius).ceil().min(self.height as f32) as i32;
+        for y in y0..y1 {
+            let dy = y as f32 + 0.5 - center.y;
+            let sy = ((center.y + dy / zoom).floor() as i32).clamp(0, self.height - 1);
+            for x in x0..x1 {
+                let dx = x as f32 + 0.5 - center.x;
+                let distance_squared = dx * dx + dy * dy;
+                if distance_squared > radius * radius {
+                    continue;
+                }
+                let sx = ((center.x + dx / zoom).floor() as i32).clamp(0, self.width - 1);
+                let src = (sy as usize * self.width as usize + sx as usize) * 4;
+                let dst = (y as usize * self.width as usize + x as usize) * 4;
+                self.rgba[dst..dst + 4].copy_from_slice(&base.rgba()[src..src + 4]);
+                if distance_squared >= border_radius * border_radius {
+                    self.blend_pixel(x, y, border);
+                }
+            }
+        }
+    }
+
+    fn apply_spotlight(&mut self, rect: RectF, dim_alpha: u8) {
+        if dim_alpha == 0 {
+            return;
+        }
+        let brightness = u16::from(255 - dim_alpha);
+        for (y, row) in self
+            .rgba
+            .chunks_exact_mut(self.width as usize * 4)
+            .enumerate()
+        {
+            for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+                if !rect.contains(Point::new(x as f32 + 0.5, y as f32 + 0.5), 0.0) {
+                    for channel in &mut pixel[..3] {
+                        *channel = ((u16::from(*channel) * brightness + 127) / 255) as u8;
+                    }
+                }
+            }
         }
     }
 
     fn apply_pixelate(&mut self, rect: RectF, block_size: u32) {
-        let step = (block_size as i32).max(2);
+        let step = block_size.clamp(2, i32::MAX as u32) as i32;
         let x0 = (rect.x.floor() as i32).max(0);
         let y0 = (rect.y.floor() as i32).max(0);
         let x1 = (rect.right().ceil() as i32).min(self.width);
@@ -264,10 +383,10 @@ impl Canvas {
 
         let mut by = y0;
         while by < y1 {
-            let block_y1 = (by + step).min(y1);
+            let block_y1 = by.saturating_add(step).min(y1);
             let mut bx = x0;
             while bx < x1 {
-                let block_x1 = (bx + step).min(x1);
+                let block_x1 = bx.saturating_add(step).min(x1);
                 let mut r_sum: u64 = 0;
                 let mut g_sum: u64 = 0;
                 let mut b_sum: u64 = 0;
@@ -296,9 +415,9 @@ impl Canvas {
                     }
                 }
 
-                bx += step;
+                bx = block_x1;
             }
-            by += step;
+            by = block_y1;
         }
     }
 
@@ -368,6 +487,64 @@ impl Canvas {
             }
         }
     }
+}
+
+/// Returns the clockwise balloon outline and the optional index of the tail tip.
+pub fn speech_balloon_outline(rect: RectF, tail: Point) -> (Vec<Point>, Option<usize>) {
+    let radius = (rect.width.min(rect.height) * 0.2).clamp(0.0, 12.0);
+    let corners = [
+        Point::new(rect.right() - radius, rect.y + radius),
+        Point::new(rect.right() - radius, rect.bottom() - radius),
+        Point::new(rect.x + radius, rect.bottom() - radius),
+        Point::new(rect.x + radius, rect.y + radius),
+    ];
+    let side = if rect.contains(tail, 0.0) {
+        None
+    } else {
+        let dx = ((tail.x - rect.x) - rect.width * 0.5) / rect.width.max(f32::EPSILON);
+        let dy = ((tail.y - rect.y) - rect.height * 0.5) / rect.height.max(f32::EPSILON);
+        Some(if dx.abs() > dy.abs() {
+            if dx > 0.0 { 0 } else { 2 }
+        } else if dy > 0.0 {
+            1
+        } else {
+            3
+        })
+    };
+    let mut outline = Vec::with_capacity(27);
+    let mut tail_index = None;
+    for (index, center) in corners.into_iter().enumerate() {
+        let quarter = std::f32::consts::FRAC_PI_2;
+        for step in 0..=5 {
+            let angle = (index as f32 - 1.0 + step as f32 / 5.0) * quarter;
+            let (sin, cos) = angle.sin_cos();
+            outline.push(Point::new(center.x + cos * radius, center.y + sin * radius));
+        }
+        if side == Some(index) {
+            let a = corners[index];
+            let b = corners[(index + 1) % corners.len()];
+            let length = (b.x - a.x).hypot(b.y - a.y);
+            if length <= 0.0 {
+                continue;
+            }
+            let axis = Point::new((b.x - a.x) / length, (b.y - a.y) / length);
+            let normal = Point::new(axis.y * radius, -axis.x * radius);
+            let half_base = (length * 0.25).min(9.0);
+            let projection = (tail.x - a.x) * axis.x + (tail.y - a.y) * axis.y;
+            let mid = projection.clamp(half_base, length - half_base);
+            let point_on_side = |offset: f32| {
+                Point::new(
+                    a.x + axis.x * offset + normal.x,
+                    a.y + axis.y * offset + normal.y,
+                )
+            };
+            outline.push(point_on_side(mid - half_base));
+            tail_index = Some(outline.len());
+            outline.push(tail);
+            outline.push(point_on_side(mid + half_base));
+        }
+    }
+    (outline, tail_index)
 }
 
 /// Flattens an `EditorDocument` into an RGBA `CapturedImage`.
@@ -470,6 +647,29 @@ pub fn render_document(doc: &EditorDocument) -> Result<CapturedImage, CoreError>
             }
             AnnotationKind::Blur { rect, radius } => {
                 canvas.apply_blur(*rect, *radius);
+            }
+            AnnotationKind::SpeechBalloon {
+                rect,
+                tail,
+                text,
+                fill,
+                border,
+                text_color,
+                font_size,
+            } => {
+                canvas.draw_balloon(*rect, *tail, *fill, *border);
+                canvas.draw_balloon_text(*rect, text, *text_color, *font_size);
+            }
+            AnnotationKind::Magnifier {
+                center,
+                radius,
+                zoom,
+                border_color,
+            } => {
+                canvas.apply_magnifier(base, *center, *radius, *zoom, *border_color);
+            }
+            AnnotationKind::Spotlight { rect, dim_alpha } => {
+                canvas.apply_spotlight(*rect, *dim_alpha);
             }
         }
     }
@@ -578,6 +778,82 @@ mod tests {
         assert!((100..=155).contains(&p_blur));
         assert_eq!(pixel_at(&flat, 0, 40)[0], 255);
         assert_eq!(pixel_at(&flat, 1, 40)[0], 0);
+    }
+
+    #[test]
+    fn spotlight_dims_only_pixels_outside_the_opening() {
+        let mut doc = EditorDocument::new(solid_image(8, 6, RgbaColor::rgba(200, 100, 50, 180)));
+        doc.push_annotation(AnnotationKind::Spotlight {
+            rect: RectF::from_points(Point::new(2.0, 1.0), Point::new(6.0, 5.0)),
+            dim_alpha: 128,
+        });
+
+        let flat = doc.flatten().unwrap();
+        for y in 0..6 {
+            for x in 0..8 {
+                let expected = if (2..6).contains(&x) && (1..5).contains(&y) {
+                    [200, 100, 50, 180]
+                } else {
+                    [100, 50, 25, 180]
+                };
+                assert_eq!(pixel_at(&flat, x, y), expected, "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn magnifier_enlarges_a_base_pixel_and_draws_a_border() {
+        let background = [20, 22, 26, 255];
+        let feature = [235, 64, 52, 255];
+        let mut rgba = background.repeat(25 * 25);
+        let offset = (12 * 25 + 12) * 4;
+        rgba[offset..offset + 4].copy_from_slice(&feature);
+        let mut doc = EditorDocument::new(CapturedImage::from_rgba(25, 25, rgba).unwrap());
+        doc.push_annotation(AnnotationKind::Rectangle {
+            rect: RectF::from_points(Point::new(0.0, 0.0), Point::new(25.0, 25.0)),
+            color: RgbaColor::GREEN,
+            stroke_width: 1.0,
+            filled: true,
+        });
+        doc.push_annotation(AnnotationKind::Magnifier {
+            center: Point::new(12.5, 12.5),
+            radius: 7.0,
+            zoom: 3.0,
+            border_color: RgbaColor::BLUE,
+        });
+
+        let flat = doc.flatten().unwrap();
+        assert_eq!(pixel_at(&flat, 11, 12), feature);
+        assert_eq!(pixel_at(&flat, 12, 12), feature);
+        assert_eq!(pixel_at(&flat, 13, 13), feature);
+        assert_eq!(pixel_at(&flat, 16, 12), background);
+        assert_eq!(pixel_at(&flat, 18, 12), [59, 130, 246, 255]);
+        assert_eq!(pixel_at(&flat, 20, 12), [52, 199, 89, 255]);
+    }
+
+    #[test]
+    fn speech_balloon_draws_rounded_body_outline_tail_and_text() {
+        let mut doc = EditorDocument::new(solid_image(50, 50, RgbaColor::BLACK));
+        doc.push_annotation(AnnotationKind::SpeechBalloon {
+            rect: RectF::from_points(Point::new(8.0, 6.0), Point::new(42.0, 30.0)),
+            tail: Point::new(25.0, 44.0),
+            text: "A".into(),
+            fill: RgbaColor::YELLOW,
+            border: RgbaColor::BLUE,
+            text_color: RgbaColor::RED,
+            font_size: 7.0,
+        });
+
+        let flat = doc.flatten().unwrap();
+        let fill = [250, 214, 48, 255];
+        let border = [59, 130, 246, 255];
+        assert_eq!(pixel_at(&flat, 8, 6), [20, 22, 26, 255]);
+        assert_eq!(pixel_at(&flat, 36, 18), fill);
+        assert_eq!(pixel_at(&flat, 25, 6), border);
+        assert_eq!(pixel_at(&flat, 25, 30), fill);
+        assert_eq!(pixel_at(&flat, 25, 35), fill);
+        assert_eq!(pixel_at(&flat, 25, 43), border);
+        assert_eq!(pixel_at(&flat, 15, 15), [235, 64, 52, 255]);
     }
 
     #[test]

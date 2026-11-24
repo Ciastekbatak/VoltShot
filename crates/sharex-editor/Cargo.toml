@@ -8,4 +8,6 @@ rust-version.workspace = true
 description = "Pure Rust non-destructive screenshot annotation document and RGBA rasterizer for ShareX in Rust."
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
 sharex-core = { path = "../sharex-core" }

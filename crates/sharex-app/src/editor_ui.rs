@@ -2,7 +2,8 @@ use crate::theme::SharexPalette;
 use eframe::egui::{self, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use sharex_core::{CapturedImage, ImageFormat, Region};
 use sharex_editor::{
-    Annotation, AnnotationKind, EditorDocument, EditorTool, Point, RectF, RgbaColor, SHAREX_PALETTE,
+    Annotation, AnnotationKind, EditorDocument, EditorTool, Point, RectF, RgbaColor,
+    SHAREX_PALETTE, speech_balloon_outline,
 };
 use std::path::PathBuf;
 
@@ -42,6 +43,8 @@ pub struct EditorViewState {
     text_draft: String,
     text_background: bool,
     effect_strength: u32,
+    magnifier_zoom: u8,
+    spotlight_alpha: u8,
     zoom: f32,
     fit_to_view: bool,
     drag: Option<DragDraft>,
@@ -77,6 +80,8 @@ impl EditorViewState {
             text_draft: "Note".into(),
             text_background: true,
             effect_strength: 12,
+            magnifier_zoom: 2,
+            spotlight_alpha: 160,
             zoom: 1.0,
             fit_to_view: true,
             drag: None,
@@ -216,6 +221,9 @@ impl EditorViewState {
             (egui::Key::N, EditorTool::StepNumber),
             (egui::Key::P, EditorTool::Pixelate),
             (egui::Key::B, EditorTool::Blur),
+            (egui::Key::Q, EditorTool::SpeechBalloon),
+            (egui::Key::M, EditorTool::Magnifier),
+            (egui::Key::S, EditorTool::Spotlight),
             (egui::Key::C, EditorTool::Crop),
         ];
         for (key, tool) in shortcut_map {
@@ -287,7 +295,7 @@ impl EditorViewState {
             ui.separator();
 
             match self.active_tool {
-                EditorTool::Text => {
+                EditorTool::Text | EditorTool::SpeechBalloon => {
                     ui.label("Text:");
                     ui.add(egui::TextEdit::singleline(&mut self.text_draft).desired_width(130.0));
                     ui.add(
@@ -295,7 +303,9 @@ impl EditorViewState {
                             .range(12.0..=64.0)
                             .prefix("Size "),
                     );
-                    ui.checkbox(&mut self.text_background, "Bg");
+                    if self.active_tool == EditorTool::Text {
+                        ui.checkbox(&mut self.text_background, "Bg");
+                    }
                 }
                 EditorTool::Pixelate | EditorTool::Blur => {
                     ui.add(
@@ -311,6 +321,17 @@ impl EditorViewState {
                             .range(12.0..=42.0)
                             .prefix("Radius "),
                     );
+                }
+                EditorTool::Magnifier => {
+                    ui.add(
+                        egui::DragValue::new(&mut self.magnifier_zoom)
+                            .range(2..=3)
+                            .prefix("Magnification ")
+                            .suffix("×"),
+                    );
+                }
+                EditorTool::Spotlight => {
+                    ui.add(egui::DragValue::new(&mut self.spotlight_alpha).prefix("Dim opacity "));
                 }
                 _ => {
                     ui.add(
@@ -456,6 +477,7 @@ impl EditorViewState {
 
                 for item in self.document.annotations() {
                     let selected = self.document.selected_id() == Some(item.id);
+                    self.paint_magnifier_sample(&painter, &item.kind, rect, zoom);
                     paint_annotation(&painter, item, &to_screen, zoom, selected, palette.accent);
                 }
 
@@ -506,6 +528,14 @@ impl EditorViewState {
                         self.status = "Placed text label.".into();
                     }
                 }
+                EditorTool::Magnifier => {
+                    self.document.push_annotation(AnnotationKind::Magnifier {
+                        center: pt,
+                        radius: 40.0,
+                        zoom: f32::from(self.magnifier_zoom),
+                        border_color: self.color,
+                    });
+                }
                 _ => {}
             }
         }
@@ -523,6 +553,12 @@ impl EditorViewState {
                 }
                 EditorTool::Freehand | EditorTool::Highlighter => {
                     self.drag = Some(DragDraft::Freehand { points: vec![pt] });
+                }
+                EditorTool::SpeechBalloon | EditorTool::Magnifier | EditorTool::Spotlight => {
+                    let start = ctx
+                        .input(|input| input.pointer.press_origin())
+                        .map_or(pt, to_image);
+                    self.drag = Some(DragDraft::Shape { start, current: pt });
                 }
                 EditorTool::Rectangle
                 | EditorTool::FilledRectangle
@@ -594,6 +630,11 @@ impl EditorViewState {
                     }
                 }
                 DragDraft::Shape { start, current } => {
+                    let end = response.interact_pointer_pos().map_or(current, to_image);
+                    if let Some(kind) = self.new_tool_annotation(start, end) {
+                        self.document.push_annotation(kind);
+                        return;
+                    }
                     let rect = RectF::from_points(start, current);
                     if rect.width < 3.0 && rect.height < 3.0 {
                         return;
@@ -675,6 +716,85 @@ impl EditorViewState {
         }
     }
 
+    fn new_tool_annotation(&self, start: Point, end: Point) -> Option<AnnotationKind> {
+        let rect = RectF::from_points(start, end);
+        match self.active_tool {
+            EditorTool::SpeechBalloon if rect.width >= 3.0 && rect.height >= 3.0 => {
+                let tail = Point::new(
+                    rect.x + rect.width * 0.25,
+                    rect.bottom() + (rect.height * 0.4).clamp(12.0, 28.0),
+                );
+                Some(AnnotationKind::SpeechBalloon {
+                    rect,
+                    tail,
+                    text: self.text_draft.trim().to_owned(),
+                    fill: RgbaColor::WHITE,
+                    border: self.color,
+                    text_color: RgbaColor::BLACK,
+                    font_size: self.font_size,
+                })
+            }
+            EditorTool::Magnifier if rect.width >= 3.0 || rect.height >= 3.0 => {
+                Some(AnnotationKind::Magnifier {
+                    center: start,
+                    radius: rect.width.hypot(rect.height),
+                    zoom: f32::from(self.magnifier_zoom),
+                    border_color: self.color,
+                })
+            }
+            EditorTool::Spotlight if rect.width >= 3.0 && rect.height >= 3.0 => {
+                Some(AnnotationKind::Spotlight {
+                    rect,
+                    dim_alpha: self.spotlight_alpha,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn paint_magnifier_sample(
+        &self,
+        painter: &egui::Painter,
+        kind: &AnnotationKind,
+        canvas: Rect,
+        editor_zoom: f32,
+    ) {
+        let AnnotationKind::Magnifier {
+            center,
+            radius,
+            zoom,
+            ..
+        } = kind
+        else {
+            return;
+        };
+        let radius = *radius * editor_zoom;
+        if radius <= 0.0 || !radius.is_finite() {
+            return;
+        }
+        let center_pos = canvas.min + Vec2::new(center.x, center.y) * editor_zoom;
+        let mut mesh = egui::Mesh::with_texture(self.texture.id());
+        let mut add_vertex = |offset: Vec2| {
+            let source = center_pos - canvas.min + offset / zoom.max(1.0);
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: center_pos + offset,
+                uv: Pos2::new(source.x / canvas.width(), source.y / canvas.height()),
+                color: Color32::WHITE,
+            });
+        };
+        add_vertex(Vec2::ZERO);
+        let segments = 64;
+        for i in 0..segments {
+            let angle = i as f32 * std::f32::consts::TAU / segments as f32;
+            let (sin, cos) = angle.sin_cos();
+            add_vertex(Vec2::new(cos, sin) * radius);
+        }
+        for i in 0..segments {
+            mesh.add_triangle(0, i + 1, (i + 1) % segments + 1);
+        }
+        painter.add(mesh);
+    }
+
     fn paint_draft(
         &self,
         painter: &egui::Painter,
@@ -704,6 +824,12 @@ impl EditorViewState {
                 }
             }
             DragDraft::Shape { start, current } => {
+                if let Some(kind) = self.new_tool_annotation(*start, *current) {
+                    self.paint_magnifier_sample(painter, &kind, canvas_rect, zoom);
+                    let draft = Annotation { id: 0, kind };
+                    paint_annotation(painter, &draft, to_screen, zoom, false, accent);
+                    return;
+                }
                 let r = RectF::from_points(*start, *current);
                 let sr = Rect::from_min_max(
                     to_screen(Point::new(r.x, r.y)),
@@ -961,6 +1087,90 @@ pub(crate) fn paint_annotation(
                 FontId::monospace(11.0),
                 Color32::WHITE,
             );
+        }
+        AnnotationKind::SpeechBalloon {
+            rect,
+            tail,
+            text,
+            fill,
+            border,
+            text_color,
+            font_size,
+        } => {
+            let body = rect_to_screen(*rect, to_screen);
+            let (outline, tail_tip) = speech_balloon_outline(*rect, *tail);
+            let points: Vec<_> = outline.into_iter().map(to_screen).collect();
+            let fill = to_egui_color(*fill);
+            let mut mesh = egui::Mesh::default();
+            mesh.colored_vertex(body.center(), fill);
+            for point in &points {
+                mesh.colored_vertex(*point, fill);
+            }
+            for index in 0..points.len() {
+                if tail_tip == Some(index) {
+                    continue;
+                }
+                let mut next = (index + 1) % points.len();
+                if tail_tip == Some(next) {
+                    mesh.add_triangle(index as u32 + 1, next as u32 + 1, next as u32 + 2);
+                    next += 1;
+                }
+                mesh.add_triangle(0, index as u32 + 1, next as u32 + 1);
+            }
+            painter.add(mesh);
+            painter.add(egui::Shape::closed_line(
+                points,
+                Stroke::new(2.0 * zoom, to_egui_color(*border)),
+            ));
+            let text_rect = body.shrink(6.0 * zoom);
+            if text_rect.is_positive() {
+                painter.with_clip_rect(text_rect).text(
+                    text_rect.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    text,
+                    FontId::proportional(
+                        (*font_size * zoom).clamp(1.0, text_rect.height().max(1.0)),
+                    ),
+                    to_egui_color(*text_color),
+                );
+            }
+        }
+        AnnotationKind::Magnifier {
+            center,
+            radius,
+            border_color,
+            ..
+        } => {
+            let outer_radius = *radius * zoom;
+            if outer_radius <= 0.0 || !outer_radius.is_finite() {
+                return;
+            }
+            let border_width = (2.0 * zoom).min(outer_radius);
+            painter.circle_stroke(
+                to_screen(*center),
+                outer_radius - border_width * 0.5,
+                Stroke::new(border_width, to_egui_color(*border_color)),
+            );
+        }
+        AnnotationKind::Spotlight { rect, dim_alpha } => {
+            let opening = rect_to_screen(*rect, to_screen);
+            let visible = painter.clip_rect();
+            if !visible.is_positive() {
+                return;
+            }
+            let left = opening.left().clamp(visible.left(), visible.right());
+            let right = opening.right().clamp(visible.left(), visible.right());
+            let top = opening.top().clamp(visible.top(), visible.bottom());
+            let bottom = opening.bottom().clamp(visible.top(), visible.bottom());
+            let dim = Color32::from_black_alpha(*dim_alpha);
+            for rect in [
+                Rect::from_min_max(visible.min, Pos2::new(visible.right(), top)),
+                Rect::from_min_max(Pos2::new(visible.left(), bottom), visible.max),
+                Rect::from_min_max(Pos2::new(visible.left(), top), Pos2::new(left, bottom)),
+                Rect::from_min_max(Pos2::new(right, top), Pos2::new(visible.right(), bottom)),
+            ] {
+                painter.rect_filled(rect, 0.0, dim);
+            }
         }
     }
 
