@@ -3497,6 +3497,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sharex-media"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sharex-core",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "sharex-tools"
 version = "0.1.0"
 dependencies = [
