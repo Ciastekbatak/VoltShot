@@ -19,6 +19,10 @@ pub struct SxcuUploader {
 
 impl SxcuUploader {
     pub fn from_sxcu(definition: SxcuDefinition) -> Result<Self, CoreError> {
+        Self::with_agent(definition, no_redirect_agent(Duration::from_secs(120)))
+    }
+
+    pub(crate) fn with_agent(definition: SxcuDefinition, agent: Agent) -> Result<Self, CoreError> {
         let mut request_url = definition.validate().map_err(|message| {
             CoreError::ConfigError(format!("invalid .sxcu definition: {message}"))
         })?;
@@ -29,12 +33,6 @@ impl SxcuUploader {
                 .extend_pairs(&definition.parameters);
         }
 
-        let agent = Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .timeout_global(Some(Duration::from_secs(120)))
-            .build()
-            .into();
         Ok(Self {
             definition,
             request_url,
@@ -47,6 +45,14 @@ impl SxcuUploader {
     }
 
     pub fn upload_request(&self, upload: &UploadRequest) -> Result<UploadResult, CoreError> {
+        self.send_request(upload.bytes.as_slice(), Some(upload))
+    }
+
+    pub(crate) fn send_request(
+        &self,
+        bytes: &[u8],
+        upload: Option<&UploadRequest>,
+    ) -> Result<UploadResult, CoreError> {
         let method = match self.definition.request_method {
             HttpMethod::Post => Method::POST,
             HttpMethod::Put => Method::PUT,
@@ -65,11 +71,9 @@ impl SxcuUploader {
 
         let payload: Option<(HeaderValue, Cow<'_, [u8]>)> = match self.definition.body {
             SxcuBodyType::MultipartFormData => {
-                let field = self.definition.file_form_name.as_deref().ok_or_else(|| {
-                    CoreError::ConfigError("FileFormName is required for MultipartFormData".into())
-                })?;
                 let boundary = random_boundary()?;
-                let body = multipart_body(&boundary, field, &self.definition.arguments, upload)?;
+                let file = self.definition.file_form_name.as_deref().zip(upload);
+                let body = multipart_body(&boundary, &self.definition.arguments, file)?;
                 let content_type =
                     HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}"))
                         .map_err(|error| {
@@ -79,7 +83,7 @@ impl SxcuUploader {
             }
             SxcuBodyType::Binary => Some((
                 HeaderValue::from_static("application/octet-stream"),
-                Cow::Borrowed(&upload.bytes),
+                Cow::Borrowed(bytes),
             )),
             SxcuBodyType::FormUrlEncoded => {
                 let body = form_urlencoded::Serializer::new(String::new())
@@ -227,6 +231,15 @@ impl UploaderLookup for CustomUploaderStore {
     }
 }
 
+pub(crate) fn no_redirect_agent(timeout: Duration) -> Agent {
+    Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(timeout))
+        .build()
+        .into()
+}
+
 fn random_boundary() -> Result<String, CoreError> {
     let mut bytes = [0; 16];
     getrandom::getrandom(&mut bytes).map_err(|error| {
@@ -237,9 +250,8 @@ fn random_boundary() -> Result<String, CoreError> {
 
 fn multipart_body(
     boundary: &str,
-    file_field: &str,
     arguments: &BTreeMap<String, String>,
-    upload: &UploadRequest,
+    file: Option<(&str, &UploadRequest)>,
 ) -> Result<Vec<u8>, CoreError> {
     let mut body = Vec::new();
     for (name, value) in arguments {
@@ -249,21 +261,24 @@ fn multipart_body(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
         )?;
     }
-    let name = disposition_parameter(file_field)?;
-    let filename = disposition_parameter(&upload.file_name)?;
-    let mime_type = if upload.mime_type.is_empty() {
-        "application/octet-stream"
-    } else {
-        &upload.mime_type
-    };
-    HeaderValue::from_str(mime_type)
-        .map_err(|error| CoreError::UploadFailed(format!("invalid file MIME type: {error}")))?;
-    write!(
-        body,
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: {mime_type}\r\n\r\n"
-    )?;
-    body.extend_from_slice(&upload.bytes);
-    write!(body, "\r\n--{boundary}--\r\n")?;
+    if let Some((file_field, upload)) = file {
+        let name = disposition_parameter(file_field)?;
+        let filename = disposition_parameter(&upload.file_name)?;
+        let mime_type = if upload.mime_type.is_empty() {
+            "application/octet-stream"
+        } else {
+            &upload.mime_type
+        };
+        HeaderValue::from_str(mime_type)
+            .map_err(|error| CoreError::UploadFailed(format!("invalid file MIME type: {error}")))?;
+        write!(
+            body,
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: {mime_type}\r\n\r\n"
+        )?;
+        body.extend_from_slice(&upload.bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    write!(body, "--{boundary}--\r\n")?;
     Ok(body)
 }
 
@@ -279,67 +294,8 @@ fn disposition_parameter(value: &str) -> Result<String, CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_http::mock_http;
     use serde_json::json;
-    use std::io::{BufRead, BufReader, Read};
-    use std::net::TcpListener;
-    use std::thread::{self, JoinHandle};
-
-    struct ReceivedRequest {
-        request_line: String,
-        headers: BTreeMap<String, String>,
-        body: Vec<u8>,
-    }
-
-    fn mock_http(
-        status: &'static str,
-        header: &'static str,
-        body: &'static str,
-    ) -> (String, JoinHandle<ReceivedRequest>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            let mut request_line = String::new();
-            assert_ne!(reader.read_line(&mut request_line).unwrap(), 0);
-
-            let mut headers = BTreeMap::new();
-            loop {
-                let mut line = String::new();
-                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                if line == "\r\n" {
-                    break;
-                }
-                let (name, value) = line.split_once(':').unwrap();
-                headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
-            }
-
-            let length = headers
-                .get("content-length")
-                .map_or(0, |value| value.parse().unwrap());
-            let mut received_body = vec![0; length];
-            reader.read_exact(&mut received_body).unwrap();
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{header}\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-
-            ReceivedRequest {
-                request_line,
-                headers,
-                body: received_body,
-            }
-        });
-        (url, server)
-    }
 
     fn upload_fixture() -> UploadRequest {
         UploadRequest {
@@ -547,18 +503,18 @@ mod tests {
         expected.push(0xff);
         expected.extend_from_slice(b"\r\n--known--\r\n");
         assert_eq!(
-            multipart_body("known", "file", &arguments, &upload).unwrap(),
+            multipart_body("known", &arguments, Some(("file", &upload))).unwrap(),
             expected
         );
 
         upload.mime_type = "image/png\r\nX-Injected: yes".into();
         assert!(matches!(
-            multipart_body("known", "file", &arguments, &upload),
+            multipart_body("known", &arguments, Some(("file", &upload))),
             Err(CoreError::UploadFailed(message)) if message.contains("MIME type")
         ));
         upload.file_name = "a.png\r\nX-Injected: yes".into();
         assert!(matches!(
-            multipart_body("known", "file", &arguments, &upload),
+            multipart_body("known", &arguments, Some(("file", &upload))),
             Err(CoreError::UploadFailed(message)) if message.contains("control characters")
         ));
     }

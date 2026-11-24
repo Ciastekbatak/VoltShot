@@ -1,8 +1,14 @@
 pub mod http_uploader;
 pub mod presets;
 pub mod queue;
+pub mod s3;
+pub mod shortener;
+pub mod store;
 pub mod sxcu;
 pub mod template;
+
+#[cfg(test)]
+mod test_http;
 
 pub use http_uploader::{CustomUploaderStore, SxcuUploader};
 pub use presets::{
@@ -11,6 +17,9 @@ pub use presets::{
     pastebin_preset_for_request,
 };
 pub use queue::{QueuedUpload, QueuedUploadStatus, RetryPolicy, UploadQueue};
+pub use s3::{S3Config, S3Uploader, SignedS3Request, sign_s3_put_request};
+pub use shortener::{IsGdShortener, SxcuUrlShortener, TinyUrlShortener, UrlShortener};
+pub use store::UploaderSettingsFile;
 pub use sxcu::{HttpMethod, SxcuBodyType, SxcuDefinition};
 pub use template::{ResponseContext, evaluate_template};
 
