@@ -20,6 +20,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
+    /// Store config, screenshots, and history beside the executable.
+    #[arg(long, global = true)]
+    pub portable: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -51,15 +55,19 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct CaptureArgs {
     /// Capture the currently focused application window.
-    #[arg(long, conflicts_with_all = ["monitor", "region"])]
+    #[arg(long, conflicts_with_all = ["active_monitor", "monitor", "region"])]
     pub active_window: bool,
 
+    /// Capture the monitor that currently contains the mouse cursor.
+    #[arg(long, conflicts_with_all = ["active_window", "monitor", "region"])]
+    pub active_monitor: bool,
+
     /// Capture a specific monitor by numeric id from `sharex monitors`.
-    #[arg(long, conflicts_with_all = ["region", "active_window"])]
+    #[arg(long, conflicts_with_all = ["region", "active_window", "active_monitor"])]
     pub monitor: Option<u32>,
 
     /// Capture a rectangular region specified as `x,y,width,height`.
-    #[arg(long, conflicts_with_all = ["monitor", "active_window"])]
+    #[arg(long, conflicts_with_all = ["monitor", "active_window", "active_monitor"])]
     pub region: Option<String>,
 
     /// Override output directory for saved captures.
@@ -149,6 +157,8 @@ pub fn execute_headless(
         Command::Capture(args) => {
             let source = if args.active_window {
                 CaptureSource::ActiveWindow
+            } else if args.active_monitor {
+                CaptureSource::ActiveMonitor
             } else if let Some(id) = args.monitor {
                 CaptureSource::Monitor {
                     id: MonitorId::new(id),
@@ -426,5 +436,76 @@ mod tests {
         assert!(out.contains("id=7"));
         assert!(out.contains("1920x1080"));
         assert!(out.contains("[primary]"));
+    }
+
+    #[test]
+    fn cli_parses_portable_and_active_monitor_flags() {
+        let parsed = Cli::try_parse_from(["sharex", "--portable", "capture", "--active-monitor"])
+            .expect("parse portable active-monitor cli");
+        assert!(parsed.portable);
+        match parsed.command {
+            Some(Command::Capture(args)) => {
+                assert!(args.active_monitor);
+                assert!(!args.active_window);
+                assert!(args.monitor.is_none());
+                assert!(args.region.is_none());
+            }
+            other => panic!("expected Capture command, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["sharex", "capture", "--active-monitor", "--active-window"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_active_monitor_executes_with_active_monitor_source() {
+        use std::sync::Mutex;
+
+        struct RecordingCapturer {
+            seen: Mutex<Vec<CaptureSource>>,
+        }
+
+        impl ScreenCapturer for RecordingCapturer {
+            fn list_monitors(&self) -> Result<Vec<MonitorInfo>, CoreError> {
+                Ok(Vec::new())
+            }
+
+            fn capture(&self, source: &CaptureSource) -> Result<CapturedImage, CoreError> {
+                self.seen.lock().expect("lock").push(*source);
+                CapturedImage::from_rgba(2, 2, [10, 20, 30, 255].repeat(4))
+            }
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let mut config = AppConfig::portable_for_dir(dir.path());
+        config.pipeline.save_to_file = false;
+        config.pipeline.copy_image_to_clipboard = false;
+        config.pipeline.record_history = false;
+
+        let capturer = RecordingCapturer {
+            seen: Mutex::new(Vec::new()),
+        };
+        let uploaders = UploaderRegistry::new();
+        let parsed = Cli::try_parse_from(["sharex", "capture", "--active-monitor", "--no-save"])
+            .expect("parse active monitor");
+
+        let out = execute_headless(
+            parsed.command.expect("capture"),
+            &AppConfig::portable_config_path(dir.path()),
+            config,
+            &capturer,
+            &NoopClipboard,
+            &uploaders,
+            Utc::now(),
+        )
+        .expect("active monitor capture succeeds");
+
+        assert!(out.contains("2x2"));
+        assert_eq!(
+            capturer.seen.lock().expect("lock").as_slice(),
+            &[CaptureSource::ActiveMonitor]
+        );
     }
 }

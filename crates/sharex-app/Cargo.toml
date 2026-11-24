@@ -19,6 +19,9 @@ eframe.workspace = true
 sharex-capture = { path = "../sharex-capture" }
 sharex-core = { path = "../sharex-core" }
 sharex-editor = { path = "../sharex-editor" }
+sharex-effects = { path = "../sharex-effects" }
+sharex-media = { path = "../sharex-media" }
+sharex-tools = { path = "../sharex-tools" }
 sharex-uploaders = { path = "../sharex-uploaders" }
 
 [target.'cfg(target_os = "windows")'.dependencies]

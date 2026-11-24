@@ -1,13 +1,16 @@
 pub mod cli;
 pub mod clipboard;
 pub mod editor_ui;
+pub mod effects_ui;
 pub mod gui;
 pub mod hotkeys;
 pub mod i18n;
 pub mod pin_window;
+pub mod recording_ui;
 pub mod region_overlay;
 pub mod theme;
 pub mod thumb_cache;
+pub mod tools_ui;
 pub mod tray;
 pub mod win_focus;
 
@@ -18,21 +21,22 @@ use clipboard::SystemClipboard;
 use sharex_capture::XcapCapturer;
 use sharex_core::{AppConfig, CoreError};
 use sharex_uploaders::UploaderRegistry;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Entry point shared by the `sharex` binary.
 pub fn run() -> Result<(), String> {
     let parsed = Cli::parse();
-    let config_path = parsed
-        .config
-        .clone()
-        .unwrap_or_else(AppConfig::default_config_path);
+    let portable_base = resolve_portable_base_dir();
+    let (config_path, fallback_config) =
+        resolve_config_location(parsed.config.as_deref(), parsed.portable, &portable_base);
 
     let command = parsed.command.unwrap_or(Command::Gui);
     match command {
-        Command::Gui => gui::launch_gui(config_path).map_err(|err| err.to_string()),
+        Command::Gui => gui::launch_gui_with_fallback(config_path, fallback_config)
+            .map_err(|err| err.to_string()),
         other => {
-            let config = AppConfig::load_or_default(&config_path).map_err(format_core_error)?;
+            let config = load_config_with_fallback(&config_path, fallback_config)
+                .map_err(format_core_error)?;
             let mirror_dir = default_mirror_dir(&config);
             let capturer = XcapCapturer::new();
             let clipboard = SystemClipboard::new();
@@ -55,10 +59,89 @@ pub fn run() -> Result<(), String> {
     }
 }
 
+/// Resolves the active config file path and default fallback config for standard or portable mode.
+pub fn resolve_config_location(
+    config_override: Option<&Path>,
+    portable: bool,
+    portable_base_dir: &Path,
+) -> (PathBuf, AppConfig) {
+    if portable {
+        let path = config_override
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| AppConfig::portable_config_path(portable_base_dir));
+        let fallback = AppConfig::portable_for_dir(portable_base_dir);
+        (path, fallback)
+    } else {
+        let path = config_override
+            .map(Path::to_path_buf)
+            .unwrap_or_else(AppConfig::default_config_path);
+        let fallback = AppConfig::default_for_os();
+        (path, fallback)
+    }
+}
+
+/// Loads configuration from `config_path` when present, or returns `fallback` when absent.
+pub fn load_config_with_fallback(
+    config_path: &Path,
+    fallback: AppConfig,
+) -> Result<AppConfig, CoreError> {
+    if config_path.exists() {
+        AppConfig::load_or_default(config_path)
+    } else {
+        Ok(fallback)
+    }
+}
+
+fn resolve_portable_base_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 pub(crate) fn default_mirror_dir(config: &AppConfig) -> PathBuf {
     config.output_dir.join("uploaded-mirror")
 }
 
 fn format_core_error(err: CoreError) -> String {
     err.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn portable_config_resolution_uses_portable_paths_and_fallback() {
+        let dir = tempdir().expect("tempdir");
+        let (path, fallback) = resolve_config_location(None, true, dir.path());
+
+        assert_eq!(path, AppConfig::portable_config_path(dir.path()));
+        assert_eq!(fallback.output_dir, dir.path().join("Screenshots"));
+        assert_eq!(fallback.history_path, dir.path().join("history.jsonl"));
+
+        let loaded =
+            load_config_with_fallback(&path, fallback.clone()).expect("load absent portable");
+        assert_eq!(loaded, fallback);
+
+        let mut custom = fallback;
+        custom.file_name_pattern = "Portable_%y%mo%d".into();
+        custom.save(&path).expect("save portable config");
+
+        let reloaded = load_config_with_fallback(&path, AppConfig::default_for_os())
+            .expect("reload saved portable config");
+        assert_eq!(reloaded, custom);
+    }
+
+    #[test]
+    fn portable_mode_respects_explicit_config_override() {
+        let dir = tempdir().expect("tempdir");
+        let override_path = dir.path().join("custom.toml");
+        let (path, fallback) = resolve_config_location(Some(&override_path), true, dir.path());
+
+        assert_eq!(path, override_path);
+        assert_eq!(fallback.output_dir, dir.path().join("Screenshots"));
+    }
 }
