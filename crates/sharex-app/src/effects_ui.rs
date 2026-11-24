@@ -369,6 +369,10 @@ fn summarize_preset(preset: &EffectPreset) -> String {
             ImageEffect::Invert => "Invert",
             ImageEffect::BrightnessContrast { .. } => "Brightness/Contrast",
             ImageEffect::AutoCrop { .. } => "Auto-crop",
+            ImageEffect::WatermarkText { .. } => "Text watermark",
+            ImageEffect::Colorize { .. } => "Colorize",
+            ImageEffect::Slice { .. } => "Slice",
+            ImageEffect::ImageWatermark { .. } => "Image watermark",
         })
         .collect();
     if labels.is_empty() {
@@ -415,6 +419,19 @@ fn describe_effect(effect: &ImageEffect) -> String {
             contrast,
         } => format!("Brightness {brightness:+} / Contrast {contrast:+}"),
         ImageEffect::AutoCrop { tolerance } => format!("Auto-crop (tolerance {tolerance})"),
+        ImageEffect::WatermarkText { position, .. } => format!("Text watermark ({position:?})"),
+        ImageEffect::Colorize { strength, .. } => format!("Colorize ({:.0}%)", strength * 100.0),
+        ImageEffect::Slice {
+            min_height,
+            max_height,
+            shift,
+        } => format!("Slice ({min_height}-{max_height}px bands, {shift:+}px shift)"),
+        ImageEffect::ImageWatermark {
+            width,
+            height,
+            position,
+            ..
+        } => format!("Image watermark ({width}x{height}, {position:?})"),
     }
 }
 

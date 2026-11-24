@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sharex_core::{CapturedImage, CoreError};
 
-use crate::effects::{EffectColor, ImageEffect, apply_effects};
+use crate::effects::{EffectColor, ImageEffect, WatermarkAnchor, apply_effects};
 
 /// Named, serializable stack of image effects.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EffectPreset {
     pub name: String,
     pub enabled: bool,
@@ -85,6 +85,25 @@ pub fn builtin_presets() -> Vec<EffectPreset> {
     ]
 }
 
+/// Returns the original presets and the opt-in Watermarked Share preset.
+pub fn extended_presets() -> Vec<EffectPreset> {
+    let mut presets = builtin_presets();
+    presets.push(EffectPreset {
+        name: "Watermarked Share".into(),
+        enabled: true,
+        effects: vec![ImageEffect::WatermarkText {
+            text: "ShareX".into(),
+            position: WatermarkAnchor::BottomRight,
+            color: EffectColor::WHITE,
+            opacity: 0.8,
+            scale: 2,
+            margin: 12,
+            shadow: true,
+        }],
+    });
+    presets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +144,32 @@ mod tests {
                     contrast: 25,
                 },
                 ImageEffect::AutoCrop { tolerance: 3 },
+                ImageEffect::WatermarkText {
+                    text: "ShareX\n2026".into(),
+                    position: WatermarkAnchor::MiddleRight,
+                    color: EffectColor::WHITE,
+                    opacity: 0.75,
+                    scale: 2,
+                    margin: 4,
+                    shadow: true,
+                },
+                ImageEffect::Colorize {
+                    color: EffectColor::rgb(30, 80, 255),
+                    strength: 0.625,
+                },
+                ImageEffect::Slice {
+                    min_height: 2,
+                    max_height: 5,
+                    shift: -3,
+                },
+                ImageEffect::ImageWatermark {
+                    rgba: vec![255, 128, 32, 200, 12, 34, 56, 78],
+                    width: 2,
+                    height: 1,
+                    position: WatermarkAnchor::BottomCenter,
+                    opacity: 0.5,
+                    margin: 6,
+                },
             ],
         }
     }
@@ -140,6 +185,25 @@ mod tests {
         let json_text = preset.to_json().expect("JSON serialization succeeds");
         let from_json = EffectPreset::from_json(&json_text).expect("JSON deserialization succeeds");
         assert_eq!(from_json, preset);
+        for tag in ["watermark_text", "colorize", "slice", "image_watermark"] {
+            assert!(toml_text.contains(&format!("type = \"{tag}\"")));
+            assert!(json_text.contains(&format!("\"type\": \"{tag}\"")));
+        }
+        assert!(toml_text.contains("position = \"middle_right\""));
+        assert!(json_text.contains("\"position\": \"bottom_center\""));
+    }
+
+    #[test]
+    fn extended_presets_add_an_opt_in_watermark_without_changing_builtins() {
+        let presets = extended_presets();
+        assert_eq!(presets.len(), 4);
+        assert_eq!(&presets[..3], builtin_presets());
+        let preset = &presets[3];
+        assert_eq!(preset.name, "Watermarked Share");
+        let image = CapturedImage::from_rgba(128, 60, vec![0; 128 * 60 * 4]).unwrap();
+        let watermarked = preset.apply(&image).unwrap();
+        assert_eq!((watermarked.width(), watermarked.height()), (128, 60));
+        assert!(watermarked.rgba().chunks_exact(4).any(|pixel| pixel[3] > 0));
     }
 
     #[test]

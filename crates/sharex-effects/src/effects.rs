@@ -1,6 +1,9 @@
-use image::{RgbaImage, imageops::FilterType};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sharex_core::{CapturedImage, CoreError, Region};
+
+use crate::resize::resize_lanczos;
+use crate::watermark::{WatermarkPlacement, apply_image_watermark, apply_watermark_text};
 
 /// RGBA8 color used by image effect parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,8 +32,26 @@ impl EffectColor {
     }
 }
 
+/// Alternate name for an RGBA8 effect color.
+pub type RgbaColor = EffectColor;
+
+/// Alignment of a watermark relative to the captured image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatermarkAnchor {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    MiddleLeft,
+    Center,
+    MiddleRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
 /// Composable image transformation applied to a [`CapturedImage`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageEffect {
     Border {
@@ -47,6 +68,8 @@ pub enum ImageEffect {
     RoundedCorners {
         radius: u32,
     },
+    /// Expands the canvas and composites a blurred source-alpha silhouette behind the image.
+    /// Larger radii use three box passes per axis to approximate a Gaussian within that radius.
     DropShadow {
         offset_x: i32,
         offset_y: i32,
@@ -67,6 +90,37 @@ pub enum ImageEffect {
     },
     AutoCrop {
         tolerance: u8,
+    },
+    /// Draws scaled 5x7 ASCII bitmap text (lowercase renders as uppercase).
+    /// An optional black shadow extends one cell down and right.
+    WatermarkText {
+        text: String,
+        position: WatermarkAnchor,
+        color: RgbaColor,
+        opacity: f32,
+        scale: u32,
+        margin: u32,
+        shadow: bool,
+    },
+    /// Blends the original RGB with its luminance multiplied by the tint RGB, preserving alpha.
+    Colorize {
+        color: RgbaColor,
+        strength: f32,
+    },
+    /// Offsets deterministic horizontal bands in alternating directions; exposed pixels are transparent.
+    Slice {
+        min_height: u32,
+        max_height: u32,
+        shift: i32,
+    },
+    /// Composites a tightly packed RGBA8 stamp, clipping it to the destination if needed.
+    ImageWatermark {
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+        position: WatermarkAnchor,
+        opacity: f32,
+        margin: u32,
     },
 }
 
@@ -106,6 +160,50 @@ pub fn apply_effect(
             contrast,
         } => apply_brightness_contrast(image, brightness, contrast),
         ImageEffect::AutoCrop { tolerance } => apply_auto_crop(image, tolerance),
+        ImageEffect::WatermarkText {
+            ref text,
+            position,
+            color,
+            opacity,
+            scale,
+            margin,
+            shadow,
+        } => apply_watermark_text(
+            image,
+            text,
+            color,
+            scale,
+            shadow,
+            WatermarkPlacement {
+                position,
+                margin,
+                opacity,
+            },
+        ),
+        ImageEffect::Colorize { color, strength } => apply_colorize(image, color, strength),
+        ImageEffect::Slice {
+            min_height,
+            max_height,
+            shift,
+        } => apply_slice(image, min_height, max_height, shift),
+        ImageEffect::ImageWatermark {
+            ref rgba,
+            width,
+            height,
+            position,
+            opacity,
+            margin,
+        } => apply_image_watermark(
+            image,
+            rgba,
+            width,
+            height,
+            WatermarkPlacement {
+                position,
+                margin,
+                opacity,
+            },
+        ),
     }
 }
 
@@ -114,32 +212,26 @@ pub fn apply_effects(
     image: &CapturedImage,
     effects: &[ImageEffect],
 ) -> Result<CapturedImage, CoreError> {
-    let mut current = image.clone();
-    for effect in effects {
+    let Some((first, rest)) = effects.split_first() else {
+        return Ok(image.clone());
+    };
+    let mut current = apply_effect(image, first)?;
+    for effect in rest {
         current = apply_effect(&current, effect)?;
     }
     Ok(current)
 }
 
-fn checked_rgba_len(width: u32, height: u32) -> Result<usize, CoreError> {
+pub(crate) fn checked_rgba_len(width: u32, height: u32) -> Result<usize, CoreError> {
     (width as usize)
         .checked_mul(height as usize)
         .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|&bytes| bytes <= isize::MAX as usize)
         .ok_or_else(|| {
             CoreError::InvalidRegion(format!(
                 "image dimensions {width}x{height} overflow buffer allocation"
             ))
         })
-}
-
-fn fill_rgba_buffer(width: u32, height: u32, color: EffectColor) -> Result<Vec<u8>, CoreError> {
-    let total_bytes = checked_rgba_len(width, height)?;
-    let pixel = color.to_array();
-    let mut buf = Vec::with_capacity(total_bytes);
-    for _ in 0..(total_bytes / 4) {
-        buf.extend_from_slice(&pixel);
-    }
-    Ok(buf)
 }
 
 fn apply_canvas_padding(
@@ -165,18 +257,34 @@ fn apply_canvas_padding(
         .and_then(|v| v.checked_add(bottom))
         .ok_or_else(|| CoreError::InvalidRegion("padded image height overflows u32".into()))?;
 
-    let mut out = fill_rgba_buffer(new_w, new_h, color)?;
+    let mut out = vec![0; checked_rgba_len(new_w, new_h)?];
     let src_stride = (image.width() as usize) * 4;
     let dst_stride = (new_w as usize) * 4;
     let left_bytes = (left as usize) * 4;
     let src = image.rgba();
 
-    for y in 0..image.height() as usize {
-        let src_offset = y * src_stride;
-        let dst_offset = (y + top as usize) * dst_stride + left_bytes;
-        out[dst_offset..dst_offset + src_stride]
-            .copy_from_slice(&src[src_offset..src_offset + src_stride]);
-    }
+    let fill = |bytes: &mut [u8]| {
+        for pixel in bytes.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&color.to_array());
+        }
+    };
+    out.par_chunks_exact_mut(dst_stride)
+        .with_min_len(8)
+        .enumerate()
+        .for_each(|(row_index, row)| {
+            if let Some(source_y) = row_index
+                .checked_sub(top as usize)
+                .filter(|&row_index| row_index < image.height() as usize)
+            {
+                let (left, image_and_right) = row.split_at_mut(left_bytes);
+                let (image_row, right) = image_and_right.split_at_mut(src_stride);
+                fill(left);
+                image_row.copy_from_slice(&src[source_y * src_stride..][..src_stride]);
+                fill(right);
+            } else {
+                fill(row);
+            }
+        });
 
     CapturedImage::from_rgba(new_w, new_h, out)
 }
@@ -186,139 +294,201 @@ fn apply_rounded_corners(image: &CapturedImage, radius: u32) -> Result<CapturedI
         return Ok(image.clone());
     }
 
-    let w = image.width();
-    let h = image.height();
-    let wf = f64::from(w);
-    let hf = f64::from(h);
-    let r = f64::from(radius).min(wf / 2.0).min(hf / 2.0);
+    let width = image.width();
+    let height = image.height();
+    let wf = f64::from(width);
+    let hf = f64::from(height);
+    let corner_radius = f64::from(radius).min(wf / 2.0).min(hf / 2.0);
     let mut out = image.rgba().to_vec();
 
-    for y in 0..h {
-        let cy = f64::from(y) + 0.5;
-        let corner_y = if cy < r {
-            Some(r)
-        } else if cy > hf - r {
-            Some(hf - r)
-        } else {
-            None
-        };
-
-        let Some(ky) = corner_y else {
-            continue;
-        };
-
-        for x in 0..w {
-            let cx = f64::from(x) + 0.5;
-            let corner_x = if cx < r {
-                Some(r)
-            } else if cx > wf - r {
-                Some(wf - r)
+    let corner_pixels = corner_radius.ceil() as usize;
+    out.par_chunks_exact_mut(width as usize * 4)
+        .with_min_len(8)
+        .enumerate()
+        .for_each(|(row_index, row)| {
+            let cy = row_index as f64 + 0.5;
+            let corner_y = if cy < corner_radius {
+                Some(corner_radius)
+            } else if cy > hf - corner_radius {
+                Some(hf - corner_radius)
             } else {
                 None
             };
 
-            let Some(kx) = corner_x else {
-                continue;
+            let Some(ky) = corner_y else {
+                return;
             };
 
-            let dist = (cx - kx).hypot(cy - ky);
-            if dist <= r - 1.0 {
-                continue;
-            }
+            let left = 0..corner_pixels;
+            let right = (width as usize - corner_pixels).max(corner_pixels)..width as usize;
+            for column in left.chain(right) {
+                let cx = column as f64 + 0.5;
+                let corner_x = if cx < corner_radius {
+                    Some(corner_radius)
+                } else if cx > wf - corner_radius {
+                    Some(wf - corner_radius)
+                } else {
+                    None
+                };
 
-            let idx = ((y as usize) * (w as usize) + (x as usize)) * 4;
-            if dist >= r {
-                out[idx + 3] = 0;
-            } else {
-                let coverage = (r - dist).clamp(0.0, 1.0);
-                out[idx + 3] = (f64::from(out[idx + 3]) * coverage).round() as u8;
-            }
-        }
-    }
+                let Some(kx) = corner_x else {
+                    continue;
+                };
 
-    CapturedImage::from_rgba(w, h, out)
+                let dist = (cx - kx).hypot(cy - ky);
+                if dist <= corner_radius - 1.0 {
+                    continue;
+                }
+
+                let alpha = &mut row[column * 4 + 3];
+                if dist >= corner_radius {
+                    *alpha = 0;
+                } else {
+                    let coverage = (corner_radius - dist).clamp(0.0, 1.0);
+                    *alpha = (f64::from(*alpha) * coverage).round() as u8;
+                }
+            }
+        });
+
+    CapturedImage::from_rgba(width, height, out)
 }
 
-fn gaussian_kernel(radius: u32) -> Vec<f32> {
-    let sigma = (radius as f32 / 2.5).max(0.5);
-    let two_sigma_sq = 2.0 * sigma * sigma;
-    let r = radius as i32;
-    let mut kernel = Vec::with_capacity((radius as usize) * 2 + 1);
-    let mut sum = 0.0f32;
-
-    for d in -r..=r {
-        let weight = (-((d * d) as f32) / two_sigma_sq).exp();
-        kernel.push(weight);
-        sum += weight;
-    }
-
-    if sum > 0.0 {
-        for weight in &mut kernel {
-            *weight /= sum;
-        }
-    }
-
-    kernel
+fn box_blur_horizontal(source: &[f32], out: &mut [f32], width: usize, radius: usize) {
+    let weight = 1.0 / (2 * radius + 1) as f32;
+    out.par_chunks_exact_mut(width)
+        .zip(source.par_chunks_exact(width))
+        .with_min_len(8)
+        .for_each(|(out, row)| {
+            let mut sum: f32 = row[..radius].iter().sum();
+            for (column, output) in out.iter_mut().enumerate() {
+                if column + radius < width {
+                    sum += row[column + radius];
+                }
+                *output = sum * weight;
+                if column >= radius {
+                    sum -= row[column - radius];
+                }
+            }
+        });
 }
 
-fn blur_alpha_channel(alpha: &[f32], width: usize, height: usize, radius: u32) -> Vec<f32> {
+fn box_blur_vertical(source: &[f32], out: &mut [f32], width: usize, radius: usize) {
+    let height = source.len() / width;
+    let weight = 1.0 / (2 * radius + 1) as f32;
+    let rows_per_band = (2 * radius + 1).max(32).min(height);
+    out.par_chunks_mut(width * rows_per_band)
+        .enumerate()
+        .for_each(|(band, rows)| {
+            let start = band * rows_per_band;
+            let mut sums = vec![0.0; width];
+            let zero_row = vec![0.0; width];
+            let top = start.saturating_sub(radius);
+            let bottom = (start + radius).min(height);
+            for input in source[top * width..bottom * width].chunks_exact(width) {
+                for (sum, &value) in sums.iter_mut().zip(input) {
+                    *sum += value;
+                }
+            }
+            let row_at = |row_index: usize| &source[row_index * width..][..width];
+            for (index, row) in rows.chunks_exact_mut(width).enumerate() {
+                let row_index = start + index;
+                let incoming = if row_index + radius < height {
+                    row_at(row_index + radius)
+                } else {
+                    &zero_row
+                };
+                let outgoing = if row_index >= radius {
+                    row_at(row_index - radius)
+                } else {
+                    &zero_row
+                };
+                for (((sum, output), &add), &remove) in
+                    sums.iter_mut().zip(row).zip(incoming).zip(outgoing)
+                {
+                    let current = *sum + add;
+                    *output = current * weight;
+                    *sum = current - remove;
+                }
+            }
+        });
+}
+
+fn blur_alpha_channel(alpha: &mut [f32], width: usize, radius: usize) {
     if radius == 0 {
-        return alpha.to_vec();
+        return;
     }
 
-    let kernel = gaussian_kernel(radius);
-    let r = radius as isize;
-    let mut temp = vec![0.0f32; width * height];
-    let mut out = vec![0.0f32; width * height];
-
-    for y in 0..height {
-        let row_offset = y * width;
-        for x in 0..width {
-            let mut acc = 0.0f32;
-            for (k_idx, &weight) in kernel.iter().enumerate() {
-                let sx = x as isize + (k_idx as isize - r);
-                if sx >= 0 && (sx as usize) < width {
-                    acc += alpha[row_offset + sx as usize] * weight;
-                }
-            }
-            temp[row_offset + x] = acc;
+    let mut scratch = vec![0.0; alpha.len()];
+    if radius <= 2 {
+        blur_small_radius(alpha, &mut scratch, width, radius);
+        return;
+    }
+    for pass in 0..3 {
+        let box_radius = (radius + pass) / 3;
+        if box_radius != 0 {
+            box_blur_horizontal(alpha, &mut scratch, width, box_radius);
+            box_blur_vertical(&scratch, alpha, width, box_radius);
         }
     }
-
-    for y in 0..height {
-        let row_offset = y * width;
-        for x in 0..width {
-            let mut acc = 0.0f32;
-            for (k_idx, &weight) in kernel.iter().enumerate() {
-                let sy = y as isize + (k_idx as isize - r);
-                if sy >= 0 && (sy as usize) < height {
-                    acc += temp[(sy as usize) * width + x] * weight;
-                }
-            }
-            out[row_offset + x] = acc;
-        }
-    }
-
-    out
 }
 
-fn blend_source_over(dst: &mut [u8; 4], src: [u8; 4]) {
+fn blur_small_radius(alpha: &mut [f32], scratch: &mut [f32], width: usize, radius: usize) {
+    let height = alpha.len() / width;
+    let sigma = (radius as f32 / 2.5).max(0.5);
+    let denominator = 2.0 * sigma * sigma;
+    let mut kernel = [0.0; 5];
+    let weights = &mut kernel[..2 * radius + 1];
+    for (index, weight) in weights.iter_mut().enumerate() {
+        let distance = index as f32 - radius as f32;
+        *weight = (-(distance * distance) / denominator).exp();
+    }
+    let sum: f32 = weights.iter().sum();
+    for weight in &mut *weights {
+        *weight /= sum;
+    }
+
+    let sample = |center: usize, length: usize, value_at: &dyn Fn(usize) -> f32| {
+        let base = center.saturating_sub(radius);
+        let skip = radius.saturating_sub(center);
+        weights[skip..]
+            .iter()
+            .take(length - base)
+            .enumerate()
+            .map(|(index, weight)| value_at(base + index) * weight)
+            .sum()
+    };
+    scratch
+        .par_chunks_exact_mut(width)
+        .zip(alpha.par_chunks_exact(width))
+        .with_min_len(8)
+        .for_each(|(out, row)| {
+            for (column, value) in out.iter_mut().enumerate() {
+                *value = sample(column, width, &|index| row[index]);
+            }
+        });
+    alpha
+        .par_chunks_exact_mut(width)
+        .with_min_len(8)
+        .enumerate()
+        .for_each(|(row_index, row)| {
+            for (column, value) in row.iter_mut().enumerate() {
+                *value = sample(row_index, height, &|index| scratch[index * width + column]);
+            }
+        });
+}
+
+pub(crate) fn blend_source_over(dst: &mut [u8], src: [u8; 4]) {
     let sa = f32::from(src[3]) / 255.0;
     if sa <= 0.0 {
         return;
     }
-    if src[3] == 255 {
-        *dst = src;
+    if src[3] == 255 || dst[3] == 0 {
+        dst.copy_from_slice(&src);
         return;
     }
 
     let da = f32::from(dst[3]) / 255.0;
     let out_a = sa + da * (1.0 - sa);
-    if out_a <= 0.0 {
-        *dst = [0, 0, 0, 0];
-        return;
-    }
-
     for channel in 0..3 {
         let sc = f32::from(src[channel]) / 255.0;
         let dc = f32::from(dst[channel]) / 255.0;
@@ -353,68 +523,83 @@ fn apply_drop_shadow(
         .map_err(|_| CoreError::InvalidRegion("drop shadow height overflows u32".into()))?;
 
     let new_w_usize = new_w as usize;
-    let new_h_usize = new_h as usize;
-    let total_pixels = new_w_usize.checked_mul(new_h_usize).ok_or_else(|| {
-        CoreError::InvalidRegion("drop shadow canvas pixel count overflows usize".into())
-    })?;
+    let total_bytes = checked_rgba_len(new_w, new_h)?;
 
     let img_x = (-min_x) as usize;
     let img_y = (-min_y) as usize;
     let shadow_x = (ox - min_x) as usize;
     let shadow_y = (oy - min_y) as usize;
 
-    let mut shadow_alpha = vec![0.0f32; total_pixels];
-    let shadow_opacity = f32::from(color.a) / 255.0;
     let src = image.rgba();
     let src_w_usize = image.width() as usize;
     let src_h_usize = image.height() as usize;
-
-    for y in 0..src_h_usize {
-        for x in 0..src_w_usize {
-            let src_a = f32::from(src[(y * src_w_usize + x) * 4 + 3]) / 255.0;
-            shadow_alpha[(shadow_y + y) * new_w_usize + (shadow_x + x)] = src_a * shadow_opacity;
-        }
+    let src_stride = src_w_usize * 4;
+    let mut shadow_alpha = vec![0.0f32; total_bytes / 4];
+    if color.a != 0 {
+        let shadow_opacity = f32::from(color.a) / 255.0;
+        shadow_alpha[shadow_y * new_w_usize..(shadow_y + src_h_usize) * new_w_usize]
+            .par_chunks_exact_mut(new_w_usize)
+            .zip(src.par_chunks_exact(src_stride))
+            .with_min_len(8)
+            .for_each(|(row, source)| {
+                for (mask, pixel) in row[shadow_x..][..src_w_usize]
+                    .iter_mut()
+                    .zip(source.chunks_exact(4))
+                {
+                    *mask = (f32::from(pixel[3]) / 255.0) * shadow_opacity;
+                }
+            });
+        blur_alpha_channel(&mut shadow_alpha, new_w_usize, blur_radius as usize);
     }
 
-    let blurred_alpha = blur_alpha_channel(&shadow_alpha, new_w_usize, new_h_usize, blur_radius);
-    let mut canvas = fill_rgba_buffer(new_w, new_h, background)?;
-
-    for (idx, &alpha) in blurred_alpha.iter().enumerate() {
-        let a_u8 = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
-        if a_u8 == 0 {
-            continue;
-        }
-        let offset = idx * 4;
-        let mut dst = [
-            canvas[offset],
-            canvas[offset + 1],
-            canvas[offset + 2],
-            canvas[offset + 3],
-        ];
-        blend_source_over(&mut dst, [color.r, color.g, color.b, a_u8]);
-        canvas[offset..offset + 4].copy_from_slice(&dst);
-    }
-
-    for y in 0..src_h_usize {
-        for x in 0..src_w_usize {
-            let src_offset = (y * src_w_usize + x) * 4;
-            let dst_offset = ((img_y + y) * new_w_usize + (img_x + x)) * 4;
-            let mut dst = [
-                canvas[dst_offset],
-                canvas[dst_offset + 1],
-                canvas[dst_offset + 2],
-                canvas[dst_offset + 3],
-            ];
-            let src_px = [
-                src[src_offset],
-                src[src_offset + 1],
-                src[src_offset + 2],
-                src[src_offset + 3],
-            ];
-            blend_source_over(&mut dst, src_px);
-            canvas[dst_offset..dst_offset + 4].copy_from_slice(&dst);
-        }
-    }
+    let paint_shadow = |dest: &mut [u8], alpha: f32| {
+        dest.copy_from_slice(&background.to_array());
+        blend_source_over(
+            dest,
+            [color.r, color.g, color.b, (alpha * 255.0).round() as u8],
+        );
+    };
+    let mut canvas = vec![0; total_bytes];
+    canvas
+        .par_chunks_exact_mut(new_w_usize * 4)
+        .zip(shadow_alpha.par_chunks_exact(new_w_usize))
+        .with_min_len(8)
+        .enumerate()
+        .for_each(|(row_index, (row, mask))| {
+            if let Some(source_y) = row_index
+                .checked_sub(img_y)
+                .filter(|&row_index| row_index < src_h_usize)
+            {
+                let source = &src[source_y * src_stride..][..src_stride];
+                let (left, middle_and_right) = row.split_at_mut(img_x * 4);
+                let (middle, right) = middle_and_right.split_at_mut(src_stride);
+                let (left_mask, rest_mask) = mask.split_at(img_x);
+                let (middle_mask, right_mask) = rest_mask.split_at(src_w_usize);
+                for (dest, &alpha) in left
+                    .chunks_exact_mut(4)
+                    .zip(left_mask)
+                    .chain(right.chunks_exact_mut(4).zip(right_mask))
+                {
+                    paint_shadow(dest, alpha);
+                }
+                for ((dest, &alpha), pixel) in middle
+                    .chunks_exact_mut(4)
+                    .zip(middle_mask)
+                    .zip(source.chunks_exact(4))
+                {
+                    if pixel[3] == 255 {
+                        dest.copy_from_slice(pixel);
+                    } else {
+                        paint_shadow(dest, alpha);
+                        blend_source_over(dest, [pixel[0], pixel[1], pixel[2], pixel[3]]);
+                    }
+                }
+            } else {
+                for (dest, &alpha) in row.chunks_exact_mut(4).zip(mask) {
+                    paint_shadow(dest, alpha);
+                }
+            }
+        });
 
     CapturedImage::from_rgba(new_w, new_h, canvas)
 }
@@ -442,41 +627,37 @@ fn apply_resize(
         (width, height)
     };
 
-    let src = RgbaImage::from_raw(image.width(), image.height(), image.rgba().to_vec())
-        .ok_or_else(|| CoreError::InvalidImageBuffer {
-            width: image.width(),
-            height: image.height(),
-            expected: (image.width() as usize) * (image.height() as usize) * 4,
-            actual: image.rgba().len(),
-        })?;
+    resize_lanczos(image, target_w, target_h)
+}
 
-    let resized = image::imageops::resize(&src, target_w, target_h, FilterType::Lanczos3);
-    CapturedImage::from_rgba(target_w, target_h, resized.into_raw())
+fn map_pixels(
+    image: &CapturedImage,
+    transform: impl Fn(&mut [u8]) + Sync + Send,
+) -> Result<CapturedImage, CoreError> {
+    let mut out = image.rgba().to_vec();
+    out.par_chunks_exact_mut(4)
+        .with_min_len(4096)
+        .for_each(transform);
+    CapturedImage::from_rgba(image.width(), image.height(), out)
+}
+
+fn luminance(pixel: &[u8]) -> f64 {
+    0.299 * f64::from(pixel[0]) + 0.587 * f64::from(pixel[1]) + 0.114 * f64::from(pixel[2])
 }
 
 fn apply_grayscale(image: &CapturedImage) -> Result<CapturedImage, CoreError> {
-    let mut out = image.rgba().to_vec();
-    for pixel in out.chunks_exact_mut(4) {
-        let luma = (0.299 * f64::from(pixel[0])
-            + 0.587 * f64::from(pixel[1])
-            + 0.114 * f64::from(pixel[2]))
-        .round()
-        .clamp(0.0, 255.0) as u8;
-        pixel[0] = luma;
-        pixel[1] = luma;
-        pixel[2] = luma;
-    }
-    CapturedImage::from_rgba(image.width(), image.height(), out)
+    map_pixels(image, |pixel| {
+        let luma = luminance(pixel).round() as u8;
+        pixel[..3].fill(luma);
+    })
 }
 
 fn apply_invert(image: &CapturedImage) -> Result<CapturedImage, CoreError> {
-    let mut out = image.rgba().to_vec();
-    for pixel in out.chunks_exact_mut(4) {
+    map_pixels(image, |pixel| {
         pixel[0] = 255 - pixel[0];
         pixel[1] = 255 - pixel[1];
         pixel[2] = 255 - pixel[2];
-    }
-    CapturedImage::from_rgba(image.width(), image.height(), out)
+    })
 }
 
 fn apply_brightness_contrast(
@@ -497,14 +678,82 @@ fn apply_brightness_contrast(
         *entry = adjusted;
     }
 
-    let mut out = image.rgba().to_vec();
-    for pixel in out.chunks_exact_mut(4) {
+    map_pixels(image, |pixel| {
         pixel[0] = lut[usize::from(pixel[0])];
         pixel[1] = lut[usize::from(pixel[1])];
         pixel[2] = lut[usize::from(pixel[2])];
+    })
+}
+
+pub(crate) fn unit_interval(value: f32) -> f64 {
+    if value.is_nan() {
+        0.0
+    } else {
+        f64::from(value.clamp(0.0, 1.0))
+    }
+}
+
+fn apply_colorize(
+    image: &CapturedImage,
+    color: EffectColor,
+    strength: f32,
+) -> Result<CapturedImage, CoreError> {
+    let strength = unit_interval(strength);
+    if strength == 0.0 {
+        return Ok(image.clone());
+    }
+    let tint = [color.r, color.g, color.b].map(|component| f64::from(component) / 255.0);
+    map_pixels(image, |pixel| {
+        let luma = luminance(pixel);
+        for (channel, tint) in pixel[..3].iter_mut().zip(tint) {
+            *channel =
+                (f64::from(*channel) * (1.0 - strength) + luma * tint * strength).round() as u8;
+        }
+    })
+}
+
+fn apply_slice(
+    image: &CapturedImage,
+    min_height: u32,
+    max_height: u32,
+    shift: i32,
+) -> Result<CapturedImage, CoreError> {
+    let width = image.width();
+    let height = image.height();
+    let limit = i64::from(width - 1);
+    let shift = i64::from(shift).clamp(-limit, limit);
+    if shift == 0 {
+        return Ok(image.clone());
+    }
+    let minimum = min_height.clamp(1, height);
+    let maximum = max_height.clamp(minimum, height);
+    let stride = width as usize * 4;
+    let offset = shift.unsigned_abs() as usize * 4;
+    let mut out = vec![0; image.rgba().len()];
+    let mut start = 0;
+    let mut seed = 0x41c6_4e6du32;
+    let mut shift_right = shift > 0;
+    while start < height {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let rows = (minimum + seed % (maximum - minimum + 1)).min(height - start);
+        let band = start as usize * stride..(start + rows) as usize * stride;
+        for (dest, source) in out[band.clone()]
+            .chunks_exact_mut(stride)
+            .zip(image.rgba()[band].chunks_exact(stride))
+        {
+            if shift_right {
+                dest[offset..].copy_from_slice(&source[..stride - offset]);
+            } else {
+                dest[..stride - offset].copy_from_slice(&source[offset..]);
+            }
+        }
+        start += rows;
+        shift_right = !shift_right;
     }
 
-    CapturedImage::from_rgba(image.width(), image.height(), out)
+    CapturedImage::from_rgba(width, height, out)
 }
 
 fn pixel_within_tolerance(pixel: [u8; 4], reference: [u8; 4], tolerance: u8) -> bool {
@@ -556,6 +805,10 @@ fn apply_auto_crop(image: &CapturedImage, tolerance: u8) -> Result<CapturedImage
     let region = Region::new(crop_x, crop_y, max_x - min_x + 1, max_y - min_y + 1)?;
     image.crop(region)
 }
+
+#[cfg(test)]
+#[path = "effects_tests.rs"]
+mod regression_tests;
 
 #[cfg(test)]
 mod tests {
