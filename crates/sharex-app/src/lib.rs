@@ -8,6 +8,7 @@ pub mod hotkeys;
 pub mod i18n;
 pub mod notifications;
 pub mod pin_window;
+pub mod recording_hud;
 pub mod recording_ui;
 pub mod region_overlay;
 pub mod sound;

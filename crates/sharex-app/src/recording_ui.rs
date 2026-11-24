@@ -1,15 +1,20 @@
 use crate::i18n::Strings;
+use crate::recording_hud::{RecordingHudAction, show_recording_hud};
 use crate::theme::SharexPalette;
 use chrono::Utc;
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
-use sharex_core::{ClipboardSink, resolve_unique_path};
+use sharex_core::{ClipboardSink, Region, resolve_unique_path};
 use sharex_media::{
-    MediaError, RecordingConfig, RecordingFormat, RecordingState, ScreenRecorder, find_ffmpeg,
+    AudioDevice, CapturePlatform, MediaError, RecordingConfig, RecordingFormat, RecordingState,
+    ScreenRecorder, VideoEncoder, detect_available_h264_encoders, find_ffmpeg, list_audio_devices,
+    preferred_mp4_encoder,
 };
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
+
+pub use crate::recording_hud::format_elapsed;
 
 type FinalizeResult = (ScreenRecorder, Result<(PathBuf, Duration), MediaError>);
 
@@ -17,7 +22,14 @@ type FinalizeResult = (ScreenRecorder, Result<(PathBuf, Duration), MediaError>);
 pub struct RecordingPanelState {
     recorder: ScreenRecorder,
     finalizing: Option<Receiver<FinalizeResult>>,
+    active_config: Option<RecordingConfig>,
     format: RecordingFormat,
+    mp4_encoder: VideoEncoder,
+    available_encoders: Vec<VideoEncoder>,
+    audio_device: Option<AudioDevice>,
+    audio_devices: Vec<AudioDevice>,
+    region: Option<Region>,
+    select_region_requested: bool,
     fps: u32,
     crf: u8,
     draw_cursor: bool,
@@ -37,7 +49,14 @@ impl RecordingPanelState {
         Self {
             recorder: ScreenRecorder::new(),
             finalizing: None,
+            active_config: None,
             format: RecordingFormat::Mp4H264,
+            mp4_encoder: VideoEncoder::Auto,
+            available_encoders: Vec::new(),
+            audio_device: None,
+            audio_devices: Vec::new(),
+            region: None,
+            select_region_requested: false,
             fps: 30,
             crf: 23,
             draw_cursor: true,
@@ -53,6 +72,21 @@ impl RecordingPanelState {
 
     pub fn is_finalizing(&self) -> bool {
         self.finalizing.is_some()
+    }
+
+    /// Sets the region for the next recording, or selects fullscreen with `None`.
+    pub fn set_region(&mut self, region: Option<Region>) {
+        self.region = region;
+    }
+
+    /// Returns the region selected for the next recording.
+    pub fn selected_region(&self) -> Option<Region> {
+        self.region
+    }
+
+    /// Consumes a pending request to open the recording-region selector.
+    pub fn take_select_region_request(&mut self) -> bool {
+        std::mem::take(&mut self.select_region_requested)
     }
 
     pub fn poll_finalize(&mut self) -> Option<String> {
@@ -87,6 +121,18 @@ impl RecordingPanelState {
         let output_path = resolve_unique_path(output_dir, &stem, self.format.extension());
         let mut config = RecordingConfig::new(output_path);
         config.format = self.format;
+        config.encoder = match self.format {
+            RecordingFormat::Mp4H264 if self.mp4_encoder == VideoEncoder::Auto => {
+                preferred_mp4_encoder(&self.available_encoders)
+            }
+            RecordingFormat::Mp4H264 => self.mp4_encoder,
+            RecordingFormat::WebmVp9 => VideoEncoder::LibvpxVp9,
+            RecordingFormat::Gif => VideoEncoder::GifPalette,
+        };
+        config.region = self.selected_region();
+        if self.format != RecordingFormat::Gif {
+            config.audio_device = self.audio_device.as_ref().map(|device| device.name.clone());
+        }
         config.fps = self.fps;
         config.crf = self.crf;
         config.draw_cursor = self.draw_cursor;
@@ -118,6 +164,25 @@ impl RecordingPanelState {
     fn check_ffmpeg(&mut self) {
         self.ffmpeg_path = find_ffmpeg(None).ok();
         self.ffmpeg_checked = true;
+        if let Some(path) = &self.ffmpeg_path {
+            self.available_encoders = detect_available_h264_encoders(path);
+            self.audio_devices = list_audio_devices(path, CapturePlatform::current());
+        } else {
+            self.available_encoders.clear();
+            self.audio_devices.clear();
+        }
+        if self
+            .audio_device
+            .as_ref()
+            .is_some_and(|device| !self.audio_devices.contains(device))
+        {
+            self.audio_device = None;
+        }
+        if !matches!(self.mp4_encoder, VideoEncoder::Auto | VideoEncoder::Libx264)
+            && !self.available_encoders.contains(&self.mp4_encoder)
+        {
+            self.mp4_encoder = VideoEncoder::Auto;
+        }
     }
 
     fn start_recording(&mut self, output_dir: &Path) -> String {
@@ -134,12 +199,16 @@ impl RecordingPanelState {
         }
         let config = self.build_config(output_dir);
         match self.recorder.start(&config) {
-            Ok(()) => format!(
-                "Recording {} at {} FPS to {}",
-                self.format.extension().to_ascii_uppercase(),
-                self.fps,
-                config.output_path.display()
-            ),
+            Ok(()) => {
+                let message = format!(
+                    "Recording {} at {} FPS to {}",
+                    self.format.extension().to_ascii_uppercase(),
+                    self.fps,
+                    config.output_path.display()
+                );
+                self.active_config = Some(config);
+                message
+            }
             Err(err) => format!("Failed to start recording: {err}"),
         }
     }
@@ -148,6 +217,7 @@ impl RecordingPanelState {
         if !self.is_recording() {
             return "No active recording to stop.".into();
         }
+        self.active_config = None;
         let mut recorder = std::mem::take(&mut self.recorder);
         let (tx, rx) = mpsc::channel();
         match thread::Builder::new()
@@ -162,6 +232,39 @@ impl RecordingPanelState {
             }
             Err(err) => format!("Failed to spawn finalizer thread: {err}"),
         }
+    }
+
+    fn abort_recording(&mut self) -> String {
+        self.active_config = None;
+        match self.recorder.abort() {
+            Ok(_) => "Recording aborted and partial file discarded.".into(),
+            Err(err) => format!("Abort failed: {err}"),
+        }
+    }
+
+    /// Renders the active recording's floating controls and reports a stop or abort message.
+    pub fn show_hud(&mut self, ctx: &egui::Context) -> Option<String> {
+        let elapsed = self.recorder.elapsed()?;
+        let config = self.active_config.as_ref()?;
+        let format = match config.format {
+            RecordingFormat::Mp4H264 => "MP4",
+            RecordingFormat::WebmVp9 => "WebM",
+            RecordingFormat::Gif => "GIF",
+        };
+        let message = match show_recording_hud(
+            ctx,
+            config.region,
+            elapsed,
+            format,
+            encoder_badge(config.encoder),
+        ) {
+            RecordingHudAction::None => return None,
+            RecordingHudAction::Stop => self.stop_recording_async(),
+            RecordingHudAction::Abort => self.abort_recording(),
+        };
+        self.last_message = Some(message.clone());
+        ctx.request_repaint();
+        Some(message)
     }
 
     pub fn show(
@@ -223,7 +326,13 @@ impl RecordingPanelState {
                             .color(p.warning),
                         );
                     }
-                    if ui.small_button("Re-check").clicked() {
+                    if ui
+                        .add_enabled(
+                            !is_recording && !is_finalizing,
+                            egui::Button::new("Re-check").small(),
+                        )
+                        .clicked()
+                    {
                         self.check_ffmpeg();
                     }
                 });
@@ -248,6 +357,83 @@ impl RecordingPanelState {
                             "WebM (VP9)",
                         );
                         ui.selectable_value(&mut self.format, RecordingFormat::Gif, "GIF");
+                    });
+                    ui.end_row();
+
+                    if self.format == RecordingFormat::Mp4H264 {
+                        ui.label("Encoder");
+                        let label = if self.mp4_encoder == VideoEncoder::Auto {
+                            format!(
+                                "Auto ({})",
+                                encoder_badge(preferred_mp4_encoder(&self.available_encoders))
+                            )
+                        } else {
+                            encoder_option(self.mp4_encoder).to_owned()
+                        };
+                        egui::ComboBox::from_id_salt("recording_encoder")
+                            .selected_text(label)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.mp4_encoder,
+                                    VideoEncoder::Auto,
+                                    "Auto",
+                                );
+                                for &encoder in &self.available_encoders {
+                                    if encoder != VideoEncoder::Libx264 {
+                                        ui.selectable_value(
+                                            &mut self.mp4_encoder,
+                                            encoder,
+                                            encoder_option(encoder),
+                                        );
+                                    }
+                                }
+                                ui.selectable_value(
+                                    &mut self.mp4_encoder,
+                                    VideoEncoder::Libx264,
+                                    encoder_option(VideoEncoder::Libx264),
+                                );
+                            });
+                        ui.end_row();
+                    }
+
+                    if self.format != RecordingFormat::Gif {
+                        ui.label("Audio input");
+                        let label = self
+                            .audio_device
+                            .as_ref()
+                            .map_or("None (Silent)", |device| &device.name);
+                        egui::ComboBox::from_id_salt("recording_audio_device")
+                            .selected_text(label)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.audio_device, None, "None (Silent)");
+                                for device in &self.audio_devices {
+                                    if ui
+                                        .selectable_label(
+                                            self.audio_device.as_ref() == Some(device),
+                                            &device.name,
+                                        )
+                                        .clicked()
+                                    {
+                                        self.audio_device = Some(device.clone());
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                    }
+
+                    ui.label("Capture region");
+                    ui.horizontal(|ui| {
+                        if ui.button("Select Region...").clicked() {
+                            self.select_region_requested = true;
+                        }
+                        if let Some(region) = self.selected_region() {
+                            ui.label(format!("{} × {}", region.width(), region.height()));
+                            if ui.button("Clear Region (Fullscreen)").clicked() {
+                                self.set_region(None);
+                            }
+                        } else {
+                            ui.label("Fullscreen");
+                        }
                     });
                     ui.end_row();
 
@@ -300,18 +486,9 @@ impl RecordingPanelState {
                 .add_enabled(is_recording && !is_finalizing, abort_btn)
                 .clicked()
             {
-                match self.recorder.abort() {
-                    Ok(_) => {
-                        let msg = "Recording aborted and partial file discarded.".to_owned();
-                        self.last_message = Some(msg.clone());
-                        status_msg = Some(msg);
-                    }
-                    Err(err) => {
-                        let msg = format!("Abort failed: {err}");
-                        self.last_message = Some(msg.clone());
-                        status_msg = Some(msg);
-                    }
-                }
+                let message = self.abort_recording();
+                self.last_message = Some(message.clone());
+                status_msg = Some(message);
             }
         });
 
@@ -380,12 +557,25 @@ impl RecordingPanelState {
     }
 }
 
-pub fn format_elapsed(duration: Duration) -> String {
-    let total_secs = duration.as_secs();
-    let mins = total_secs / 60;
-    let secs = total_secs % 60;
-    let tenths = duration.subsec_millis() / 100;
-    format!("{mins:02}:{secs:02}.{tenths}")
+fn encoder_badge(encoder: VideoEncoder) -> &'static str {
+    match encoder {
+        VideoEncoder::NvencH264 => "NVENC",
+        VideoEncoder::QsvH264 => "QSV",
+        VideoEncoder::AmfH264 => "AMF",
+        VideoEncoder::Libx264 => "libx264",
+        VideoEncoder::LibvpxVp9 => "VP9",
+        VideoEncoder::Auto | VideoEncoder::GifPalette => "",
+    }
+}
+
+fn encoder_option(encoder: VideoEncoder) -> &'static str {
+    match encoder {
+        VideoEncoder::NvencH264 => "NVENC (NVIDIA)",
+        VideoEncoder::QsvH264 => "QSV (Intel)",
+        VideoEncoder::AmfH264 => "AMF (AMD)",
+        VideoEncoder::Libx264 => "CPU (libx264)",
+        _ => encoder_badge(encoder),
+    }
 }
 
 #[cfg(test)]
@@ -414,6 +604,65 @@ mod tests {
                 Some(ext)
             );
         }
+    }
+
+    #[test]
+    fn build_config_applies_region_encoder_and_audio_but_keeps_gif_silent() {
+        let dir = tempdir().expect("tempdir");
+        let mut state = RecordingPanelState::new();
+        let region = Region::new(-640, 20, 640, 480).expect("valid region");
+        state.set_region(Some(region));
+        state.mp4_encoder = VideoEncoder::NvencH264;
+        state.audio_device = Some(AudioDevice {
+            name: "USB Microphone".into(),
+            backend: "dshow",
+        });
+
+        let mp4 = state.build_config(dir.path());
+        assert_eq!(mp4.region, state.selected_region());
+        assert_eq!(mp4.region, Some(region));
+        assert_eq!(mp4.encoder, VideoEncoder::NvencH264);
+        assert_eq!(mp4.audio_device.as_deref(), Some("USB Microphone"));
+        assert!(mp4.validate().is_ok());
+
+        state.format = RecordingFormat::Gif;
+        let gif = state.build_config(dir.path());
+        assert_eq!(gif.region, Some(region));
+        assert_eq!(gif.encoder, VideoEncoder::GifPalette);
+        assert_eq!(gif.audio_device, None);
+        assert!(gif.validate().is_ok());
+
+        state.format = RecordingFormat::WebmVp9;
+        state.set_region(None);
+        let webm = state.build_config(dir.path());
+        assert_eq!(webm.region, None);
+        assert_eq!(webm.encoder, VideoEncoder::LibvpxVp9);
+        assert_eq!(webm.audio_device, mp4.audio_device);
+        assert!(webm.validate().is_ok());
+    }
+
+    #[test]
+    fn build_config_resolves_auto_using_the_detected_encoders() {
+        let dir = tempdir().expect("tempdir");
+        let mut state = RecordingPanelState::new();
+        assert_eq!(
+            state.build_config(dir.path()).encoder,
+            VideoEncoder::Libx264
+        );
+        state.available_encoders = vec![VideoEncoder::AmfH264, VideoEncoder::QsvH264];
+        assert_eq!(
+            state.build_config(dir.path()).encoder,
+            VideoEncoder::QsvH264
+        );
+    }
+
+    #[test]
+    fn select_region_request_is_consumed_once() {
+        let mut state = RecordingPanelState::new();
+        assert!(!state.take_select_region_request());
+        state.select_region_requested = true;
+        assert!(state.take_select_region_request());
+        assert!(!state.take_select_region_request());
     }
 
     #[test]
