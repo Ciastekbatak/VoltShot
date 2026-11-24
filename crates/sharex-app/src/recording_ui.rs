@@ -55,6 +55,62 @@ impl RecordingPanelState {
         config
     }
 
+    /// Stops the active recording or starts a recording in the requested format.
+    pub fn toggle_hotkey_recording(
+        &mut self,
+        format: RecordingFormat,
+        output_dir: &Path,
+    ) -> String {
+        let message = if self.is_recording() {
+            self.stop_recording()
+        } else {
+            if !self.ffmpeg_checked {
+                self.check_ffmpeg();
+            }
+            self.format = format;
+            self.start_recording(output_dir)
+        };
+        self.last_message = Some(message.clone());
+        message
+    }
+
+    fn check_ffmpeg(&mut self) {
+        self.ffmpeg_path = find_ffmpeg(None).ok();
+        self.ffmpeg_checked = true;
+    }
+
+    fn start_recording(&mut self, output_dir: &Path) -> String {
+        if self.ffmpeg_path.is_none() {
+            return "FFmpeg was not found. Install FFmpeg, then select Re-check.".into();
+        }
+        if !matches!(self.recorder.state(), RecordingState::Idle)
+            && let Err(err) = self.recorder.reset()
+        {
+            return format!("Failed to reset recorder: {err}");
+        }
+        let config = self.build_config(output_dir);
+        match self.recorder.start(&config) {
+            Ok(()) => format!(
+                "Recording {} at {} FPS to {}",
+                self.format.extension().to_ascii_uppercase(),
+                self.fps,
+                config.output_path.display()
+            ),
+            Err(err) => format!("Failed to start recording: {err}"),
+        }
+    }
+
+    fn stop_recording(&mut self) -> String {
+        match self.recorder.stop() {
+            Ok((path, duration)) => format!(
+                "Saved recording ({}) to {}",
+                format_elapsed(duration),
+                path.display()
+            ),
+            Err(err) => format!("Recording stop failed: {err}"),
+        }
+    }
+
     pub fn show(
         &mut self,
         ctx: &egui::Context,
@@ -67,8 +123,7 @@ impl RecordingPanelState {
         let mut status_msg = None;
 
         if !self.ffmpeg_checked {
-            self.ffmpeg_path = find_ffmpeg(None).ok();
-            self.ffmpeg_checked = true;
+            self.check_ffmpeg();
         }
 
         let is_recording = self.recorder.state().is_recording();
@@ -112,7 +167,7 @@ impl RecordingPanelState {
                         );
                     }
                     if ui.small_button("Re-check").clicked() {
-                        self.ffmpeg_path = find_ffmpeg(None).ok();
+                        self.check_ffmpeg();
                     }
                 });
             });
@@ -166,48 +221,17 @@ impl RecordingPanelState {
                 egui::Button::new(RichText::new("Start Recording").color(Color32::WHITE))
                     .fill(p.accent);
             if ui.add_enabled(can_start, start_btn).clicked() {
-                if !matches!(self.recorder.state(), RecordingState::Idle) {
-                    let _ = self.recorder.reset();
-                }
-                let config = self.build_config(output_dir);
-                match self.recorder.start(&config) {
-                    Ok(()) => {
-                        let msg = format!(
-                            "Recording {} at {} FPS -> {}",
-                            self.format.extension().to_ascii_uppercase(),
-                            self.fps,
-                            config.output_path.display()
-                        );
-                        self.last_message = Some(msg.clone());
-                        status_msg = Some(msg);
-                    }
-                    Err(err) => {
-                        let msg = format!("Failed to start recording: {err}");
-                        self.last_message = Some(msg.clone());
-                        status_msg = Some(msg);
-                    }
-                }
+                let message = self.start_recording(output_dir);
+                self.last_message = Some(message.clone());
+                status_msg = Some(message);
             }
 
             let stop_btn = egui::Button::new(RichText::new("Stop & Save").color(Color32::WHITE))
                 .fill(p.success);
             if ui.add_enabled(is_recording, stop_btn).clicked() {
-                match self.recorder.stop() {
-                    Ok((path, duration)) => {
-                        let msg = format!(
-                            "Saved recording ({}) to {}",
-                            format_elapsed(duration),
-                            path.display()
-                        );
-                        self.last_message = Some(msg.clone());
-                        status_msg = Some(msg);
-                    }
-                    Err(err) => {
-                        let msg = format!("Recording stop failed: {err}");
-                        self.last_message = Some(msg.clone());
-                        status_msg = Some(msg);
-                    }
-                }
+                let message = self.stop_recording();
+                self.last_message = Some(message.clone());
+                status_msg = Some(message);
             }
 
             let abort_btn =
@@ -327,6 +351,19 @@ mod tests {
                 Some(ext)
             );
         }
+    }
+
+    #[test]
+    fn hotkey_reports_missing_ffmpeg_without_starting_recording() {
+        let dir = tempdir().expect("tempdir");
+        let mut state = RecordingPanelState::new();
+        state.ffmpeg_checked = true;
+        let status = state.toggle_hotkey_recording(RecordingFormat::Gif, dir.path());
+
+        assert!(status.contains("FFmpeg was not found"));
+        assert!(!state.is_recording());
+        assert_eq!(state.format, RecordingFormat::Gif);
+        assert_eq!(state.last_message.as_deref(), Some(status.as_str()));
     }
 
     #[test]

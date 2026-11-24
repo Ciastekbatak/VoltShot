@@ -12,15 +12,19 @@ pub enum HotkeyAction {
     CaptureActiveWindow,
     CaptureLastRegion,
     OpenEditor,
+    RecordVideo,
+    RecordGif,
 }
 
 impl HotkeyAction {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::CaptureFullscreen,
         Self::CaptureRegion,
         Self::CaptureActiveWindow,
         Self::CaptureLastRegion,
         Self::OpenEditor,
+        Self::RecordVideo,
+        Self::RecordGif,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -30,6 +34,8 @@ impl HotkeyAction {
             Self::CaptureActiveWindow => "Capture active window",
             Self::CaptureLastRegion => "Capture last region",
             Self::OpenEditor => "Open image editor",
+            Self::RecordVideo => "Record screen (MP4)",
+            Self::RecordGif => "Record screen (GIF)",
         }
     }
 }
@@ -442,6 +448,32 @@ pub fn default_sharex_hotkeys() -> Vec<HotkeyBinding> {
             )),
             enabled: true,
         },
+        HotkeyBinding {
+            id: "record-video".into(),
+            action: HotkeyAction::RecordVideo,
+            combo: Some(HotkeyCombo::new(
+                KeyModifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..KeyModifiers::NONE
+                },
+                KeyCode::PrintScreen,
+            )),
+            enabled: true,
+        },
+        HotkeyBinding {
+            id: "record-gif".into(),
+            action: HotkeyAction::RecordGif,
+            combo: Some(HotkeyCombo::new(
+                KeyModifiers {
+                    alt: true,
+                    shift: true,
+                    ..KeyModifiers::NONE
+                },
+                KeyCode::PrintScreen,
+            )),
+            enabled: true,
+        },
     ]
 }
 
@@ -467,7 +499,7 @@ mod tests {
     #[test]
     fn default_hotkeys_include_standard_sharex_bindings() {
         let defaults = default_sharex_hotkeys();
-        assert_eq!(defaults.len(), 5);
+        assert_eq!(defaults.len(), 7);
         assert_eq!(
             defaults[0].combo.map(|c| c.to_string()).as_deref(),
             Some("PrintScreen")
@@ -484,5 +516,24 @@ mod tests {
             defaults[3].combo.map(|c| c.to_string()).as_deref(),
             Some("Shift + PrintScreen")
         );
+        for (binding, id, action, combo) in [
+            (
+                &defaults[5],
+                "record-video",
+                HotkeyAction::RecordVideo,
+                "Ctrl + Shift + PrintScreen",
+            ),
+            (
+                &defaults[6],
+                "record-gif",
+                HotkeyAction::RecordGif,
+                "Alt + Shift + PrintScreen",
+            ),
+        ] {
+            assert_eq!(binding.id, id);
+            assert_eq!(binding.action, action);
+            assert_eq!(binding.combo, Some(HotkeyCombo::parse(combo).unwrap()));
+            assert!(binding.enabled);
+        }
     }
 }

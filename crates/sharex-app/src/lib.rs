@@ -12,6 +12,7 @@ pub mod theme;
 pub mod thumb_cache;
 pub mod tools_ui;
 pub mod tray;
+pub mod uploaders_ui;
 pub mod win_focus;
 
 use chrono::Utc;

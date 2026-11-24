@@ -10,15 +10,17 @@ use crate::theme::{SharexPalette, apply_sharex_theme, palette};
 use crate::thumb_cache::LruCache;
 use crate::tools_ui::{ToolsContext, ToolsPanelState};
 use crate::tray::{TrayAction, TrayRuntime};
+use crate::uploaders_ui::UploadersPanelState;
 use chrono::Utc;
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 use sharex_capture::{DesktopSnapshot, XcapCapturer};
 use sharex_core::{
     AppConfig, CaptureId, CaptureSource, CapturedImage, ClipboardSink, FileNameContext,
-    FileNamePattern, HistoryEntry, HistoryRepository, HotkeyAction, HotkeyCombo, ImageFormat,
-    JsonlHistoryStore, KeyCode, KeyModifiers, MonitorInfo, ScreenCapturer, default_sharex_hotkeys,
-    resolve_unique_path,
+    FileNamePattern, HistoryEntry, HistoryQuery, HistoryRepository, HotkeyAction, HotkeyCombo,
+    ImageFormat, JsonlHistoryStore, KeyCode, KeyModifiers, MonitorInfo, ScreenCapturer,
+    SqliteHistoryStore, default_sharex_hotkeys, resolve_unique_path,
 };
+use sharex_media::RecordingFormat;
 use std::collections::HashMap;
 use std::fs;
 use std::num::NonZeroUsize;
@@ -27,6 +29,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const THUMB_CACHE_CAPACITY: usize = 64;
+const HISTORY_LIMIT: usize = 100;
 
 /// Starts the ShareX-style native desktop application window with global hotkeys.
 pub fn launch_gui(config_path: PathBuf) -> Result<(), eframe::Error> {
@@ -66,6 +69,7 @@ enum ActiveView {
     Effects,
     Tools,
     Recording,
+    Uploaders,
     Hotkeys,
     Settings,
 }
@@ -79,14 +83,20 @@ struct SharexGuiApp {
     active_view: ActiveView,
     language: UiLanguage,
     search_filter: String,
+    sqlite_history: Option<SqliteHistoryStore>,
+    jsonl_history: JsonlHistoryStore,
     history_entries: Vec<HistoryEntry>,
-    selected_entry_id: Option<String>,
+    search_results: Option<Vec<HistoryEntry>>,
+    older_capture_path: Option<PathBuf>,
+    selected_capture: Option<HistoryEntry>,
+    tag_input: String,
     thumbnails: LruCache<PathBuf, egui::TextureHandle>,
     failed_thumbs: HashMap<PathBuf, bool>,
     editor: Option<EditorViewState>,
     effects: EffectsPanelState,
     tools: ToolsPanelState,
     recording: RecordingPanelState,
+    uploaders: UploadersPanelState,
     overlay: Option<RegionOverlayState>,
     pins: PinManager,
     tray: TrayRuntime,
@@ -106,7 +116,7 @@ impl SharexGuiApp {
     ) -> Self {
         let language = UiLanguage::default();
         let ready_text = i18n::strings(language).ready_status.to_owned();
-        let (config, initial_status) = if config_path.exists() {
+        let (mut config, mut initial_status) = if config_path.exists() {
             match AppConfig::load_or_default(&config_path) {
                 Ok(cfg) => (cfg, ready_text),
                 Err(err) => (
@@ -118,18 +128,51 @@ impl SharexGuiApp {
             (fallback_config, ready_text)
         };
 
+        if !config.hotkeys.is_empty() {
+            for binding in default_sharex_hotkeys().into_iter().filter(|binding| {
+                matches!(
+                    binding.action,
+                    HotkeyAction::RecordVideo | HotkeyAction::RecordGif
+                )
+            }) {
+                if !config
+                    .hotkeys
+                    .iter()
+                    .any(|saved| saved.action == binding.action || saved.id == binding.id)
+                {
+                    config.hotkeys.push(binding);
+                }
+            }
+        }
+
         apply_sharex_theme(&cc.egui_ctx, config.dark_theme);
         let hotkeys = HotkeyRuntime::new(cc.egui_ctx.clone(), &config.hotkeys);
         let tray = TrayRuntime::new(cc.egui_ctx.clone());
         let capturer = XcapCapturer::new();
         let monitors = capturer.list_monitors().unwrap_or_default();
-        let history_entries = JsonlHistoryStore::new(&config.history_path)
-            .list(Some(100))
-            .unwrap_or_default();
+        let sqlite_path = config.history_path.with_extension("sqlite");
+        let sqlite_history = match SqliteHistoryStore::open(&sqlite_path) {
+            Ok(store) => {
+                if sqlite_path != config.history_path
+                    && config.history_path.exists()
+                    && let Err(err) = store.migrate_from_jsonl(&config.history_path)
+                {
+                    initial_status.push_str(&format!(" History import failed: {err}"));
+                }
+                Some(store)
+            }
+            Err(err) => {
+                initial_status
+                    .push_str(&format!(" Using JSONL history. SQLite open failed: {err}"));
+                None
+            }
+        };
+        let jsonl_history = JsonlHistoryStore::new(&config.history_path);
+        let uploaders = UploadersPanelState::new(&crate::default_mirror_dir(&config));
         let output_dir_input = config.output_dir.display().to_string();
         let cache_cap = NonZeroUsize::new(THUMB_CACHE_CAPACITY).expect("non-zero cache capacity");
 
-        Self {
+        let mut app = Self {
             config_path,
             theme_applied_dark: config.dark_theme,
             config,
@@ -139,14 +182,20 @@ impl SharexGuiApp {
             active_view: ActiveView::Captures,
             language,
             search_filter: String::new(),
-            history_entries,
-            selected_entry_id: None,
+            sqlite_history,
+            jsonl_history,
+            history_entries: Vec::new(),
+            search_results: None,
+            older_capture_path: None,
+            selected_capture: None,
+            tag_input: String::new(),
             thumbnails: LruCache::new(cache_cap),
             failed_thumbs: HashMap::new(),
             editor: None,
             effects: EffectsPanelState::new(),
             tools: ToolsPanelState::new(),
             recording: RecordingPanelState::new(),
+            uploaders,
             overlay: None,
             pins: PinManager::new(),
             tray,
@@ -155,7 +204,9 @@ impl SharexGuiApp {
             capturer,
             clipboard: SystemClipboard::new(),
             status_line: initial_status,
-        }
+        };
+        app.refresh_history();
+        app
     }
 
     fn persist_config_silent(&mut self) {
@@ -165,9 +216,24 @@ impl SharexGuiApp {
     }
 
     fn latest_capture_path(&self) -> Option<&Path> {
-        self.history_entries
-            .iter()
-            .find_map(|entry| entry.file_path.as_deref().filter(|path| path.exists()))
+        first_existing_capture_path(&self.history_entries).or_else(|| {
+            self.older_capture_path
+                .as_deref()
+                .filter(|path| path.is_file())
+        })
+    }
+
+    fn select_capture(&mut self, entry: &HistoryEntry) {
+        if !self.is_capture_selected(entry) {
+            self.tag_input.clear();
+        }
+        self.selected_capture = Some(entry.clone());
+    }
+
+    fn is_capture_selected(&self, entry: &HistoryEntry) -> bool {
+        self.selected_capture
+            .as_ref()
+            .is_some_and(|selected| selected.id == entry.id)
     }
 
     fn hotkey_hint(&self, action: HotkeyAction) -> String {
@@ -245,6 +311,17 @@ impl SharexGuiApp {
                     self.status_line =
                         "No screenshot available to open in the image editor.".into();
                 }
+            }
+            HotkeyAction::RecordVideo | HotkeyAction::RecordGif => {
+                let format = if event.action == HotkeyAction::RecordVideo {
+                    RecordingFormat::Mp4H264
+                } else {
+                    RecordingFormat::Gif
+                };
+                self.status_line = self
+                    .recording
+                    .toggle_hotkey_recording(format, &self.config.output_dir);
+                self.active_view = ActiveView::Recording;
             }
         }
     }
@@ -333,10 +410,9 @@ impl SharexGuiApp {
         }
 
         let capture_id = CaptureId::from_timestamp(now, image.width() ^ image.height());
-        if self.config.pipeline.record_history {
-            let store = JsonlHistoryStore::new(&self.config.history_path);
-            let _ = store.append(&HistoryEntry {
-                id: capture_id.clone(),
+        let history_result = if self.config.pipeline.record_history {
+            let entry = HistoryEntry {
+                id: capture_id,
                 timestamp: now,
                 source,
                 width: image.width(),
@@ -346,11 +422,14 @@ impl SharexGuiApp {
                 upload_url: None,
                 tags: Vec::new(),
                 note: None,
-            });
-        }
+            };
+            self.history_repository()
+                .append(&entry)
+                .map(|()| self.select_capture(&entry))
+        } else {
+            Ok(())
+        };
 
-        self.refresh_history();
-        self.selected_entry_id = Some(capture_id.as_str().to_owned());
         self.status_line = match &saved_path {
             Some(p) => format!(
                 "Captured {}x{} ({}){} -> {}",
@@ -368,6 +447,11 @@ impl SharexGuiApp {
                 effect_note
             ),
         };
+        if let Err(err) = history_result {
+            self.status_line
+                .push_str(&format!(" History update failed: {err}"));
+        }
+        self.refresh_history();
 
         if force_open_in_editor || self.config.pipeline.open_in_editor {
             self.editor = Some(EditorViewState::open(ctx, image, saved_path, format));
@@ -448,11 +532,62 @@ impl SharexGuiApp {
         }
     }
 
+    fn history_repository(&self) -> &dyn HistoryRepository {
+        match &self.sqlite_history {
+            Some(store) => store,
+            None => &self.jsonl_history,
+        }
+    }
+
     fn refresh_history(&mut self) {
-        let store = JsonlHistoryStore::new(&self.config.history_path);
-        match store.list(Some(100)) {
+        match self.history_repository().list(Some(HISTORY_LIMIT)) {
             Ok(entries) => self.history_entries = entries,
             Err(err) => self.status_line = format!("History load failed: {err}"),
+        }
+        self.older_capture_path = None;
+        if self.history_entries.len() == HISTORY_LIMIT && self.latest_capture_path().is_none() {
+            match self.history_repository().list(None) {
+                Ok(entries) => {
+                    self.older_capture_path =
+                        first_existing_capture_path(&entries).map(Path::to_path_buf);
+                }
+                Err(err) => self.status_line = format!("History load failed: {err}"),
+            }
+        }
+        self.refresh_history_search();
+    }
+
+    fn refresh_history_search(&mut self) {
+        let query = capture_history_query(&self.search_filter);
+        self.search_results = if query.text.is_none() && query.tag.is_none() {
+            None
+        } else {
+            Some(match self.history_repository().search(&query) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    self.status_line = format!("History search failed: {err}");
+                    Vec::new()
+                }
+            })
+        };
+    }
+
+    fn save_capture_tags(&mut self, id: &CaptureId, tags: &[String]) -> bool {
+        match self.history_repository().set_tags(id, tags) {
+            Ok(true) => {
+                self.status_line = "Capture tags updated.".into();
+                self.refresh_history();
+                true
+            }
+            Ok(false) => {
+                self.status_line = "This capture is no longer in history.".into();
+                self.refresh_history();
+                false
+            }
+            Err(err) => {
+                self.status_line = format!("Could not update capture tags: {err}");
+                false
+            }
         }
     }
 
@@ -668,6 +803,15 @@ impl SharexGuiApp {
                 }
                 if sidebar_nav_button(
                     ui,
+                    s.uploaders,
+                    self.active_view == ActiveView::Uploaders,
+                    p,
+                ) {
+                    self.active_view = ActiveView::Uploaders;
+                    self.refresh_history();
+                }
+                if sidebar_nav_button(
+                    ui,
                     s.hotkey_settings,
                     self.active_view == ActiveView::Hotkeys,
                     p,
@@ -716,35 +860,37 @@ impl SharexGuiApp {
                     self.refresh_history();
                     self.refresh_monitors();
                 }
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search_filter)
-                        .hint_text(s.filter_captures_hint)
-                        .desired_width(180.0),
-                );
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.search_filter)
+                            .hint_text(s.filter_captures_hint)
+                            .desired_width(180.0_f32),
+                    )
+                    .on_hover_text("Use #tag or #tag followed by filter text.")
+                    .changed()
+                {
+                    self.refresh_history_search();
+                }
             });
         });
         ui.separator();
 
-        let query = self.search_filter.trim().to_ascii_lowercase();
-        let visible: Vec<HistoryEntry> = self
-            .history_entries
-            .iter()
-            .filter(|entry| {
-                if query.is_empty() {
-                    return true;
-                }
-                let path_match = entry.file_path.as_ref().is_some_and(|path| {
-                    path.to_string_lossy().to_ascii_lowercase().contains(&query)
-                });
-                path_match || entry.id.as_str().to_ascii_lowercase().contains(&query)
-            })
-            .cloned()
-            .collect();
+        let visible = self
+            .search_results
+            .as_ref()
+            .unwrap_or(&self.history_entries)
+            .clone();
 
         if visible.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
+                    if self.search_results.is_some() {
+                        ui.label(
+                            RichText::new("No captures match this filter.").color(p.text_muted),
+                        );
+                        return;
+                    }
                     ui.label(
                         RichText::new(s.no_screenshots_yet)
                             .size(18.0)
@@ -777,10 +923,7 @@ impl SharexGuiApp {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for entry in &visible {
-                let is_selected = self
-                    .selected_entry_id
-                    .as_deref()
-                    .is_some_and(|id| id == entry.id.as_str());
+                let is_selected = self.is_capture_selected(entry);
                 let frame = egui::Frame::NONE
                     .fill(p.card_bg)
                     .stroke(Stroke::new(
@@ -804,7 +947,7 @@ impl SharexGuiApp {
                                     .sense(egui::Sense::click()),
                             );
                             if img_resp.clicked() {
-                                self.selected_entry_id = Some(entry.id.as_str().to_owned());
+                                self.select_capture(entry);
                             }
                             if img_resp.double_clicked()
                                 && let Some(path) = &entry.file_path
@@ -812,8 +955,11 @@ impl SharexGuiApp {
                                 open_editor_path = Some(path.clone());
                             }
                         } else {
-                            let (rect, _) =
-                                ui.allocate_exact_size(thumb_size, egui::Sense::hover());
+                            let (rect, preview) =
+                                ui.allocate_exact_size(thumb_size, egui::Sense::click());
+                            if preview.clicked() {
+                                self.select_capture(entry);
+                            }
                             ui.painter()
                                 .rect_filled(rect, CornerRadius::same(3), p.sidebar_bg);
                             ui.painter().text(
@@ -833,12 +979,16 @@ impl SharexGuiApp {
                                 .and_then(|fp| fp.file_name())
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| entry.id.as_str().to_owned());
-                            ui.label(
+                            let title = egui::Label::new(
                                 RichText::new(title)
                                     .strong()
-                                    .size(14.0)
+                                    .size(14.0_f32)
                                     .color(p.text_primary),
-                            );
+                            )
+                            .sense(egui::Sense::click());
+                            if ui.add(title).on_hover_text("Select capture").clicked() {
+                                self.select_capture(entry);
+                            }
                             ui.label(
                                 RichText::new(format!(
                                     "{}x{} {} | {}",
@@ -857,6 +1007,7 @@ impl SharexGuiApp {
                                         .color(p.text_muted),
                                 );
                             }
+                            self.render_capture_tags(ui, p, entry);
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
                                 if let Some(path) = &entry.file_path {
@@ -920,10 +1071,70 @@ impl SharexGuiApp {
                 Ok(()) => {
                     self.thumbnails.remove(&path);
                     self.failed_thumbs.remove(&path);
+                    self.refresh_history();
                     format!("Deleted {}", path.display())
                 }
                 Err(err) => format!("Delete failed: {err}"),
             };
+        }
+    }
+
+    fn render_capture_tags(&mut self, ui: &mut egui::Ui, p: &SharexPalette, entry: &HistoryEntry) {
+        if !entry.tags.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for tag in &entry.tags {
+                    egui::Frame::NONE
+                        .fill(p.sidebar_bg)
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(5, 1))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("#{tag}")).small().color(p.text_muted),
+                                );
+                                if ui
+                                    .add(egui::Button::new("×").small().frame(false))
+                                    .on_hover_text(format!("Remove #{tag}"))
+                                    .clicked()
+                                {
+                                    let tags = entry
+                                        .tags
+                                        .iter()
+                                        .filter(|existing| *existing != tag)
+                                        .cloned()
+                                        .collect::<Vec<_>>();
+                                    self.save_capture_tags(&entry.id, &tags);
+                                }
+                            });
+                        });
+                }
+            });
+        }
+
+        if self.is_capture_selected(entry) {
+            ui.horizontal(|ui| {
+                let input = ui.add(
+                    egui::TextEdit::singleline(&mut self.tag_input)
+                        .id_salt(("capture_tag", entry.id.as_str()))
+                        .hint_text("Add tag")
+                        .desired_width(100.0_f32),
+                );
+                let tag = self.tag_input.trim().trim_start_matches('#').trim();
+                let can_add = !tag.is_empty() && !entry.tags.iter().any(|existing| existing == tag);
+                let submitted = ui
+                    .add_enabled(can_add, egui::Button::new("+").small())
+                    .on_hover_text("Add tag")
+                    .clicked()
+                    || (input.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                if submitted && can_add {
+                    let mut tags = entry.tags.clone();
+                    tags.push(tag.to_owned());
+                    if self.save_capture_tags(&entry.id, &tags) {
+                        self.tag_input.clear();
+                    }
+                }
+            });
         }
     }
 
@@ -983,8 +1194,7 @@ impl SharexGuiApp {
                 match self.write_new_capture_file(&image, format, Utc::now()) {
                     Ok(path) => {
                         let now = Utc::now();
-                        let store = JsonlHistoryStore::new(&self.config.history_path);
-                        let _ = store.append(&HistoryEntry {
+                        let history_result = self.history_repository().append(&HistoryEntry {
                             id: CaptureId::from_timestamp(now, image.width()),
                             timestamp: now,
                             source: CaptureSource::PrimaryMonitor,
@@ -1000,6 +1210,10 @@ impl SharexGuiApp {
                             ed.set_saved(path.clone());
                         }
                         self.status_line = format!("Saved edited copy to {}", path.display());
+                        if let Err(err) = history_result {
+                            self.status_line
+                                .push_str(&format!(" History update failed: {err}"));
+                        }
                         self.refresh_history();
                     }
                     Err(err) => self.status_line = format!("Save copy failed: {err}"),
@@ -1048,6 +1262,26 @@ impl SharexGuiApp {
         {
             self.status_line = msg;
         }
+    }
+
+    fn render_uploaders_view(&mut self, ui: &mut egui::Ui, p: &SharexPalette) {
+        let selected = self
+            .selected_capture
+            .as_ref()
+            .and_then(|entry| entry.file_path.as_deref())
+            .filter(|path| path.is_file());
+        let capture = selected.map(|path| (path.to_path_buf(), true)).or_else(|| {
+            self.latest_capture_path()
+                .map(|path| (path.to_path_buf(), false))
+        });
+        self.uploaders.show(
+            ui,
+            p,
+            i18n::strings(self.language),
+            capture
+                .as_ref()
+                .map(|(path, selected)| (path.as_path(), *selected)),
+        );
     }
 
     fn render_hotkeys_view(&mut self, ui: &mut egui::Ui, p: &SharexPalette) {
@@ -1280,6 +1514,7 @@ impl SharexGuiApp {
 impl eframe::App for SharexGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(80));
+        self.uploaders.poll_upload(&self.clipboard);
 
         if self.last_hotkey_retry.elapsed() >= Duration::from_secs(2) {
             self.hotkeys.retry_conflicts(&self.config.hotkeys);
@@ -1409,10 +1644,39 @@ impl eframe::App for SharexGuiApp {
                 ActiveView::Effects => self.render_effects_view(ctx, ui, &p),
                 ActiveView::Tools => self.render_tools_view(ctx, ui, &p),
                 ActiveView::Recording => self.render_recording_view(ctx, ui, &p),
+                ActiveView::Uploaders => self.render_uploaders_view(ui, &p),
                 ActiveView::Hotkeys => self.render_hotkeys_view(ui, &p),
                 ActiveView::Settings => self.render_settings_view(ctx, ui, &p),
             });
     }
+}
+
+fn first_existing_capture_path(entries: &[HistoryEntry]) -> Option<&Path> {
+    entries
+        .iter()
+        .find_map(|entry| entry.file_path.as_deref().filter(|path| path.is_file()))
+}
+
+fn capture_history_query(filter: &str) -> HistoryQuery {
+    let filter = filter.trim();
+    let mut query = HistoryQuery {
+        limit: Some(HISTORY_LIMIT),
+        ..HistoryQuery::default()
+    };
+    if let Some(tag_filter) = filter.strip_prefix('#') {
+        let mut parts = tag_filter.splitn(2, char::is_whitespace);
+        if let Some(tag) = parts.next().filter(|tag| !tag.is_empty()) {
+            query.tag = Some(tag.to_owned());
+            query.text = parts
+                .next()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned);
+            return query;
+        }
+    }
+    query.text = (!filter.is_empty()).then(|| filter.to_owned());
+    query
 }
 
 fn sidebar_action_button(ui: &mut egui::Ui, label: &str, hotkey: &str, p: &SharexPalette) -> bool {
@@ -1484,5 +1748,25 @@ fn open_folder_in_os(path: &Path) {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_history_filter_supports_plain_text_and_tag_prefix() {
+        for (filter, text, tag) in [
+            ("   ", None, None),
+            (" Step #2 ", Some("Step #2"), None),
+            (" #Bug ", None, Some("Bug")),
+            (" #Bug   Login screen ", Some("Login screen"), Some("Bug")),
+        ] {
+            let query = capture_history_query(filter);
+            assert_eq!(query.text.as_deref(), text);
+            assert_eq!(query.tag.as_deref(), tag);
+            assert_eq!(query.limit, Some(HISTORY_LIMIT));
+        }
     }
 }
