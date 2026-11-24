@@ -3392,6 +3392,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sharex-effects"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "serde",
+ "serde_json",
+ "sharex-core",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "sharex-uploaders"
 version = "0.1.0"
 dependencies = [

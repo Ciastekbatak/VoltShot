@@ -4,6 +4,7 @@ members = [
     "crates/sharex-core",
     "crates/sharex-capture",
     "crates/sharex-editor",
+    "crates/sharex-effects",
     "crates/sharex-uploaders",
     "crates/sharex-app",
 ]
