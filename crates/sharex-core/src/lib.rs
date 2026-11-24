@@ -8,7 +8,8 @@ pub mod ports;
 
 pub use config::{AppConfig, PipelineConfig};
 pub use domain::{
-    CaptureId, CaptureSource, CapturedImage, CoreError, ImageFormat, MonitorId, MonitorInfo, Region,
+    CaptureId, CaptureSource, CapturedImage, CoreError, ImageFormat, MonitorId, MonitorInfo,
+    Region, WindowId, WindowInfo,
 };
 pub use history::{HistoryEntry, HistoryRepository, JsonlHistoryStore};
 pub use hotkeys::{

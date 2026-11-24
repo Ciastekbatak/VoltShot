@@ -129,6 +129,40 @@ pub struct MonitorInfo {
     pub is_primary: bool,
 }
 
+/// Operating-system identifier for a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WindowId(u32);
+
+impl WindowId {
+    pub const fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for WindowId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Window metadata reported by the screen capture backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowInfo {
+    pub id: WindowId,
+    pub title: String,
+    pub app_name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub is_minimized: bool,
+    pub is_focused: bool,
+}
+
 /// Validated non-empty rectangular screen region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Region {
@@ -197,8 +231,10 @@ impl Region {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CaptureSource {
     PrimaryMonitor,
+    ActiveMonitor,
     ActiveWindow,
     Monitor { id: MonitorId },
+    Window { id: WindowId },
     Region { region: Region },
 }
 

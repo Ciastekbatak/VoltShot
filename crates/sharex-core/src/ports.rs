@@ -1,8 +1,11 @@
-use crate::domain::{CaptureSource, CapturedImage, CoreError, MonitorInfo};
+use crate::domain::{CaptureSource, CapturedImage, CoreError, MonitorInfo, WindowInfo};
 
 /// Screen capture backend boundary implemented by OS adapters.
 pub trait ScreenCapturer: Send + Sync {
     fn list_monitors(&self) -> Result<Vec<MonitorInfo>, CoreError>;
+    fn list_windows(&self) -> Result<Vec<WindowInfo>, CoreError> {
+        Ok(Vec::new())
+    }
     fn capture(&self, source: &CaptureSource) -> Result<CapturedImage, CoreError>;
 }
 

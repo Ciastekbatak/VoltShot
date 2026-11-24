@@ -1,5 +1,6 @@
 use sharex_core::{
     CaptureSource, CapturedImage, CoreError, MonitorId, MonitorInfo, Region, ScreenCapturer,
+    WindowId, WindowInfo,
 };
 use xcap::{Monitor, Window};
 
@@ -9,6 +10,23 @@ pub struct DesktopSnapshot {
     pub image: CapturedImage,
     pub origin_x: i32,
     pub origin_y: i32,
+}
+
+impl DesktopSnapshot {
+    fn crop_region(&self, region: Region) -> Result<CapturedImage, CoreError> {
+        let bounds = ScreenRect::new(
+            self.origin_x,
+            self.origin_y,
+            self.image.width(),
+            self.image.height(),
+        );
+        let intersection = bounds
+            .intersection(ScreenRect::from(region))
+            .ok_or_else(|| {
+                CoreError::InvalidRegion("region is outside the virtual desktop".into())
+            })?;
+        self.image.crop(bounds.local_region(intersection)?)
+    }
 }
 
 /// Cross-platform screen capturer backed by `xcap`.
@@ -63,6 +81,50 @@ impl XcapCapturer {
         CapturedImage::from_rgba(width, height, buffer.into_raw())
     }
 
+    fn primary_monitor(monitors: &[Monitor]) -> Result<&Monitor, CoreError> {
+        monitors
+            .iter()
+            .find(|monitor| monitor.is_primary().unwrap_or(false))
+            .or_else(|| monitors.first())
+            .ok_or_else(|| CoreError::CaptureFailed("no monitors detected".into()))
+    }
+
+    fn window_to_info(window: &Window) -> Option<WindowInfo> {
+        let width = window.width().ok()?;
+        let height = window.height().ok()?;
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        Some(WindowInfo {
+            id: WindowId::new(window.id().ok()?),
+            x: window.x().ok()?,
+            y: window.y().ok()?,
+            width,
+            height,
+            title: window.title().unwrap_or_default(),
+            app_name: window.app_name().unwrap_or_default(),
+            is_minimized: window.is_minimized().unwrap_or(true),
+            is_focused: window.is_focused().unwrap_or(false),
+        })
+    }
+
+    fn capture_window(window: &Window) -> Result<CapturedImage, CoreError> {
+        let buffer = window
+            .capture_image()
+            .map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
+        CapturedImage::from_rgba(buffer.width(), buffer.height(), buffer.into_raw())
+    }
+
+    fn capture_window_by_id(id: WindowId) -> Result<CapturedImage, CoreError> {
+        let windows = Window::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
+        let target = windows
+            .iter()
+            .find(|window| window.id().ok() == Some(id.value()))
+            .ok_or_else(|| CoreError::CaptureFailed(format!("window `{id}` not found")))?;
+        Self::capture_window(target)
+    }
+
     fn capture_active_window() -> Result<CapturedImage, CoreError> {
         let windows = Window::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
         let target = windows
@@ -82,22 +144,13 @@ impl XcapCapturer {
             })
             .ok_or_else(|| CoreError::CaptureFailed("no visible active window found".into()))?;
 
-        let buffer = target
-            .capture_image()
-            .map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
-        CapturedImage::from_rgba(buffer.width(), buffer.height(), buffer.into_raw())
+        Self::capture_window(target)
     }
 
     /// Captures the primary display together with its virtual screen origin for the region overlay.
     pub fn capture_primary_snapshot(&self) -> Result<DesktopSnapshot, CoreError> {
         let monitors = Monitor::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
-        if monitors.is_empty() {
-            return Err(CoreError::CaptureFailed("no monitors detected".into()));
-        }
-        let target = monitors
-            .iter()
-            .find(|m| m.is_primary().unwrap_or(false))
-            .unwrap_or(&monitors[0]);
+        let target = Self::primary_monitor(&monitors)?;
         let info = Self::monitor_to_info(target)?;
         let image = Self::capture_monitor(target)?;
         Ok(DesktopSnapshot {
@@ -110,17 +163,39 @@ impl XcapCapturer {
     /// Captures and stitches all connected monitors into one virtual desktop snapshot.
     pub fn capture_virtual_desktop(&self) -> Result<DesktopSnapshot, CoreError> {
         let monitors = Monitor::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
-        if monitors.is_empty() {
+        let infos = monitors
+            .iter()
+            .map(Self::monitor_to_info)
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::capture_virtual_desktop_from_monitors(monitors.iter().zip(infos))
+    }
+
+    fn capture_virtual_desktop_from_monitors<'a>(
+        monitors: impl ExactSizeIterator<Item = (&'a Monitor, MonitorInfo)>,
+    ) -> Result<DesktopSnapshot, CoreError> {
+        if monitors.len() == 0 {
             return Err(CoreError::CaptureFailed("no monitors detected".into()));
         }
         let mut frames = Vec::with_capacity(monitors.len());
-        for monitor in &monitors {
-            let info = Self::monitor_to_info(monitor)?;
-            let image = Self::capture_monitor(monitor)?;
-            frames.push((info, image));
+        for (monitor, info) in monitors {
+            frames.push((info, Self::capture_monitor(monitor)?));
         }
         stitch_monitor_frames(&frames)
     }
+}
+
+#[cfg(target_os = "windows")]
+fn cursor_position() -> Option<(i32, i32)> {
+    use windows_sys::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
+
+    let mut point = POINT { x: 0, y: 0 };
+    let success = unsafe { GetCursorPos(&mut point) };
+    (success != 0).then_some((point.x, point.y))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cursor_position() -> Option<(i32, i32)> {
+    None
 }
 
 impl ScreenCapturer for XcapCapturer {
@@ -129,20 +204,34 @@ impl ScreenCapturer for XcapCapturer {
         monitors.iter().map(Self::monitor_to_info).collect()
     }
 
+    fn list_windows(&self) -> Result<Vec<WindowInfo>, CoreError> {
+        let windows = Window::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
+        Ok(windows.iter().filter_map(Self::window_to_info).collect())
+    }
+
     fn capture(&self, source: &CaptureSource) -> Result<CapturedImage, CoreError> {
         match source {
             CaptureSource::ActiveWindow => Self::capture_active_window(),
-            CaptureSource::PrimaryMonitor => {
+            CaptureSource::Window { id } => Self::capture_window_by_id(*id),
+            CaptureSource::PrimaryMonitor | CaptureSource::ActiveMonitor => {
                 let monitors =
                     Monitor::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
-                if monitors.is_empty() {
-                    return Err(CoreError::CaptureFailed("no monitors detected".into()));
+                let position = match source {
+                    CaptureSource::ActiveMonitor => cursor_position(),
+                    _ => None,
+                };
+                if let Some((x, y)) = position {
+                    let infos = monitors
+                        .iter()
+                        .map(Self::monitor_to_info)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let index = resolve_monitor_for_point(x, y, &infos)
+                        .and_then(|id| infos.iter().position(|info| info.id == id));
+                    if let Some(index) = index {
+                        return Self::capture_monitor(&monitors[index]);
+                    }
                 }
-                let target = monitors
-                    .iter()
-                    .find(|m| m.is_primary().unwrap_or(false))
-                    .unwrap_or(&monitors[0]);
-                Self::capture_monitor(target)
+                Self::capture_monitor(Self::primary_monitor(&monitors)?)
             }
             CaptureSource::Monitor { id } => {
                 let monitors =
@@ -163,6 +252,11 @@ impl ScreenCapturer for XcapCapturer {
                     .iter()
                     .map(Self::monitor_to_info)
                     .collect::<Result<_, _>>()?;
+                if region_across_monitors(*region, &infos) {
+                    let snapshot =
+                        Self::capture_virtual_desktop_from_monitors(monitors.iter().zip(infos))?;
+                    return snapshot.crop_region(*region);
+                }
                 let (monitor_id, local_region) = resolve_region_on_monitors(*region, &infos)?;
                 let target = monitors
                     .iter()
@@ -175,6 +269,105 @@ impl ScreenCapturer for XcapCapturer {
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct ScreenRect {
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+}
+
+impl ScreenRect {
+    fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
+        let left = i64::from(x);
+        let top = i64::from(y);
+        Self {
+            left,
+            top,
+            right: left + i64::from(width),
+            bottom: top + i64::from(height),
+        }
+    }
+
+    fn contains_point(self, x: i32, y: i32) -> bool {
+        (self.left..self.right).contains(&i64::from(x))
+            && (self.top..self.bottom).contains(&i64::from(y))
+    }
+
+    fn intersection(self, other: Self) -> Option<Self> {
+        let overlap = Self {
+            left: self.left.max(other.left),
+            top: self.top.max(other.top),
+            right: self.right.min(other.right),
+            bottom: self.bottom.min(other.bottom),
+        };
+        (overlap.left < overlap.right && overlap.top < overlap.bottom).then_some(overlap)
+    }
+
+    fn width(self) -> u32 {
+        (self.right - self.left) as u32
+    }
+
+    fn height(self) -> u32 {
+        (self.bottom - self.top) as u32
+    }
+
+    fn local_region(self, intersection: Self) -> Result<Region, CoreError> {
+        let x = i32::try_from(intersection.left - self.left).map_err(|_| {
+            CoreError::InvalidRegion("crop x offset exceeds coordinate range".into())
+        })?;
+        let y = i32::try_from(intersection.top - self.top).map_err(|_| {
+            CoreError::InvalidRegion("crop y offset exceeds coordinate range".into())
+        })?;
+        Region::new(x, y, intersection.width(), intersection.height())
+    }
+}
+
+impl From<Region> for ScreenRect {
+    fn from(region: Region) -> Self {
+        Self::new(region.x(), region.y(), region.width(), region.height())
+    }
+}
+
+/// Returns the monitor at the point, or the primary monitor if the point is outside all displays.
+pub fn resolve_monitor_for_point(x: i32, y: i32, monitors: &[MonitorInfo]) -> Option<MonitorId> {
+    monitors
+        .iter()
+        .find(|monitor| {
+            ScreenRect::new(monitor.x, monitor.y, monitor.width, monitor.height)
+                .contains_point(x, y)
+        })
+        .or_else(|| monitors.iter().find(|monitor| monitor.is_primary))
+        .map(|monitor| monitor.id)
+}
+
+/// Returns the first non-minimized window whose screen bounds contain the point.
+pub fn find_window_at_point(x: i32, y: i32, windows: &[WindowInfo]) -> Option<&WindowInfo> {
+    windows.iter().find(|window| {
+        !window.is_minimized
+            && ScreenRect::new(window.x, window.y, window.width, window.height).contains_point(x, y)
+    })
+}
+
+/// Returns whether a region intersects at least two monitors with positive area.
+pub fn region_across_monitors(region: Region, monitors: &[MonitorInfo]) -> bool {
+    let bounds = ScreenRect::from(region);
+    monitors
+        .iter()
+        .filter(|monitor| {
+            bounds
+                .intersection(ScreenRect::new(
+                    monitor.x,
+                    monitor.y,
+                    monitor.width,
+                    monitor.height,
+                ))
+                .is_some()
+        })
+        .nth(1)
+        .is_some()
 }
 
 /// Stitches per-monitor captures into a single virtual desktop RGBA image.
@@ -204,10 +397,18 @@ pub fn stitch_monitor_frames(
     let total_h = u32::try_from(max_y - i64::from(min_y))
         .map_err(|_| CoreError::CaptureFailed("invalid stitched height".into()))?;
 
-    let mut canvas = vec![0u8; (total_w as usize) * (total_h as usize) * 4];
+    let canvas_len = (total_w as usize)
+        .checked_mul(total_h as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| CoreError::CaptureFailed("stitched image is too large".into()))?;
+    let mut canvas = Vec::new();
+    canvas.try_reserve_exact(canvas_len).map_err(|error| {
+        CoreError::CaptureFailed(format!("could not allocate stitched image: {error}"))
+    })?;
+    canvas.resize(canvas_len, 0);
     for (info, img) in frames {
-        let dst_x = (info.x - min_x) as usize;
-        let dst_y = (info.y - min_y) as usize;
+        let dst_x = (i64::from(info.x) - i64::from(min_x)) as usize;
+        let dst_y = (i64::from(info.y) - i64::from(min_y)) as usize;
         let src_w = img.width() as usize;
         let src_h = img.height() as usize;
         let src = img.rgba();
@@ -236,31 +437,18 @@ pub fn resolve_region_on_monitors(
         return Err(CoreError::CaptureFailed("no monitors available".into()));
     }
 
-    let rx1 = i64::from(region.x());
-    let ry1 = i64::from(region.y());
-    let rx2 = rx1 + i64::from(region.width());
-    let ry2 = ry1 + i64::from(region.height());
-
-    let best = monitors
+    let bounds = ScreenRect::from(region);
+    let (id, monitor_bounds, intersection) = monitors
         .iter()
         .filter_map(|monitor| {
-            let mx1 = i64::from(monitor.x);
-            let my1 = i64::from(monitor.y);
-            let mx2 = mx1 + i64::from(monitor.width);
-            let my2 = my1 + i64::from(monitor.height);
-
-            let ix1 = rx1.max(mx1);
-            let iy1 = ry1.max(my1);
-            let ix2 = rx2.min(mx2);
-            let iy2 = ry2.min(my2);
-
-            if ix2 <= ix1 || iy2 <= iy1 {
-                return None;
-            }
-            let area = (ix2 - ix1) * (iy2 - iy1);
-            Some((monitor, ix1 - mx1, iy1 - my1, ix2 - ix1, iy2 - iy1, area))
+            let monitor_bounds =
+                ScreenRect::new(monitor.x, monitor.y, monitor.width, monitor.height);
+            let intersection = bounds.intersection(monitor_bounds)?;
+            Some((monitor.id, monitor_bounds, intersection))
         })
-        .max_by_key(|entry| entry.5)
+        .max_by_key(|(_, _, intersection)| {
+            u64::from(intersection.width()) * u64::from(intersection.height())
+        })
         .ok_or_else(|| {
             CoreError::InvalidRegion(format!(
                 "region ({},{},{}x{}) does not intersect any monitor",
@@ -271,8 +459,7 @@ pub fn resolve_region_on_monitors(
             ))
         })?;
 
-    let local = Region::new(best.1 as i32, best.2 as i32, best.3 as u32, best.4 as u32)?;
-    Ok((best.0.id, local))
+    Ok((id, monitor_bounds.local_region(intersection)?))
 }
 
 #[cfg(test)]
@@ -300,6 +487,118 @@ mod tests {
                 is_primary: false,
             },
         ]
+    }
+
+    #[test]
+    fn resolves_points_on_secondary_monitor_and_shared_edge() {
+        let mut monitors = sample_monitors();
+        monitors[1].y = -100;
+        let (primary, left) = (&monitors[0], &monitors[1]);
+
+        assert_eq!(
+            resolve_monitor_for_point(-1280, -100, &monitors),
+            Some(left.id)
+        );
+        assert_eq!(resolve_monitor_for_point(-1, 619, &monitors), Some(left.id));
+        assert_eq!(resolve_monitor_for_point(0, 0, &monitors), Some(primary.id));
+        assert_eq!(
+            resolve_monitor_for_point(-1, 620, &monitors),
+            Some(primary.id)
+        );
+    }
+
+    #[test]
+    fn falls_back_only_to_a_reported_primary_monitor() {
+        let monitors = sample_monitors();
+        assert_eq!(
+            resolve_monitor_for_point(1920, 0, &monitors),
+            Some(monitors[0].id)
+        );
+        assert_eq!(resolve_monitor_for_point(1920, 0, &monitors[1..]), None);
+        assert_eq!(resolve_monitor_for_point(0, 0, &[]), None);
+
+        let large = MonitorInfo {
+            x: i32::MAX - 1,
+            y: i32::MAX - 1,
+            width: 4,
+            height: 4,
+            ..monitors[1].clone()
+        };
+        let id = large.id;
+        assert_eq!(
+            resolve_monitor_for_point(i32::MAX, i32::MAX, &[large]),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn finds_first_containing_visible_window_in_list_order() {
+        let front = WindowInfo {
+            id: WindowId::new(1),
+            title: "Front".into(),
+            app_name: "Example".into(),
+            x: -10,
+            y: -20,
+            width: 10,
+            height: 10,
+            is_minimized: false,
+            is_focused: false,
+        };
+        let windows = [
+            WindowInfo {
+                id: WindowId::new(2),
+                is_minimized: true,
+                ..front.clone()
+            },
+            WindowInfo {
+                id: WindowId::new(3),
+                width: 0,
+                ..front.clone()
+            },
+            front.clone(),
+            WindowInfo {
+                id: WindowId::new(4),
+                is_focused: true,
+                width: 20,
+                height: 20,
+                ..front
+            },
+        ];
+
+        assert_eq!(find_window_at_point(-10, -20, &windows), Some(&windows[2]));
+        assert_eq!(find_window_at_point(-1, -11, &windows), Some(&windows[2]));
+        assert_eq!(find_window_at_point(0, -11, &windows), Some(&windows[3]));
+        assert_eq!(find_window_at_point(-1, -10, &windows), Some(&windows[3]));
+        assert_eq!(find_window_at_point(10, 0, &windows), None);
+        assert_eq!(find_window_at_point(-10, -20, &windows[..2]), None);
+        assert_eq!(find_window_at_point(-10, -20, &[]), None);
+    }
+
+    #[test]
+    fn detects_positive_area_overlap_with_multiple_monitors() {
+        let mut monitors = sample_monitors();
+        let cases = [
+            ((-1, 0, 2, 1), true),
+            ((-1, 719, 2, 1), true),
+            ((-1, 720, 2, 1), false),
+            ((-100, 0, 100, 100), false),
+            ((0, 0, 100, 100), false),
+            ((-2000, -2000, 50, 50), false),
+        ];
+        for ((x, y, width, height), expected) in cases {
+            let region = Region::new(x, y, width, height).expect("valid region");
+            assert_eq!(
+                region_across_monitors(region, &monitors),
+                expected,
+                "{region:?}"
+            );
+        }
+
+        let seam = Region::new(-1, 0, 2, 1).expect("valid region");
+        assert!(!region_across_monitors(seam, &[]));
+        assert!(!region_across_monitors(seam, &monitors[..1]));
+        monitors[1].width = 0;
+        assert!(!region_across_monitors(seam, &monitors));
     }
 
     #[test]
@@ -372,5 +671,75 @@ mod tests {
         assert_eq!(snapshot.image.height(), 2);
         assert_eq!(&snapshot.image.rgba()[0..4], &[255, 0, 0, 255]);
         assert_eq!(&snapshot.image.rgba()[8..12], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn crops_stitched_frames_in_global_coordinates_across_a_display_gap() {
+        let monitors = [
+            MonitorInfo {
+                id: MonitorId::new(1),
+                name: "Upper left".into(),
+                x: -3,
+                y: -2,
+                width: 2,
+                height: 2,
+                is_primary: false,
+            },
+            MonitorInfo {
+                id: MonitorId::new(2),
+                name: "Primary".into(),
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+                is_primary: true,
+            },
+        ];
+        let left = [
+            [1, 0, 0, 255],
+            [2, 0, 0, 255],
+            [3, 0, 0, 255],
+            [4, 0, 0, 255],
+        ];
+        let right = [
+            [0, 0, 1, 255],
+            [0, 0, 2, 255],
+            [0, 0, 3, 255],
+            [0, 0, 4, 255],
+        ];
+        let region = Region::new(-2, -1, 3, 3).expect("valid region");
+        assert!(region_across_monitors(region, &monitors));
+
+        let frames: Vec<_> = monitors
+            .into_iter()
+            .zip([left, right])
+            .map(|(monitor, pixels)| {
+                let image = CapturedImage::from_rgba(2, 2, pixels.concat()).expect("valid frame");
+                (monitor, image)
+            })
+            .collect();
+        let snapshot = stitch_monitor_frames(&frames).expect("stitch succeeds");
+        let crop = snapshot.crop_region(region).expect("crop succeeds");
+        let clear = [0, 0, 0, 0];
+        let expected = [
+            left[3], clear, clear, clear, clear, right[0], clear, clear, right[2],
+        ];
+
+        assert_eq!((snapshot.origin_x, snapshot.origin_y), (-3, -2));
+        assert_eq!((crop.width(), crop.height()), (3, 3));
+        assert_eq!(crop.rgba(), expected.concat());
+
+        let beyond_edges = Region::new(-4, -3, 7, 6).expect("valid region");
+        assert_eq!(
+            snapshot
+                .crop_region(beyond_edges)
+                .expect("crop clips to desktop"),
+            snapshot.image
+        );
+        let outside = Region::new(2, 0, 1, 1).expect("valid region");
+        assert!(matches!(
+            snapshot.crop_region(outside),
+            Err(CoreError::InvalidRegion(_))
+        ));
     }
 }

@@ -10,3 +10,6 @@ description = "Cross-platform OS screen capture adapter for ShareX in Rust."
 [dependencies]
 sharex-core = { path = "../sharex-core" }
 xcap.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
