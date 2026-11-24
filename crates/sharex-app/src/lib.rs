@@ -5,6 +5,7 @@ pub mod gui;
 pub mod hotkeys;
 pub mod region_overlay;
 pub mod theme;
+pub mod win_focus;
 
 use chrono::Utc;
 use clap::Parser;

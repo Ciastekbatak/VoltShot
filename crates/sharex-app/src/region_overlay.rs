@@ -1,10 +1,13 @@
 use crate::editor_ui::{paint_annotation, paint_arrow, paint_ellipse_stroke, to_egui_color};
+use crate::win_focus::OverlayFocusGuard;
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke, Vec2,
 };
 use sharex_capture::DesktopSnapshot;
 use sharex_core::{CapturedImage, Region};
 use sharex_editor::{AnnotationKind, EditorDocument, Point, RectF, RgbaColor, SHAREX_PALETTE};
+
+const OVERLAY_WINDOW_TITLE: &str = "ShareX Region Capture";
 
 /// Result produced by one frame of the interactive ShareX region capture overlay.
 pub enum OverlayOutcome {
@@ -83,6 +86,7 @@ pub struct RegionOverlayState {
     origin_y: i32,
     document: EditorDocument,
     texture: egui::TextureHandle,
+    focus_guard: OverlayFocusGuard,
     active_tool: OverlayTool,
     selection: Option<RectF>,
     auto_capture_on_drag: bool,
@@ -96,6 +100,7 @@ pub struct RegionOverlayState {
 
 impl RegionOverlayState {
     pub fn open(ctx: &egui::Context, snapshot: DesktopSnapshot) -> Self {
+        let focus_guard = OverlayFocusGuard::capture_current_foreground();
         let color_img = egui::ColorImage::from_rgba_unmultiplied(
             [
                 snapshot.image.width() as usize,
@@ -113,6 +118,7 @@ impl RegionOverlayState {
             origin_y: snapshot.origin_y,
             document: EditorDocument::new(snapshot.image),
             texture,
+            focus_guard,
             active_tool: OverlayTool::Region,
             selection: None,
             auto_capture_on_drag: true,
@@ -125,6 +131,10 @@ impl RegionOverlayState {
         }
     }
 
+    pub fn restore_previous_focus(&self) {
+        self.focus_guard.restore_previous();
+    }
+
     pub fn show(&mut self, ctx: &egui::Context) -> OverlayOutcome {
         let viewport_id = egui::ViewportId::from_hash_of("sharex_region_capture_overlay");
         let ppp = ctx.pixels_per_point().max(1.0);
@@ -132,7 +142,7 @@ impl RegionOverlayState {
         let img_h = self.document.base_image().height() as f32;
 
         let builder = egui::ViewportBuilder::default()
-            .with_title("ShareX Region Capture")
+            .with_title(OVERLAY_WINDOW_TITLE)
             .with_decorations(false)
             .with_always_on_top()
             .with_resizable(false)
@@ -143,6 +153,7 @@ impl RegionOverlayState {
         let mut outcome = OverlayOutcome::Pending;
 
         ctx.show_viewport_immediate(viewport_id, builder, |overlay_ctx, _class| {
+            self.focus_guard.enforce_overlay_focus(OVERLAY_WINDOW_TITLE);
             let typing = overlay_ctx.wants_keyboard_input();
 
             if overlay_ctx.input(|i| i.viewport().close_requested())

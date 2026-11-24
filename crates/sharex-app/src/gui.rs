@@ -1,11 +1,11 @@
 use crate::clipboard::SystemClipboard;
 use crate::editor_ui::{EditorAction, EditorViewState};
-use crate::hotkeys::{HotkeyRuntime, HotkeyStatus};
+use crate::hotkeys::{HotkeyRuntime, HotkeyStatus, TriggeredHotkey};
 use crate::region_overlay::{OverlayOutcome, RegionOverlayState};
 use crate::theme::{SharexPalette, apply_sharex_theme, palette};
 use chrono::Utc;
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
-use sharex_capture::XcapCapturer;
+use sharex_capture::{DesktopSnapshot, XcapCapturer};
 use sharex_core::{
     AppConfig, CaptureId, CapturePipeline, CaptureSource, CapturedImage, ClipboardSink,
     EmptyUploaderLookup, FileNameContext, FileNamePattern, HistoryEntry, HistoryRepository,
@@ -126,13 +126,17 @@ impl SharexGuiApp {
             .unwrap_or_else(|| "Unbound".into())
     }
 
-    fn trigger_hotkey_action(&mut self, ctx: &egui::Context, action: HotkeyAction) {
-        match action {
+    fn trigger_hotkey_event(&mut self, ctx: &egui::Context, event: TriggeredHotkey) {
+        match event.action {
             HotkeyAction::CaptureFullscreen => {
                 self.capture_source(ctx, CaptureSource::PrimaryMonitor);
             }
             HotkeyAction::CaptureRegion => {
-                self.start_region_overlay(ctx);
+                if let Some(snapshot) = event.pre_snapshot {
+                    self.open_region_overlay_with_snapshot(ctx, snapshot);
+                } else {
+                    self.start_region_overlay(ctx);
+                }
             }
             HotkeyAction::CaptureActiveWindow => {
                 self.capture_source(ctx, CaptureSource::ActiveWindow);
@@ -165,13 +169,20 @@ impl SharexGuiApp {
         }
     }
 
+    fn open_region_overlay_with_snapshot(
+        &mut self,
+        ctx: &egui::Context,
+        snapshot: DesktopSnapshot,
+    ) {
+        self.overlay = Some(RegionOverlayState::open(ctx, snapshot));
+        self.status_line =
+            "Region capture active: drag to select, annotate from top bar, Esc to cancel.".into();
+    }
+
     fn start_region_overlay(&mut self, ctx: &egui::Context) {
         match self.capturer.capture_primary_snapshot() {
             Ok(snapshot) => {
-                self.overlay = Some(RegionOverlayState::open(ctx, snapshot));
-                self.status_line =
-                    "Region capture active: drag to select, Enter for fullscreen, Esc to cancel."
-                        .into();
+                self.open_region_overlay_with_snapshot(ctx, snapshot);
             }
             Err(err) => {
                 self.status_line = format!("Region capture failed: {err}");
@@ -438,7 +449,13 @@ impl SharexGuiApp {
             &self.hotkey_hint(HotkeyAction::CaptureLastRegion),
             p,
         ) {
-            self.trigger_hotkey_action(ctx, HotkeyAction::CaptureLastRegion);
+            self.trigger_hotkey_event(
+                ctx,
+                TriggeredHotkey {
+                    action: HotkeyAction::CaptureLastRegion,
+                    pre_snapshot: None,
+                },
+            );
         }
 
         ui.add_space(4.0);
@@ -1060,15 +1077,17 @@ impl eframe::App for SharexGuiApp {
         }
 
         let pending_actions = self.hotkeys.poll_actions();
-        for action in pending_actions {
-            self.trigger_hotkey_action(ctx, action);
+        for event in pending_actions {
+            self.trigger_hotkey_event(ctx, event);
         }
 
         if let Some(overlay) = self.overlay.as_mut() {
             match overlay.show(ctx) {
                 OverlayOutcome::Pending => {}
                 OverlayOutcome::Cancelled => {
-                    self.overlay = None;
+                    if let Some(closing) = self.overlay.take() {
+                        closing.restore_previous_focus();
+                    }
                     self.status_line = "Region capture cancelled.".into();
                 }
                 OverlayOutcome::Captured {
@@ -1076,9 +1095,10 @@ impl eframe::App for SharexGuiApp {
                     global_region,
                     open_in_editor,
                 } => {
-                    self.overlay = None;
+                    let closing = self.overlay.take();
                     self.config.last_region = Some(global_region);
                     self.persist_config_silent();
+                    let will_open_editor = open_in_editor || self.config.pipeline.open_in_editor;
                     self.commit_captured_image(
                         ctx,
                         image,
@@ -1087,6 +1107,9 @@ impl eframe::App for SharexGuiApp {
                         },
                         open_in_editor,
                     );
+                    if !will_open_editor && let Some(prev) = closing {
+                        prev.restore_previous_focus();
+                    }
                 }
             }
         }

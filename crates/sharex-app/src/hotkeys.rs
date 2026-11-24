@@ -7,10 +7,18 @@ pub enum HotkeyStatus {
     Error(String),
 }
 
+/// Global hotkey event delivered to the GUI loop, optionally carrying a pre-focus screen snapshot.
+pub struct TriggeredHotkey {
+    pub action: sharex_core::HotkeyAction,
+    pub pre_snapshot: Option<sharex_capture::DesktopSnapshot>,
+}
+
 #[cfg(target_os = "windows")]
 mod platform {
-    use super::HotkeyStatus;
+    use super::{HotkeyStatus, TriggeredHotkey};
+    use crate::win_focus;
     use eframe::egui;
+    use sharex_capture::XcapCapturer;
     use sharex_core::{HotkeyAction, HotkeyBinding, HotkeyCombo, KeyCode, KeyModifiers};
     use std::collections::HashMap;
     use std::ptr;
@@ -37,7 +45,7 @@ mod platform {
         thread_id: u32,
         desired: Arc<Mutex<Vec<HotkeyBinding>>>,
         statuses: Arc<Mutex<HashMap<String, HotkeyStatus>>>,
-        action_rx: Receiver<HotkeyAction>,
+        action_rx: Receiver<TriggeredHotkey>,
     }
 
     impl HotkeyRuntime {
@@ -85,10 +93,10 @@ mod platform {
             }
         }
 
-        pub fn poll_actions(&self) -> Vec<HotkeyAction> {
+        pub fn poll_actions(&self) -> Vec<TriggeredHotkey> {
             let mut actions = Vec::new();
-            while let Ok(action) = self.action_rx.try_recv() {
-                actions.push(action);
+            while let Ok(ev) = self.action_rx.try_recv() {
+                actions.push(ev);
             }
             actions
         }
@@ -127,7 +135,7 @@ mod platform {
         ctx: egui::Context,
         desired: Arc<Mutex<Vec<HotkeyBinding>>>,
         statuses: Arc<Mutex<HashMap<String, HotkeyStatus>>>,
-        action_tx: Sender<HotkeyAction>,
+        action_tx: Sender<TriggeredHotkey>,
         ready_tx: Sender<u32>,
     ) {
         let mut msg: MSG = unsafe { std::mem::zeroed() };
@@ -149,8 +157,23 @@ mod platform {
                 WM_HOTKEY => {
                     let id = msg.wParam as i32;
                     if let Some(&action) = registered.get(&id) {
-                        let _ = action_tx.send(action);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        win_focus::allow_self_foreground();
+                        let pre_snapshot = if action == HotkeyAction::CaptureRegion {
+                            let snap = XcapCapturer::new().capture_primary_snapshot().ok();
+                            win_focus::release_cursor_clip();
+                            snap
+                        } else {
+                            None
+                        };
+                        let _ = action_tx.send(TriggeredHotkey {
+                            action,
+                            pre_snapshot,
+                        });
+                        if action == HotkeyAction::CaptureRegion
+                            || action == HotkeyAction::OpenEditor
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        }
                         ctx.request_repaint();
                     }
                 }
@@ -330,7 +353,7 @@ mod platform {
 
 #[cfg(not(target_os = "windows"))]
 mod platform {
-    use super::HotkeyStatus;
+    use super::{HotkeyStatus, TriggeredHotkey};
     use eframe::egui;
     use global_hotkey::{
         GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
@@ -436,11 +459,14 @@ mod platform {
             }
         }
 
-        pub fn poll_actions(&self) -> Vec<HotkeyAction> {
+        pub fn poll_actions(&self) -> Vec<TriggeredHotkey> {
             let mut actions = Vec::new();
             while let Ok(id) = self.rx.try_recv() {
                 if let Some(action) = self.id_to_action.get(&id).copied() {
-                    actions.push(action);
+                    actions.push(TriggeredHotkey {
+                        action,
+                        pre_snapshot: None,
+                    });
                 }
             }
             actions
