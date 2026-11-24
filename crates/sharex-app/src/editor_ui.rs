@@ -573,7 +573,10 @@ impl EditorViewState {
                         current: pt,
                     });
                 }
-                EditorTool::Text | EditorTool::StepNumber => {}
+                EditorTool::Text
+                | EditorTool::StepNumber
+                | EditorTool::ImageOverlay
+                | EditorTool::SmartEraser => {}
             }
         }
 
@@ -1172,6 +1175,7 @@ pub(crate) fn paint_annotation(
                 painter.rect_filled(rect, 0.0, dim);
             }
         }
+        AnnotationKind::ImageOverlay { .. } | AnnotationKind::SmartEraser { .. } => {}
     }
 
     if selected {

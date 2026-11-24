@@ -60,6 +60,10 @@ impl Point {
     pub const fn new(x: f32, y: f32) -> Self {
         Self { x, y }
     }
+
+    pub(crate) fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite()
+    }
 }
 
 /// Normalized image-space rectangle (`width >= 0`, `height >= 0`).
@@ -108,7 +112,7 @@ impl RectF {
         }
     }
 
-    fn is_valid(self) -> bool {
+    pub(crate) fn is_valid(self) -> bool {
         self.x.is_finite()
             && self.y.is_finite()
             && self.width >= 0.0
@@ -136,11 +140,13 @@ pub enum EditorTool {
     SpeechBalloon,
     Magnifier,
     Spotlight,
+    ImageOverlay,
+    SmartEraser,
     Crop,
 }
 
 impl EditorTool {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::Select,
         Self::Rectangle,
         Self::FilledRectangle,
@@ -156,6 +162,8 @@ impl EditorTool {
         Self::SpeechBalloon,
         Self::Magnifier,
         Self::Spotlight,
+        Self::ImageOverlay,
+        Self::SmartEraser,
         Self::Crop,
     ];
 
@@ -176,6 +184,8 @@ impl EditorTool {
             Self::SpeechBalloon => "Balloon",
             Self::Magnifier => "Magnifier",
             Self::Spotlight => "Spotlight",
+            Self::ImageOverlay => "Image Overlay",
+            Self::SmartEraser => "Smart Eraser",
             Self::Crop => "Crop",
         }
     }
@@ -197,6 +207,8 @@ impl EditorTool {
             Self::SpeechBalloon => "Q",
             Self::Magnifier => "M",
             Self::Spotlight => "S",
+            Self::ImageOverlay => "I",
+            Self::SmartEraser => "X",
             Self::Crop => "C",
         }
     }
@@ -278,6 +290,37 @@ pub enum AnnotationKind {
         rect: RectF,
         dim_alpha: u8,
     },
+    ImageOverlay {
+        rect: RectF,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        opacity: f32,
+    },
+    SmartEraser {
+        points: Vec<Point>,
+        stroke_width: f32,
+        sample_color: Option<RgbaColor>,
+    },
+}
+
+/// A corner of the annotation's bounding rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResizeHandle {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl ResizeHandle {
+    fn is_left(self) -> bool {
+        matches!(self, Self::TopLeft | Self::BottomLeft)
+    }
+
+    fn is_top(self) -> bool {
+        matches!(self, Self::TopLeft | Self::TopRight)
+    }
 }
 
 /// Identified annotation layer inside an `EditorDocument`.
@@ -294,7 +337,8 @@ impl Annotation {
             | AnnotationKind::Ellipse { rect, .. }
             | AnnotationKind::Pixelate { rect, .. }
             | AnnotationKind::Blur { rect, .. }
-            | AnnotationKind::Spotlight { rect, .. } => *rect,
+            | AnnotationKind::Spotlight { rect, .. }
+            | AnnotationKind::ImageOverlay { rect, .. } => *rect,
             AnnotationKind::SpeechBalloon { rect, tail, .. } => RectF::from_points(
                 Point::new(rect.x.min(tail.x), rect.y.min(tail.y)),
                 Point::new(rect.right().max(tail.x), rect.bottom().max(tail.y)),
@@ -303,7 +347,8 @@ impl Annotation {
                 RectF::from_points(*start, *end)
             }
             AnnotationKind::Freehand { points, .. }
-            | AnnotationKind::Highlighter { points, .. } => {
+            | AnnotationKind::Highlighter { points, .. }
+            | AnnotationKind::SmartEraser { points, .. } => {
                 if points.is_empty() {
                     return RectF {
                         x: 0.0,
@@ -365,7 +410,8 @@ impl Annotation {
             | AnnotationKind::Ellipse { rect, .. }
             | AnnotationKind::Pixelate { rect, .. }
             | AnnotationKind::Blur { rect, .. }
-            | AnnotationKind::Spotlight { rect, .. } => {
+            | AnnotationKind::Spotlight { rect, .. }
+            | AnnotationKind::ImageOverlay { rect, .. } => {
                 *rect = rect.translate(dx, dy);
             }
             AnnotationKind::SpeechBalloon { rect, tail, .. } => {
@@ -380,7 +426,8 @@ impl Annotation {
                 end.y += dy;
             }
             AnnotationKind::Freehand { points, .. }
-            | AnnotationKind::Highlighter { points, .. } => {
+            | AnnotationKind::Highlighter { points, .. }
+            | AnnotationKind::SmartEraser { points, .. } => {
                 for p in points {
                     p.x += dx;
                     p.y += dy;
@@ -398,13 +445,144 @@ impl Annotation {
         }
     }
 
-    fn resize(&mut self, new_rect: RectF) -> bool {
+    /// Returns the four corners of the annotation's bounds in image coordinates.
+    pub fn resize_handles(&self) -> [(ResizeHandle, Point); 4] {
+        let rect = self.bounds();
+        [
+            (ResizeHandle::TopLeft, Point::new(rect.x, rect.y)),
+            (ResizeHandle::TopRight, Point::new(rect.right(), rect.y)),
+            (ResizeHandle::BottomLeft, Point::new(rect.x, rect.bottom())),
+            (
+                ResizeHandle::BottomRight,
+                Point::new(rect.right(), rect.bottom()),
+            ),
+        ]
+    }
+
+    fn supports_resize(&self) -> bool {
+        !matches!(
+            self.kind,
+            AnnotationKind::Text { .. }
+                | AnnotationKind::Freehand { .. }
+                | AnnotationKind::Highlighter { .. }
+                | AnnotationKind::SmartEraser { .. }
+        )
+    }
+
+    fn resize_corner(&mut self, handle: ResizeHandle, target: Point) -> bool {
+        let old = self.bounds();
+        if !self.supports_resize() || !old.is_valid() || !target.is_finite() {
+            return false;
+        }
+
+        let left = handle.is_left();
+        let top = handle.is_top();
+        let anchor = Point::new(
+            if left { old.right() } else { old.x },
+            if top { old.bottom() } else { old.y },
+        );
+        let corner = Point::new(
+            if left { old.x } else { old.right() },
+            if top { old.y } else { old.bottom() },
+        );
+        if target == corner {
+            return false;
+        }
+        let horizontal = if left { -1.0 } else { 1.0 };
+        let vertical = if top { -1.0 } else { 1.0 };
+
+        if let AnnotationKind::Line { start, end, .. } | AnnotationKind::Arrow { start, end, .. } =
+            &mut self.kind
+        {
+            if !start.is_finite() || !end.is_finite() {
+                return false;
+            }
+            let start_moves = (start.x - corner.x).hypot(start.y - corner.y)
+                <= (end.x - corner.x).hypot(end.y - corner.y);
+            let resize_axis = |start: f32, end: f32, fixed: f32, target: f32, direction: f32| {
+                if start == end {
+                    return if start_moves {
+                        (target, fixed)
+                    } else {
+                        (fixed, target)
+                    };
+                }
+                let moving = fixed + direction * ((target - fixed) * direction).max(1.0);
+                if (start < end) == (direction < 0.0) {
+                    (moving, fixed)
+                } else {
+                    (fixed, moving)
+                }
+            };
+            let (start_x, end_x) = resize_axis(start.x, end.x, anchor.x, target.x, horizontal);
+            let (start_y, end_y) = resize_axis(start.y, end.y, anchor.y, target.y, vertical);
+            let new_start = Point::new(start_x, start_y);
+            let new_end = Point::new(end_x, end_y);
+            let new = RectF::from_points(new_start, new_end);
+            if !new.is_valid()
+                || new.width.hypot(new.height) < 1.0
+                || (*start, *end) == (new_start, new_end)
+            {
+                return false;
+            }
+            *start = new_start;
+            *end = new_end;
+            return true;
+        }
+
+        let dx = (target.x - anchor.x) * horizontal;
+        let dy = (target.y - anchor.y) * vertical;
+        let (width, height) = match &self.kind {
+            AnnotationKind::Magnifier { .. } | AnnotationKind::StepNumber { .. } => {
+                let side = (dx * 0.5 + dy * 0.5).max(1.0);
+                (side, side)
+            }
+            AnnotationKind::SpeechBalloon { rect, .. } => (
+                dx.max(old.width / rect.width.max(1.0)).max(1.0),
+                dy.max(old.height / rect.height.max(1.0)).max(1.0),
+            ),
+            _ => (dx.max(1.0), dy.max(1.0)),
+        };
+        let moving = Point::new(anchor.x + horizontal * width, anchor.y + vertical * height);
+        let new = RectF::from_points(anchor, moving);
+        if !new.is_valid() || new.width < 1.0 || new.height < 1.0 || new == old {
+            return false;
+        }
+
+        if let AnnotationKind::SpeechBalloon { rect, .. } = &self.kind {
+            let scale_axis = |start: f32, length: f32, from: f32, span: f32, to: f32, size: f32| {
+                if span > 0.0 {
+                    (
+                        to + (start - from) / span * size,
+                        (length / span * size).max(1.0),
+                    )
+                } else {
+                    (to, size)
+                }
+            };
+            let (x, width) = scale_axis(rect.x, rect.width, old.x, old.width, new.x, new.width);
+            let (y, height) = scale_axis(rect.y, rect.height, old.y, old.height, new.y, new.height);
+            return self.resize_to_rect(RectF {
+                x,
+                y,
+                width,
+                height,
+            });
+        }
+        self.resize_to_rect(new)
+    }
+
+    fn resize_to_rect(&mut self, new_rect: RectF) -> bool {
+        if !new_rect.is_valid() || new_rect.width < 1.0 || new_rect.height < 1.0 {
+            return false;
+        }
         match &mut self.kind {
             AnnotationKind::Rectangle { rect, .. }
             | AnnotationKind::Ellipse { rect, .. }
             | AnnotationKind::Pixelate { rect, .. }
             | AnnotationKind::Blur { rect, .. }
-            | AnnotationKind::Spotlight { rect, .. } => {
+            | AnnotationKind::Spotlight { rect, .. }
+            | AnnotationKind::ImageOverlay { rect, .. } => {
                 if *rect == new_rect {
                     return false;
                 }
@@ -421,13 +599,18 @@ impl Annotation {
                         offset
                     }
                 }
-                *tail = Point::new(
+                let new_tail = Point::new(
                     new_rect.x + scale_offset(tail.x - rect.x, rect.width, new_rect.width),
                     new_rect.y + scale_offset(tail.y - rect.y, rect.height, new_rect.height),
                 );
+                if !new_tail.is_finite() {
+                    return false;
+                }
+                *tail = new_tail;
                 *rect = new_rect;
             }
-            AnnotationKind::Magnifier { center, radius, .. } => {
+            AnnotationKind::Magnifier { center, radius, .. }
+            | AnnotationKind::StepNumber { center, radius, .. } => {
                 let new_center = Point::new(
                     new_rect.x + new_rect.width * 0.5,
                     new_rect.y + new_rect.height * 0.5,
@@ -569,19 +752,56 @@ impl EditorDocument {
         }
     }
 
-    /// Resizes an annotation in one undoable edit. For a balloon, the rectangle is its body.
-    pub fn resize_annotation(&mut self, id: u64, new_rect: RectF) -> bool {
-        if !new_rect.is_valid() {
-            return false;
+    /// Finds the nearest resize handle within the given image-space distance.
+    pub fn hit_test_resize_handle(
+        &self,
+        id: u64,
+        point: Point,
+        tolerance: f32,
+    ) -> Option<ResizeHandle> {
+        if !point.is_finite() || !tolerance.is_finite() || tolerance < 0.0 {
+            return None;
         }
+        let annotation = self.annotations.iter().find(|item| item.id == id)?;
+        if !annotation.supports_resize() || !annotation.bounds().is_valid() {
+            return None;
+        }
+        annotation
+            .resize_handles()
+            .into_iter()
+            .map(|(handle, corner)| (handle, (point.x - corner.x).hypot(point.y - corner.y)))
+            .filter(|&(_, distance)| distance <= tolerance)
+            .min_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(handle, _)| handle)
+    }
+
+    /// Drags a corner while anchoring its opposite corner, as one undoable edit.
+    pub fn resize_annotation(
+        &mut self,
+        id: u64,
+        handle: ResizeHandle,
+        target_point: Point,
+    ) -> bool {
+        self.apply_resize(id, |annotation| {
+            annotation.resize_corner(handle, target_point)
+        })
+    }
+
+    /// Resizes a rectangular or circular annotation to explicit bounds in one undoable edit.
+    /// For a balloon, the rectangle is its body.
+    pub fn resize_annotation_to_rect(&mut self, id: u64, new_rect: RectF) -> bool {
+        self.apply_resize(id, |annotation| annotation.resize_to_rect(new_rect))
+    }
+
+    fn apply_resize(&mut self, id: u64, resize: impl FnOnce(&mut Annotation) -> bool) -> bool {
         let Some(index) = self.annotations.iter().position(|item| item.id == id) else {
             return false;
         };
         let mut resized = self.annotations[index].clone();
-        if !resized.resize(new_rect) {
+        if !resize(&mut resized) || !resized.bounds().is_valid() {
             return false;
         }
-        self.begin_move_undo();
+        self.record_undo();
         self.annotations[index] = resized;
         true
     }
@@ -738,8 +958,8 @@ mod tests {
             radius: 3.0,
         });
         let before = source.annotations().to_vec();
-        assert!(source.resize_annotation(balloon, resized));
-        assert!(!source.resize_annotation(balloon, resized));
+        assert!(source.resize_annotation_to_rect(balloon, resized));
+        assert!(!source.resize_annotation_to_rect(balloon, resized));
         assert!(matches!(
             &source.annotations()[0].kind,
             AnnotationKind::SpeechBalloon { rect, tail, .. }
@@ -807,7 +1027,7 @@ mod tests {
             },
         ] {
             let id = doc.push_annotation(kind);
-            assert!(doc.resize_annotation(id, new_rect));
+            assert!(doc.resize_annotation_to_rect(id, new_rect));
             assert_eq!(doc.annotations().last().unwrap().bounds(), new_rect);
         }
         let line = doc.push_annotation(AnnotationKind::Line {
@@ -816,10 +1036,161 @@ mod tests {
             color: RgbaColor::RED,
             stroke_width: 1.0,
         });
-        assert!(!doc.resize_annotation(line, new_rect));
-        assert!(!doc.resize_annotation(999, new_rect));
+        assert!(!doc.resize_annotation_to_rect(line, new_rect));
+        assert!(!doc.resize_annotation_to_rect(999, new_rect));
         assert!(doc.undo());
         assert_eq!(doc.annotations().len(), 6);
+    }
+
+    #[test]
+    fn corner_handles_resize_shapes_and_round_trip_through_history() {
+        let upper_left = Point::new(4.0, 6.0);
+        let bottom_right = Point::new(14.0, 16.0);
+        let rect = RectF::from_points(upper_left, bottom_right);
+        let target = Point::new(24.0, 26.0);
+        let color = RgbaColor::RED;
+        let kinds = [
+            AnnotationKind::Rectangle {
+                rect,
+                color,
+                stroke_width: 1.0,
+                filled: false,
+            },
+            AnnotationKind::Ellipse {
+                rect,
+                color,
+                stroke_width: 1.0,
+            },
+            AnnotationKind::SpeechBalloon {
+                rect: RectF {
+                    height: 7.0,
+                    ..rect
+                },
+                tail: Point::new(9.0, 16.0),
+                text: "Note".into(),
+                fill: RgbaColor::WHITE,
+                border: color,
+                text_color: RgbaColor::BLACK,
+                font_size: 12.0,
+            },
+            AnnotationKind::Magnifier {
+                center: Point::new(9.0, 11.0),
+                radius: 5.0,
+                zoom: 2.0,
+                border_color: color,
+            },
+            AnnotationKind::Spotlight {
+                rect,
+                dim_alpha: 128,
+            },
+            AnnotationKind::Arrow {
+                start: bottom_right,
+                end: upper_left,
+                color,
+                stroke_width: 1.0,
+            },
+            AnnotationKind::Line {
+                start: upper_left,
+                end: bottom_right,
+                color,
+                stroke_width: 1.0,
+            },
+            AnnotationKind::ImageOverlay {
+                rect,
+                width: 1,
+                height: 1,
+                rgba: vec![1, 2, 3, 4],
+                opacity: 1.0,
+            },
+        ];
+        for kind in kinds {
+            let mut doc = document();
+            let id = doc.push_annotation(kind.clone());
+            assert_eq!(
+                doc.annotations()[0].resize_handles(),
+                [
+                    (ResizeHandle::TopLeft, upper_left),
+                    (ResizeHandle::TopRight, Point::new(14.0, 6.0)),
+                    (ResizeHandle::BottomLeft, Point::new(4.0, 16.0)),
+                    (ResizeHandle::BottomRight, bottom_right),
+                ]
+            );
+            for (handle, point) in doc.annotations()[0].resize_handles() {
+                assert_eq!(doc.hit_test_resize_handle(id, point, 20.0), Some(handle));
+            }
+            assert_eq!(
+                doc.hit_test_resize_handle(id, Point::new(9.0, 11.0), 2.0),
+                None
+            );
+            assert_eq!(doc.hit_test_resize_handle(id + 1, bottom_right, 2.0), None);
+            assert!(doc.resize_annotation(id, ResizeHandle::BottomRight, target));
+            assert_eq!(
+                doc.annotations()[0].bounds(),
+                RectF::from_points(upper_left, target)
+            );
+            let resized = doc.annotations()[0].kind.clone();
+            match &resized {
+                AnnotationKind::Arrow { start, end, .. } => {
+                    assert_eq!((*start, *end), (target, upper_left))
+                }
+                AnnotationKind::Line { start, end, .. } => {
+                    assert_eq!((*start, *end), (upper_left, target))
+                }
+                AnnotationKind::Magnifier { center, radius, .. } => {
+                    assert_eq!((*center, *radius), (Point::new(14.0, 16.0), 10.0))
+                }
+                AnnotationKind::SpeechBalloon { rect, tail, .. } => {
+                    assert_eq!((rect.height, *tail), (14.0, Point::new(14.0, 26.0)))
+                }
+                _ => {}
+            }
+            assert!(!doc.resize_annotation(id, ResizeHandle::BottomRight, target));
+            assert!(!doc.resize_annotation(
+                id,
+                ResizeHandle::BottomRight,
+                Point::new(f32::NAN, 0.0)
+            ));
+            assert!(doc.undo());
+            assert_eq!(doc.annotations()[0].kind, kind);
+            assert!(doc.redo());
+            assert_eq!(doc.annotations()[0].kind, resized);
+        }
+    }
+
+    #[test]
+    fn corner_resize_clamps_crossed_corners_and_handles_flat_lines() {
+        let mut doc = document();
+        let rect = RectF::from_points(Point::new(2.0, 3.0), Point::new(10.0, 11.0));
+        let shape = doc.push_annotation(AnnotationKind::Ellipse {
+            rect,
+            color: RgbaColor::RED,
+            stroke_width: 1.0,
+        });
+        assert!(doc.resize_annotation(shape, ResizeHandle::TopLeft, Point::new(25.0, 30.0)));
+        assert_eq!(
+            doc.annotations()[0].bounds(),
+            RectF::from_points(Point::new(9.0, 10.0), Point::new(10.0, 11.0))
+        );
+
+        let line = doc.push_annotation(AnnotationKind::Line {
+            start: Point::new(9.0, 5.0),
+            end: Point::new(1.0, 5.0),
+            color: RgbaColor::RED,
+            stroke_width: 1.0,
+        });
+        let handle = doc
+            .hit_test_resize_handle(line, Point::new(9.0, 5.0), 0.0)
+            .unwrap();
+        assert!(doc.resize_annotation(line, handle, Point::new(0.0, 5.0)));
+        assert_eq!(
+            doc.annotations()[1].bounds(),
+            RectF::from_points(Point::new(1.0, 5.0), Point::new(2.0, 5.0))
+        );
+        assert!(doc.resize_annotation(line, handle, Point::new(5.0, 9.0)));
+        assert!(
+            matches!(doc.annotations()[1].kind, AnnotationKind::Line { start, end, .. }
+            if start == Point::new(5.0, 9.0) && end == Point::new(1.0, 5.0))
+        );
     }
 
     #[test]

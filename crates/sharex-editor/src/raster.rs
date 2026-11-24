@@ -1,4 +1,4 @@
-use crate::font::glyph_5x7;
+use crate::font::{TextFont, glyph_5x7};
 use crate::model::{AnnotationKind, EditorDocument, Point, RectF, RgbaColor};
 use sharex_core::{CapturedImage, CoreError};
 
@@ -52,6 +52,81 @@ impl Canvas {
                 self.blend_pixel(x, y, color);
             }
         }
+    }
+
+    fn draw_image_overlay(
+        &mut self,
+        rect: RectF,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        opacity: f32,
+    ) {
+        let (width, height) = (width as usize, height as usize);
+        let expected = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4));
+        if width == 0
+            || height == 0
+            || expected != Some(rgba.len())
+            || !rect.is_valid()
+            || rect.width <= 0.0
+            || rect.height <= 0.0
+            || !opacity.is_finite()
+            || opacity <= 0.0
+        {
+            return;
+        }
+        let opacity = opacity.min(1.0);
+        let left = ((rect.x - 0.5).ceil() as i32).max(0);
+        let right = ((rect.right() - 0.5).ceil() as i32).min(self.width);
+        let top = ((rect.y - 0.5).ceil() as i32).max(0);
+        let bottom = ((rect.bottom() - 0.5).ceil() as i32).min(self.height);
+        for y in top..bottom {
+            let src_y = (((y as f32 + 0.5 - rect.y) / rect.height * height as f32) as usize)
+                .min(height - 1);
+            for x in left..right {
+                let src_x = (((x as f32 + 0.5 - rect.x) / rect.width * width as f32) as usize)
+                    .min(width - 1);
+                let index = (src_y * width + src_x) * 4;
+                let alpha = (f32::from(rgba[index + 3]) * opacity).round() as u8;
+                self.blend_pixel(
+                    x,
+                    y,
+                    RgbaColor::rgba(rgba[index], rgba[index + 1], rgba[index + 2], alpha),
+                );
+            }
+        }
+    }
+
+    fn draw_smart_eraser(
+        &mut self,
+        points: &[Point],
+        stroke_width: f32,
+        sample_color: Option<RgbaColor>,
+    ) {
+        let Some(first) = points.first() else {
+            return;
+        };
+        if !stroke_width.is_finite()
+            || stroke_width <= 0.0
+            || points.iter().any(|point| !point.is_finite())
+            || self.width <= 0
+            || self.height <= 0
+        {
+            return;
+        }
+        let color = sample_color.unwrap_or_else(|| {
+            let x = (first.x.floor() as i32).clamp(0, self.width - 1) as usize;
+            let y = (first.y.floor() as i32).clamp(0, self.height - 1) as usize;
+            let index = (y * self.width as usize + x) * 4;
+            if self.rgba[index + 3] == 0 {
+                RgbaColor::BLACK
+            } else {
+                RgbaColor::rgb(self.rgba[index], self.rgba[index + 1], self.rgba[index + 2])
+            }
+        });
+        self.draw_polyline(points, color.with_alpha(255), stroke_width.max(1.5));
     }
 
     fn stroke_rect(&mut self, rect: RectF, color: RgbaColor, stroke_width: f32) {
@@ -256,6 +331,64 @@ impl Canvas {
                 }
             }
             cursor_x += 6.0 * scale;
+        }
+    }
+
+    fn draw_text_label(
+        &mut self,
+        origin: Point,
+        text: &str,
+        color: RgbaColor,
+        size: f32,
+        background: Option<RgbaColor>,
+        font: &TextFont<'_>,
+    ) {
+        if !origin.is_finite() || !size.is_finite() {
+            return;
+        }
+        let layout = font.layout(origin, text, size);
+        if let Some(background) = background {
+            let (width, height) = layout.as_ref().map_or_else(
+                || {
+                    let scale = (size / 7.0).round().max(1.0);
+                    (
+                        text.chars().count().max(1) as f32 * 6.0 * scale,
+                        7.0 * scale,
+                    )
+                },
+                |(width, height, _)| (*width, *height),
+            );
+            self.fill_rect(
+                RectF {
+                    x: origin.x - 5.0,
+                    y: origin.y - 5.0,
+                    width: width + 10.0,
+                    height: height + 10.0,
+                },
+                background,
+            );
+        }
+        if let Some((_, _, glyphs)) = layout {
+            for glyph in glyphs {
+                let bounds = glyph.px_bounds();
+                if bounds.max.x <= 0.0
+                    || bounds.max.y <= 0.0
+                    || bounds.min.x >= self.width as f32
+                    || bounds.min.y >= self.height as f32
+                {
+                    continue;
+                }
+                glyph.draw(|x, y, coverage| {
+                    let alpha = (coverage * f32::from(color.a)).round() as u8;
+                    self.blend_pixel(
+                        bounds.min.x as i32 + x as i32,
+                        bounds.min.y as i32 + y as i32,
+                        color.with_alpha(alpha),
+                    );
+                });
+            }
+        } else {
+            self.draw_text_line(origin, text, color, size);
         }
     }
 
@@ -543,6 +676,14 @@ pub fn speech_balloon_outline(rect: RectF, tail: Point) -> (Vec<Point>, Option<u
 
 /// Flattens an `EditorDocument` into an RGBA `CapturedImage`.
 pub fn render_document(doc: &EditorDocument) -> Result<CapturedImage, CoreError> {
+    render_document_with_font(doc, &TextFont::default())
+}
+
+/// Flattens all annotation layers using the chosen font for text labels.
+pub fn render_document_with_font(
+    doc: &EditorDocument,
+    font: &TextFont<'_>,
+) -> Result<CapturedImage, CoreError> {
     let base = doc.base_image();
     let mut canvas = Canvas::from_image(base);
 
@@ -604,21 +745,7 @@ pub fn render_document(doc: &EditorDocument) -> Result<CapturedImage, CoreError>
                 font_size,
                 background,
             } => {
-                if let Some(bg) = background {
-                    let scale = ((*font_size / 7.0).round()).max(1.0);
-                    let w = (text.chars().count().max(1) as f32) * (6.0 * scale) + 10.0;
-                    let h = 7.0 * scale + 10.0;
-                    canvas.fill_rect(
-                        RectF {
-                            x: position.x - 5.0,
-                            y: position.y - 5.0,
-                            width: w,
-                            height: h,
-                        },
-                        *bg,
-                    );
-                }
-                canvas.draw_text_line(*position, text, *color, *font_size);
+                canvas.draw_text_label(*position, text, *color, *font_size, *background, font);
             }
             AnnotationKind::StepNumber {
                 center,
@@ -664,6 +791,22 @@ pub fn render_document(doc: &EditorDocument) -> Result<CapturedImage, CoreError>
             }
             AnnotationKind::Spotlight { rect, dim_alpha } => {
                 canvas.apply_spotlight(*rect, *dim_alpha);
+            }
+            AnnotationKind::ImageOverlay {
+                rect,
+                width,
+                height,
+                rgba,
+                opacity,
+            } => {
+                canvas.draw_image_overlay(*rect, *width, *height, rgba, *opacity);
+            }
+            AnnotationKind::SmartEraser {
+                points,
+                stroke_width,
+                sample_color,
+            } => {
+                canvas.draw_smart_eraser(points, *stroke_width, *sample_color);
             }
         }
     }
@@ -733,6 +876,143 @@ mod tests {
         assert_eq!(pixel_at(&flat, 95, 25), [245, 247, 250, 255]);
         assert_eq!(pixel_at(&flat, 85, 25), [59, 130, 246, 255]);
         assert_eq!(pixel_at(&flat, 10, 75), [245, 247, 250, 255]);
+    }
+
+    #[test]
+    fn truetype_renders_partial_coverage_and_invalid_font_uses_bitmap() {
+        let mut doc = EditorDocument::new(solid_image(96, 48, RgbaColor::rgba(0, 0, 0, 0)));
+        doc.push_annotation(AnnotationKind::Text {
+            position: Point::new(4.25, 4.25),
+            text: "AVg".into(),
+            color: RgbaColor::WHITE.with_alpha(200),
+            font_size: 27.0,
+            background: None,
+        });
+
+        let invalid = TextFont::from_bytes(b"not a font");
+        assert!(!invalid.is_truetype());
+        let fallback = render_document_with_font(&doc, &invalid).unwrap();
+        assert_eq!(fallback.rgba(), doc.flatten().unwrap().rgba());
+        assert!(
+            fallback
+                .rgba()
+                .chunks_exact(4)
+                .all(|pixel| [0, 200].contains(&pixel[3]))
+        );
+        assert!(fallback.rgba().chunks_exact(4).any(|pixel| pixel[3] == 200));
+
+        let system = TextFont::system();
+        let rendered = render_document_with_font(&doc, &system).unwrap();
+        if system.is_truetype() {
+            assert!(rendered.rgba().chunks_exact(4).any(|pixel| pixel[3] == 200));
+            assert!(
+                rendered
+                    .rgba()
+                    .chunks_exact(4)
+                    .any(|pixel| { pixel[..3] == [245, 247, 250] && (1..200).contains(&pixel[3]) })
+            );
+        } else {
+            assert_eq!(rendered.rgba(), fallback.rgba());
+        }
+    }
+
+    #[test]
+    fn image_overlay_scales_composites_and_round_trips() {
+        let base = solid_image(5, 4, RgbaColor::rgb(0, 0, 255));
+        let mut doc = EditorDocument::new(base.clone());
+        doc.push_annotation(AnnotationKind::ImageOverlay {
+            rect: RectF::from_points(Point::new(-1.0, 1.0), Point::new(3.0, 3.0)),
+            width: 2,
+            height: 2,
+            rgba: vec![
+                255, 0, 0, 128, 0, 255, 0, 255, 255, 0, 0, 0, 255, 255, 255, 255,
+            ],
+            opacity: 0.5,
+        });
+        let flat = doc.flatten().unwrap();
+        assert_eq!(pixel_at(&flat, 0, 1), [64, 0, 191, 255]);
+        assert_eq!(pixel_at(&flat, 1, 1), [0, 128, 127, 255]);
+        assert_eq!(pixel_at(&flat, 2, 1), [0, 128, 127, 255]);
+        assert_eq!(pixel_at(&flat, 0, 2), [0, 0, 255, 255]);
+        assert_eq!(pixel_at(&flat, 1, 2), [128, 128, 255, 255]);
+        assert_eq!(pixel_at(&flat, 3, 2), [0, 0, 255, 255]);
+
+        let mut imported = EditorDocument::new(base);
+        let json = doc.export_annotations_json().unwrap();
+        assert_eq!(imported.import_annotations_json(&json).unwrap(), 1);
+        assert_eq!(imported.annotations(), doc.annotations());
+        assert_eq!(imported.flatten().unwrap().rgba(), flat.rgba());
+    }
+
+    #[test]
+    fn malformed_image_overlay_buffers_are_ignored() {
+        let base = solid_image(4, 4, RgbaColor::WHITE);
+        let mut doc = EditorDocument::new(base.clone());
+        for (width, height, rgba) in [
+            (2, 2, vec![255; 15]),
+            (1, 1, vec![255; 5]),
+            (u32::MAX, u32::MAX, vec![]),
+            (0, 3, vec![]),
+        ] {
+            doc.push_annotation(AnnotationKind::ImageOverlay {
+                rect: RectF::from_points(Point::new(0.0, 0.0), Point::new(4.0, 4.0)),
+                width,
+                height,
+                rgba,
+                opacity: 1.0,
+            });
+        }
+        assert_eq!(doc.flatten().unwrap().rgba(), base.rgba());
+    }
+
+    #[test]
+    fn smart_eraser_samples_prior_layers_and_paints_opaque_pixels() {
+        let base = solid_image(12, 8, RgbaColor::rgba(0, 0, 255, 80));
+        let mut doc = EditorDocument::new(base.clone());
+        doc.push_annotation(AnnotationKind::Rectangle {
+            rect: RectF::from_points(Point::new(0.0, 2.0), Point::new(4.0, 6.0)),
+            color: RgbaColor::rgba(255, 0, 0, 128),
+            stroke_width: 1.0,
+            filled: true,
+        });
+        let blemish = RgbaColor::rgb(0, 255, 0);
+        doc.push_annotation(AnnotationKind::Rectangle {
+            rect: RectF::from_points(Point::new(5.0, 3.0), Point::new(9.0, 5.0)),
+            color: blemish,
+            stroke_width: 1.0,
+            filled: true,
+        });
+        let before = doc.flatten().unwrap();
+        let [red, green, blue, alpha] = pixel_at(&before, 2, 4);
+        assert!(red > 0 && blue > 0 && alpha < 255);
+        doc.push_annotation(AnnotationKind::SmartEraser {
+            points: vec![Point::new(2.5, 4.0), Point::new(9.5, 4.0)],
+            stroke_width: 2.0,
+            sample_color: None,
+        });
+        doc.push_annotation(AnnotationKind::SmartEraser {
+            points: vec![Point::new(11.5, 0.5)],
+            stroke_width: 1.0,
+            sample_color: Some(RgbaColor::rgba(123, 45, 67, 0)),
+        });
+        let flat = doc.flatten().unwrap();
+        for y in 3..5 {
+            for x in 5..9 {
+                assert_eq!(pixel_at(&flat, x, y), [red, green, blue, 255]);
+            }
+        }
+        assert_eq!(pixel_at(&flat, 11, 0), [123, 45, 67, 255]);
+        assert_eq!(pixel_at(&flat, 6, 2), pixel_at(&before, 6, 2));
+
+        let mut imported = EditorDocument::new(base);
+        assert_eq!(
+            imported
+                .import_annotations_json(&doc.export_annotations_json().unwrap())
+                .unwrap(),
+            4
+        );
+        assert_eq!(imported.annotations(), doc.annotations());
+        assert_eq!(imported.flatten().unwrap().rgba(), flat.rgba());
     }
 
     #[test]

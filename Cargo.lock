@@ -4072,6 +4072,7 @@ name = "sharex-capture"
 version = "0.1.0"
 dependencies = [
  "sharex-core",
+ "windows 0.62.2",
  "windows-sys 0.59.0",
  "xcap",
 ]
@@ -4096,6 +4097,7 @@ dependencies = [
 name = "sharex-editor"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "serde",
  "serde_json",
  "sharex-core",
