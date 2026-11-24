@@ -1,3 +1,11 @@
+pub mod http_uploader;
+pub mod sxcu;
+pub mod template;
+
+pub use http_uploader::{CustomUploaderStore, SxcuUploader};
+pub use sxcu::{HttpMethod, SxcuBodyType, SxcuDefinition};
+pub use template::{ResponseContext, evaluate_template};
+
 use sharex_core::{
     CoreError, UploadRequest, UploadResult, Uploader, UploaderLookup, resolve_unique_path,
 };
