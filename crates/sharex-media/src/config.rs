@@ -6,6 +6,15 @@ use std::path::PathBuf;
 
 pub const MAX_RECORDING_FPS: u32 = 240;
 pub const MAX_CRF: u8 = 51;
+/// Minimum region width and height for hardware H.264 encoding.
+pub const MIN_HARDWARE_ENCODER_SIDE: u32 = 160;
+
+/// Returns whether the region meets the hardware encoder size threshold.
+pub fn hardware_encoder_supported_for_region(region: Option<Region>) -> bool {
+    region.is_none_or(|region| {
+        region.width() >= MIN_HARDWARE_ENCODER_SIDE && region.height() >= MIN_HARDWARE_ENCODER_SIDE
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +55,10 @@ pub enum VideoEncoder {
 }
 
 impl VideoEncoder {
+    pub(crate) const fn is_hardware_h264(self) -> bool {
+        matches!(self, Self::NvencH264 | Self::QsvH264 | Self::AmfH264)
+    }
+
     /// Resolves `Auto` to a concrete encoder and validates compatibility with `format`.
     pub fn resolve(self, format: RecordingFormat) -> Result<Self, MediaError> {
         match (format, self) {
@@ -108,6 +121,9 @@ pub struct RecordingConfig {
     pub ffmpeg_path: Option<PathBuf>,
     #[serde(default)]
     pub audio_device: Option<String>,
+    /// Retry with libx264 if the selected hardware encoder fails during startup.
+    #[serde(default)]
+    pub fallback_to_libx264_on_hw_fail: bool,
 }
 
 impl RecordingConfig {
@@ -122,6 +138,16 @@ impl RecordingConfig {
             output_path: output_path.into(),
             ffmpeg_path: None,
             audio_device: None,
+            fallback_to_libx264_on_hw_fail: false,
+        }
+    }
+
+    pub(crate) fn resolved_encoder(&self) -> Result<VideoEncoder, MediaError> {
+        let encoder = self.encoder.resolve(self.format)?;
+        if encoder.is_hardware_h264() && !hardware_encoder_supported_for_region(self.region) {
+            Ok(VideoEncoder::Libx264)
+        } else {
+            Ok(encoder)
         }
     }
 

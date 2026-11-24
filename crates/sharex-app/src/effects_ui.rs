@@ -1,9 +1,9 @@
 use crate::i18n::Strings;
 use crate::theme::{SharexPalette, card_frame, section_label, view_heading};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke, Vec2};
-use sharex_core::CapturedImage;
+use sharex_core::{CapturedImage, CoreError};
 use sharex_effects::{
-    EffectColor, EffectPreset, ImageEffect, WatermarkAnchor, apply_effects, builtin_presets,
+    EffectColor, EffectPreset, ImageEffect, WatermarkAnchor, apply_effect, builtin_presets,
     extended_presets,
 };
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ pub struct EffectsPanelState {
     preview_texture: Option<egui::TextureHandle>,
     preview_dims: Option<(u32, u32)>,
     preview_key: Option<(Option<usize>, Option<PathBuf>)>,
-    preview_source: Option<(Option<PathBuf>, CapturedImage)>,
+    preview_source: Option<(Option<PathBuf>, Result<CapturedImage, CoreError>)>,
     preview_error: Option<String>,
 }
 
@@ -449,22 +449,32 @@ impl EffectsPanelState {
             let image = source_path
                 .as_ref()
                 .and_then(|path| CapturedImage::load_from_file(path).ok())
-                .map_or_else(build_sample_preview_image, |image| {
-                    downscale_for_preview(&image, 420, 260)
-                });
+                .map_or_else(
+                    || Ok(build_sample_preview_image()),
+                    |image| downscale_for_preview(image, 420, 260),
+                );
             self.preview_source = Some((source_path, image));
         }
         let Some((_, base_image)) = &self.preview_source else {
             return;
         };
-        let rendered = self
-            .active_preset()
-            .map_or_else(|| Ok(base_image.clone()), |preset| preset.apply(base_image));
+        let rendered = base_image
+            .as_ref()
+            .map_err(ToString::to_string)
+            .and_then(|base_image| {
+                let img = self
+                    .active_preset()
+                    .map_or_else(|| Ok(base_image.clone()), |preset| preset.apply(base_image))
+                    .map_err(|err| err.to_string())?;
+                let dimensions = (img.width(), img.height());
+                let texture_limit = ctx.input(|input| input.max_texture_side) as u32;
+                let preview = downscale_for_preview(img, texture_limit, texture_limit)
+                    .map_err(|err| err.to_string())?;
+                Ok((preview, dimensions))
+            });
 
         match rendered {
-            Ok(img) => {
-                let texture_limit = ctx.input(|input| input.max_texture_side) as u32;
-                let preview = downscale_for_preview(&img, texture_limit, texture_limit);
+            Ok((preview, dimensions)) => {
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [preview.width() as usize, preview.height() as usize],
                     preview.rgba(),
@@ -478,7 +488,7 @@ impl EffectsPanelState {
                         egui::TextureOptions::LINEAR,
                     ));
                 }
-                self.preview_dims = Some((img.width(), img.height()));
+                self.preview_dims = Some(dimensions);
                 self.preview_error = None;
             }
             Err(err) => {
@@ -787,19 +797,22 @@ fn edit_anchor(ui: &mut egui::Ui, position: &mut WatermarkAnchor) -> bool {
     *position != original
 }
 
-fn downscale_for_preview(img: &CapturedImage, max_w: u32, max_h: u32) -> CapturedImage {
+fn downscale_for_preview(
+    img: CapturedImage,
+    max_w: u32,
+    max_h: u32,
+) -> Result<CapturedImage, CoreError> {
     if img.width() <= max_w && img.height() <= max_h {
-        return img.clone();
+        return Ok(img);
     }
-    apply_effects(
-        img,
-        &[ImageEffect::Resize {
+    apply_effect(
+        &img,
+        &ImageEffect::Resize {
             width: max_w,
             height: max_h,
             keep_aspect: true,
-        }],
+        },
     )
-    .unwrap_or_else(|_| img.clone())
 }
 
 fn build_sample_preview_image() -> CapturedImage {
@@ -871,6 +884,37 @@ mod tests {
         assert_eq!(state.preview_dims, Some((284, 172)));
         state.set_selected_preset_idx(Some(state.presets().len()));
         assert_eq!(state.active_preset(), Some(&original));
+    }
+
+    #[test]
+    fn oversized_imported_preset_reports_a_preview_error() {
+        let mut state = EffectsPanelState::new();
+        state.ensure_preview_texture(&egui::Context::default(), None);
+        assert!(state.preview_texture.is_some());
+
+        state
+            .import_preset_toml(
+                r#"
+name = "Oversized resize"
+enabled = true
+
+[[effects]]
+type = "resize"
+width = 50000
+height = 50000
+keep_aspect = false
+"#,
+            )
+            .expect("preset parses");
+        state.ensure_preview_texture(&egui::Context::default(), None);
+        assert!(state.preview_texture.is_none());
+        assert!(state.preview_dims.is_none());
+        assert!(
+            state
+                .preview_error
+                .as_deref()
+                .is_some_and(|err| err.contains("50000x50000"))
+        );
     }
 
     #[test]

@@ -6,8 +6,8 @@ use eframe::egui::{self, Color32, RichText};
 use sharex_core::{ClipboardSink, Region, resolve_unique_path};
 use sharex_media::{
     AudioDevice, CapturePlatform, MediaError, RecordingConfig, RecordingFormat, RecordingState,
-    ScreenRecorder, VideoEncoder, detect_available_h264_encoders, find_ffmpeg, list_audio_devices,
-    preferred_mp4_encoder,
+    ScreenRecorder, VideoEncoder, detect_available_h264_encoders, find_ffmpeg,
+    hardware_encoder_supported_for_region, list_audio_devices, preferred_mp4_encoder,
 };
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -121,15 +121,17 @@ impl RecordingPanelState {
         let output_path = resolve_unique_path(output_dir, &stem, self.format.extension());
         let mut config = RecordingConfig::new(output_path);
         config.format = self.format;
+        config.region = self.selected_region();
         config.encoder = match self.format {
             RecordingFormat::Mp4H264 if self.mp4_encoder == VideoEncoder::Auto => {
-                preferred_mp4_encoder(&self.available_encoders)
+                let encoder = self.auto_mp4_encoder();
+                config.fallback_to_libx264_on_hw_fail = encoder != VideoEncoder::Libx264;
+                encoder
             }
             RecordingFormat::Mp4H264 => self.mp4_encoder,
             RecordingFormat::WebmVp9 => VideoEncoder::LibvpxVp9,
             RecordingFormat::Gif => VideoEncoder::GifPalette,
         };
-        config.region = self.selected_region();
         if self.format != RecordingFormat::Gif {
             config.audio_device = self.audio_device.as_ref().map(|device| device.name.clone());
         }
@@ -138,6 +140,14 @@ impl RecordingPanelState {
         config.draw_cursor = self.draw_cursor;
         config.ffmpeg_path = self.ffmpeg_path.clone();
         config
+    }
+
+    fn auto_mp4_encoder(&self) -> VideoEncoder {
+        if hardware_encoder_supported_for_region(self.selected_region()) {
+            preferred_mp4_encoder(&self.available_encoders)
+        } else {
+            VideoEncoder::Libx264
+        }
     }
 
     /// Stops the active recording (off the UI thread) or starts a recording in the requested format.
@@ -256,7 +266,7 @@ impl RecordingPanelState {
             config.region,
             elapsed,
             format,
-            encoder_badge(config.encoder),
+            encoder_badge(self.recorder.active_encoder()?),
         ) {
             RecordingHudAction::None => return None,
             RecordingHudAction::Stop => self.stop_recording_async(),
@@ -366,10 +376,7 @@ impl RecordingPanelState {
                     if self.format == RecordingFormat::Mp4H264 {
                         ui.label("Encoder");
                         let label = if self.mp4_encoder == VideoEncoder::Auto {
-                            format!(
-                                "Auto ({})",
-                                encoder_badge(preferred_mp4_encoder(&self.available_encoders))
-                            )
+                            format!("Auto ({})", encoder_badge(self.auto_mp4_encoder()))
                         } else {
                             encoder_option(self.mp4_encoder).to_owned()
                         };
@@ -648,10 +655,15 @@ mod tests {
             VideoEncoder::Libx264
         );
         state.available_encoders = vec![VideoEncoder::AmfH264, VideoEncoder::QsvH264];
-        assert_eq!(
-            state.build_config(dir.path()).encoder,
-            VideoEncoder::QsvH264
-        );
+        let fullscreen = state.build_config(dir.path());
+        assert_eq!(fullscreen.encoder, VideoEncoder::QsvH264);
+        assert!(fullscreen.fallback_to_libx264_on_hw_fail);
+
+        state.available_encoders = vec![VideoEncoder::NvencH264];
+        state.set_region(Some(Region::new(0, 0, 64, 64).expect("valid region")));
+        let small_region = state.build_config(dir.path());
+        assert_eq!(small_region.encoder, VideoEncoder::Libx264);
+        assert!(!small_region.fallback_to_libx264_on_hw_fail);
     }
 
     #[test]

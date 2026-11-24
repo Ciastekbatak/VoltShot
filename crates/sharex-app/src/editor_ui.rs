@@ -586,7 +586,10 @@ impl EditorViewState {
 
     fn render_project_controls(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Export .sxed").clicked() {
+            if ui.button("Export .sxed")
+                .on_hover_text("Saves an editable project containing the original unredacted base image and annotation layers. Use Save for a flattened redacted PNG.")
+                .clicked()
+            {
                 self.status = match project_path(self.source_path.as_deref()).and_then(|path| {
                     save_project(&self.document, &path)?;
                     Ok(path)
@@ -1515,14 +1518,22 @@ fn paint_eraser_stroke(
     width: f32,
     color: RgbaColor,
 ) {
-    let points: Vec<_> = points.iter().copied().map(to_screen).collect();
+    if !width.is_finite()
+        || width <= 0.0
+        || points
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+    {
+        return;
+    }
     let width = width.max(1.5) * zoom;
     let color = to_egui_color(color.with_alpha(255));
-    for &point in &points {
-        painter.circle_filled(point, width * 0.5, color);
+    let stroke = Stroke::new(width, color);
+    for segment in points.windows(2) {
+        painter.line_segment([to_screen(segment[0]), to_screen(segment[1])], stroke);
     }
-    if points.len() >= 2 {
-        painter.add(egui::Shape::line(points, Stroke::new(width, color)));
+    for &point in points {
+        painter.circle_filled(to_screen(point), width * 0.5, color);
     }
 }
 
@@ -2019,7 +2030,7 @@ mod tests {
         editor.zoom = 6.0;
         editor.push_annotation(test_rectangle());
         let frame = |editor: &mut EditorViewState, events| {
-            let _ = ctx.run(
+            ctx.run(
                 egui::RawInput {
                     events,
                     ..Default::default()
@@ -2034,9 +2045,19 @@ mod tests {
                         editor.handle_canvas_pointer(ctx, &response, &|position| {
                             Point::new((position.x - 12.0) / 6.0, (position.y - 12.0) / 6.0)
                         });
+                        if let Some(draft) = &editor.drag {
+                            editor.paint_draft(
+                                &ui.painter_at(response.rect),
+                                draft,
+                                &|point| Pos2::new(12.0 + point.x * 6.0, 12.0 + point.y * 6.0),
+                                response.rect,
+                                editor.zoom,
+                                Color32::BLUE,
+                            );
+                        }
                     });
                 },
-            );
+            )
         };
         let moved = |column, row| {
             egui::Event::PointerMoved(Pos2::new(12.0 + column * 6.0_f32, 12.0 + row * 6.0_f32))
@@ -2066,7 +2087,11 @@ mod tests {
 
         editor.active_tool = EditorTool::SmartEraser;
         frame(&mut editor, vec![moved(6.0, 7.0), click(6.0, 7.0, true)]);
-        frame(&mut editor, vec![moved(21.0, 7.0)]);
+        let preview = frame(&mut editor, vec![moved(21.0, 7.0)]);
+        assert!(preview.shapes.iter().any(|shape| matches!(
+            &shape.shape,
+            egui::Shape::LineSegment { stroke, .. } if stroke.color == to_egui_color(RgbaColor::RED)
+        )));
         assert!(matches!(
             editor.drag,
             Some(DragDraft::SmartEraser {

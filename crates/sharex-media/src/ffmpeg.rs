@@ -321,7 +321,7 @@ pub fn build_recording_args(
     platform: CapturePlatform,
 ) -> Result<Vec<String>, MediaError> {
     config.validate()?;
-    let encoder = config.encoder.resolve(config.format)?;
+    let encoder = config.resolved_encoder()?;
     let cursor_flag = if config.draw_cursor { "1" } else { "0" };
     let active_audio = if config.format == RecordingFormat::Gif {
         None
@@ -611,6 +611,24 @@ mod tests {
                 "out/recording.mp4",
             ]
         );
+    }
+
+    #[test]
+    fn build_args_uses_libx264_when_either_region_side_is_too_small() {
+        let mut config = RecordingConfig::new("screen.mp4");
+        config.encoder = VideoEncoder::NvencH264;
+
+        for (width, height) in [(64, 64), (159, 160), (160, 159), (160, 160)] {
+            config.region = Some(Region::new(0, 0, width, height).expect("valid region"));
+            let args = build_recording_args(&config, CapturePlatform::WindowsGdiGrab)
+                .expect("args build succeeds");
+            let expected = if (width, height) == (160, 160) {
+                "h264_nvenc"
+            } else {
+                "libx264"
+            };
+            assert!(args.windows(2).any(|pair| pair == ["-c:v", expected]));
+        }
     }
 
     #[test]

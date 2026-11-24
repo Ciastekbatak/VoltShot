@@ -5,6 +5,25 @@ use sharex_core::{CapturedImage, CoreError, Region};
 use crate::resize::resize_lanczos;
 use crate::watermark::{WatermarkPlacement, apply_image_watermark, apply_watermark_text};
 
+/// Maximum width or height of an effect output in pixels.
+pub const MAX_EFFECT_DIMENSION: u32 = 16_384;
+
+/// Maximum pixel count of an effect output (256 MB for RGBA8).
+pub const MAX_EFFECT_PIXELS: u64 = 64_000_000;
+
+/// Checks whether the given dimensions fit within the effect allocation limits.
+pub fn validate_output_dimensions(width: u32, height: u32) -> Result<(), CoreError> {
+    if width > MAX_EFFECT_DIMENSION
+        || height > MAX_EFFECT_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_EFFECT_PIXELS
+    {
+        return Err(CoreError::InvalidRegion(format!(
+            "effect dimensions {width}x{height} exceed the limits of {MAX_EFFECT_DIMENSION} pixels per side and {MAX_EFFECT_PIXELS} total pixels"
+        )));
+    }
+    Ok(())
+}
+
 /// RGBA8 color used by image effect parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectColor {
@@ -129,6 +148,7 @@ pub fn apply_effect(
     image: &CapturedImage,
     effect: &ImageEffect,
 ) -> Result<CapturedImage, CoreError> {
+    validate_output_dimensions(image.width(), image.height())?;
     match *effect {
         ImageEffect::Border { width, color } => {
             apply_canvas_padding(image, width, width, width, width, color)
@@ -213,6 +233,7 @@ pub fn apply_effects(
     effects: &[ImageEffect],
 ) -> Result<CapturedImage, CoreError> {
     let Some((first, rest)) = effects.split_first() else {
+        validate_output_dimensions(image.width(), image.height())?;
         return Ok(image.clone());
     };
     let mut current = apply_effect(image, first)?;
@@ -257,6 +278,7 @@ fn apply_canvas_padding(
         .and_then(|v| v.checked_add(bottom))
         .ok_or_else(|| CoreError::InvalidRegion("padded image height overflows u32".into()))?;
 
+    validate_output_dimensions(new_w, new_h)?;
     let mut out = vec![0; checked_rgba_len(new_w, new_h)?];
     let src_stride = (image.width() as usize) * 4;
     let dst_stride = (new_w as usize) * 4;
@@ -522,6 +544,7 @@ fn apply_drop_shadow(
     let new_h = u32::try_from(max_y - min_y)
         .map_err(|_| CoreError::InvalidRegion("drop shadow height overflows u32".into()))?;
 
+    validate_output_dimensions(new_w, new_h)?;
     let new_w_usize = new_w as usize;
     let total_bytes = checked_rgba_len(new_w, new_h)?;
 
@@ -627,6 +650,8 @@ fn apply_resize(
         (width, height)
     };
 
+    validate_output_dimensions(target_w, target_h)?;
+    validate_output_dimensions(image.width(), target_h)?;
     resize_lanczos(image, target_w, target_h)
 }
 
@@ -825,6 +850,59 @@ mod tests {
         let idx = ((y as usize) * (image.width() as usize) + (x as usize)) * 4;
         let rgba = image.rgba();
         [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]]
+    }
+
+    #[test]
+    fn oversized_effect_outputs_return_errors_without_allocating() {
+        let img = solid_image(4, 3, EffectColor::WHITE);
+        for effect in [
+            ImageEffect::CanvasPadding {
+                top: 100_000,
+                bottom: 100_000,
+                left: 0,
+                right: 0,
+                color: EffectColor::TRANSPARENT,
+            },
+            ImageEffect::Border {
+                width: 100_000,
+                color: EffectColor::BLACK,
+            },
+            ImageEffect::DropShadow {
+                offset_x: 0,
+                offset_y: 0,
+                blur_radius: 100_000,
+                color: EffectColor::BLACK,
+                background: EffectColor::TRANSPARENT,
+            },
+            ImageEffect::Resize {
+                width: 50_000,
+                height: 50_000,
+                keep_aspect: true,
+            },
+            ImageEffect::Resize {
+                width: 8_001,
+                height: 8_000,
+                keep_aspect: false,
+            },
+        ] {
+            assert!(matches!(
+                apply_effects(&img, &[effect]),
+                Err(CoreError::InvalidRegion(message)) if message.contains("exceed the limits")
+            ));
+        }
+    }
+
+    #[test]
+    fn effect_pipeline_checks_dimensions_before_cloning_the_input() {
+        let img = solid_image(1, MAX_EFFECT_DIMENSION + 1, EffectColor::WHITE);
+        assert!(matches!(
+            apply_effects(&img, &[]),
+            Err(CoreError::InvalidRegion(_))
+        ));
+        assert!(matches!(
+            apply_effect(&img, &ImageEffect::Invert),
+            Err(CoreError::InvalidRegion(_))
+        ));
     }
 
     #[test]

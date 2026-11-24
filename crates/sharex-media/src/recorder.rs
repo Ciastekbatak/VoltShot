@@ -1,4 +1,4 @@
-use crate::config::{CapturePlatform, RecordingConfig, RecordingFormat};
+use crate::config::{CapturePlatform, RecordingConfig, RecordingFormat, VideoEncoder};
 use crate::ffmpeg::{
     MediaError, build_gif_spool_args, build_gif_transcode_args, build_recording_args, find_ffmpeg,
 };
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const GIF_FINALIZE_TIMEOUT: Duration = Duration::from_secs(120);
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const HARDWARE_STARTUP_PROBE: Duration = Duration::from_millis(120);
 const MAX_CAPTURED_STDERR_BYTES: usize = 16 * 1024;
 
 struct GifSpoolJob {
@@ -162,6 +163,7 @@ impl RecordingStateMachine {
 
 pub struct ScreenRecorder {
     machine: RecordingStateMachine,
+    encoder: VideoEncoder,
     child: Option<Child>,
     stderr_handle: Option<JoinHandle<String>>,
     gif_spool: Option<GifSpoolJob>,
@@ -182,6 +184,7 @@ impl ScreenRecorder {
     pub fn with_platform(platform: CapturePlatform) -> Self {
         Self {
             machine: RecordingStateMachine::new(),
+            encoder: VideoEncoder::Auto,
             child: None,
             stderr_handle: None,
             gif_spool: None,
@@ -191,6 +194,11 @@ impl ScreenRecorder {
 
     pub fn state(&self) -> &RecordingState {
         self.machine.state()
+    }
+
+    /// Returns the encoder used by the active recording, including any startup fallback.
+    pub fn active_encoder(&self) -> Option<VideoEncoder> {
+        self.state().is_recording().then_some(self.encoder)
     }
 
     pub fn elapsed(&self) -> Option<Duration> {
@@ -216,24 +224,46 @@ impl ScreenRecorder {
             fs::create_dir_all(parent)?;
         }
 
-        let (args, gif_spool) = if config.format == RecordingFormat::Gif {
-            let spool_path = make_gif_spool_path(&config.output_path);
-            let args = build_gif_spool_args(config, self.platform, &spool_path)?;
-            let job = GifSpoolJob {
-                ffmpeg_bin: ffmpeg_bin.clone(),
-                spool_path,
-                output_path: config.output_path.clone(),
-                fps: config.fps,
-            };
-            (args, Some(job))
-        } else {
-            (build_recording_args(config, self.platform)?, None)
-        };
+        if config.format != RecordingFormat::Gif {
+            let platform = self.platform;
+            return self.start_capture(config, |attempt| {
+                let mut command = Command::new(&ffmpeg_bin);
+                command.args(build_recording_args(attempt, platform)?);
+                Ok(command)
+            });
+        }
 
+        let spool_path = make_gif_spool_path(&config.output_path);
         let mut command = Command::new(&ffmpeg_bin);
-        command.args(&args);
-        self.spawn_command(command, config.output_path.clone())?;
-        self.gif_spool = gif_spool;
+        command.args(build_gif_spool_args(config, self.platform, &spool_path)?);
+        self.spawn_command(command, config.output_path.clone(), false)?;
+        self.encoder = VideoEncoder::GifPalette;
+        self.gif_spool = Some(GifSpoolJob {
+            ffmpeg_bin,
+            spool_path,
+            output_path: config.output_path.clone(),
+            fps: config.fps,
+        });
+        Ok(())
+    }
+
+    fn start_capture(
+        &mut self,
+        config: &RecordingConfig,
+        mut command: impl FnMut(&RecordingConfig) -> Result<Command, MediaError>,
+    ) -> Result<(), MediaError> {
+        let mut encoder = config.resolved_encoder()?;
+        let probe = config.fallback_to_libx264_on_hw_fail && encoder.is_hardware_h264();
+        match self.spawn_command(command(config)?, config.output_path.clone(), probe) {
+            Err(MediaError::ProcessFailed(_)) if probe => {
+                let mut fallback = config.clone();
+                encoder = VideoEncoder::Libx264;
+                fallback.encoder = encoder;
+                self.spawn_command(command(&fallback)?, fallback.output_path, true)?;
+            }
+            result => result?,
+        }
+        self.encoder = encoder;
         Ok(())
     }
 
@@ -241,6 +271,7 @@ impl ScreenRecorder {
         &mut self,
         mut command: Command,
         output_path: PathBuf,
+        probe: bool,
     ) -> Result<(), MediaError> {
         if !matches!(self.machine.state(), RecordingState::Idle) {
             return Err(MediaError::InvalidStateTransition {
@@ -255,9 +286,31 @@ impl ScreenRecorder {
             .stderr(Stdio::piped())
             .spawn()?;
 
+        let started_at = Instant::now();
         let stderr_handle = child.stderr.take().map(spawn_stderr_drain);
 
-        self.machine.start(output_path, Instant::now())?;
+        if probe {
+            thread::sleep(HARDWARE_STARTUP_PROBE);
+            match child.try_wait() {
+                Ok(Some(status)) if !status.success() => {
+                    let stderr = join_stderr(stderr_handle);
+                    let detail = if stderr.is_empty() {
+                        format!("ffmpeg exited with {status}")
+                    } else {
+                        stderr
+                    };
+                    return Err(MediaError::ProcessFailed(detail));
+                }
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(err.into());
+                }
+                Ok(_) => {}
+            }
+        }
+
+        self.machine.start(output_path, started_at)?;
         self.child = Some(child);
         self.stderr_handle = stderr_handle;
         Ok(())
@@ -348,12 +401,15 @@ impl ScreenRecorder {
     }
 
     fn collect_stderr(&mut self) -> String {
-        self.stderr_handle
-            .take()
-            .and_then(|handle| handle.join().ok())
-            .map(|text| text.trim().to_owned())
-            .unwrap_or_default()
+        join_stderr(self.stderr_handle.take())
     }
+}
+
+fn join_stderr(handle: Option<JoinHandle<String>>) -> String {
+    handle
+        .and_then(|handle| handle.join().ok())
+        .map(|text| text.trim().to_owned())
+        .unwrap_or_default()
 }
 
 impl Drop for ScreenRecorder {
@@ -593,7 +649,7 @@ mod tests {
         };
 
         recorder
-            .spawn_command(command, output.clone())
+            .spawn_command(command, output.clone(), false)
             .expect("spawn child");
         assert!(recorder.state().is_recording());
         assert!(recorder.elapsed().is_some());
@@ -601,6 +657,47 @@ mod tests {
         let (finished_path, _) = recorder.stop().expect("graceful stop succeeds");
         assert_eq!(finished_path, output);
         assert!(matches!(recorder.state(), RecordingState::Completed { .. }));
+    }
+
+    #[test]
+    fn screen_recorder_retries_cpu_if_hardware_exits_during_startup() {
+        let dir = tempdir().expect("temp dir");
+        let mut config = RecordingConfig::new(dir.path().join("recorded.mp4"));
+        config.encoder = VideoEncoder::NvencH264;
+        config.fallback_to_libx264_on_hw_fail = true;
+        let mut recorder = ScreenRecorder::new();
+        let mut attempts = Vec::new();
+
+        recorder
+            .start_capture(&config, |attempt| {
+                attempts.push(attempt.encoder);
+                let hardware = attempt.encoder == VideoEncoder::NvencH264;
+                #[cfg(windows)]
+                let mut command = Command::new("cmd");
+                #[cfg(windows)]
+                command.args([
+                    "/C",
+                    if hardware {
+                        "exit /b 1"
+                    } else {
+                        "set /p line="
+                    },
+                ]);
+                #[cfg(not(windows))]
+                let mut command = Command::new("sh");
+                #[cfg(not(windows))]
+                command.args(["-c", if hardware { "exit 1" } else { "read line" }]);
+                Ok(command)
+            })
+            .expect("software fallback starts");
+
+        assert_eq!(attempts, [VideoEncoder::NvencH264, VideoEncoder::Libx264]);
+        assert!(recorder.state().is_recording());
+        assert_eq!(recorder.active_encoder(), Some(VideoEncoder::Libx264));
+        assert_eq!(
+            recorder.stop().expect("software recording stops").0,
+            config.output_path
+        );
     }
 
     #[test]
@@ -625,7 +722,7 @@ mod tests {
         };
 
         recorder
-            .spawn_command(command, output.clone())
+            .spawn_command(command, output.clone(), false)
             .expect("spawn long-running child");
 
         let aborted_path = recorder.abort().expect("abort succeeds");
@@ -654,7 +751,7 @@ mod tests {
         };
 
         recorder
-            .spawn_command(command, output)
+            .spawn_command(command, output, false)
             .expect("spawn failing child");
 
         let err = recorder.stop().expect_err("non-zero exit must fail");
