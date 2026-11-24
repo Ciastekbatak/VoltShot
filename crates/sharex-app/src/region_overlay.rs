@@ -1,10 +1,11 @@
 use std::time::Instant;
 
 use crate::editor_ui::{paint_annotation, paint_arrow, paint_ellipse_stroke, to_egui_color};
+use crate::icons::{Icon, paint_icon, toolbar_icon_button};
 use crate::win_focus::OverlayFocusGuard;
 use eframe::egui::emath::GuiRounding;
 use eframe::egui::{
-    self, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke, Vec2,
+    self, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Shadow, Stroke, Vec2,
 };
 use sharex_capture::{DesktopSnapshot, XcapCapturer, find_window_at_point};
 use sharex_core::{CapturedImage, Region, ScreenCapturer, WindowInfo};
@@ -12,9 +13,16 @@ use sharex_editor::{AnnotationKind, EditorDocument, Point, RectF, RgbaColor, SHA
 use sharex_tools::{ColorSample, sample_image};
 
 const OVERLAY_WINDOW_TITLE: &str = "ShareX Region Capture";
-const SNAP_COLOR: Color32 = Color32::from_rgb(34, 197, 94);
 const MIN_REGION_DRAG: f32 = 4.0;
 const MAGNIFIER_HALF_EXTENT: i32 = 5;
+
+fn glass_bg() -> Color32 {
+    Color32::from_rgba_unmultiplied(15, 18, 24, 236)
+}
+
+fn glass_border() -> Color32 {
+    Color32::from_rgba_unmultiplied(255, 255, 255, 28)
+}
 
 /// Result produced by one frame of the interactive ShareX region capture overlay.
 pub enum OverlayOutcome {
@@ -174,6 +182,42 @@ impl OverlayTool {
             Self::Blur => "Blur",
         }
     }
+
+    const fn icon(self) -> Icon {
+        match self {
+            Self::Region => Icon::Region,
+            Self::Select => Icon::SelectCursor,
+            Self::Rectangle => Icon::RectOutline,
+            Self::FilledRectangle => Icon::RectFilled,
+            Self::Ellipse => Icon::Ellipse,
+            Self::Arrow => Icon::Arrow,
+            Self::Line => Icon::Line,
+            Self::Freehand => Icon::Pen,
+            Self::Highlighter => Icon::Highlighter,
+            Self::Text => Icon::TextT,
+            Self::StepNumber => Icon::StepNumber,
+            Self::Pixelate => Icon::Pixelate,
+            Self::Blur => Icon::Blur,
+        }
+    }
+
+    const fn tooltip(self) -> &'static str {
+        match self {
+            Self::Region => "Capture Region (Space)",
+            Self::Select => "Select / Move (V)",
+            Self::Rectangle => "Rectangle (R)",
+            Self::FilledRectangle => "Filled Rectangle (F)",
+            Self::Ellipse => "Ellipse (E)",
+            Self::Arrow => "Arrow (A)",
+            Self::Line => "Line (L)",
+            Self::Freehand => "Freehand Pen (D)",
+            Self::Highlighter => "Highlighter (H)",
+            Self::Text => "Text (T)",
+            Self::StepNumber => "Step Number (N)",
+            Self::Pixelate => "Pixelate (P)",
+            Self::Blur => "Blur (B)",
+        }
+    }
 }
 
 enum OverlayDrag {
@@ -205,6 +249,7 @@ pub struct RegionOverlayState {
     visual_snap_target: Option<RectF>,
     last_frame_time: Instant,
     show_magnifier: bool,
+    show_style_bar: bool,
     color: RgbaColor,
     stroke_width: f32,
     font_size: f32,
@@ -271,6 +316,7 @@ impl RegionOverlayState {
             visual_snap_target: None,
             last_frame_time: Instant::now(),
             show_magnifier: true,
+            show_style_bar: false,
             color: RgbaColor::RED,
             stroke_width: 4.0,
             font_size: 20.0,
@@ -360,10 +406,14 @@ impl RegionOverlayState {
                 return;
             }
 
-            if capture_mode && overlay_ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
+            if capture_mode
+                && overlay_ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z))
+            {
                 self.document.undo();
             }
-            if capture_mode && overlay_ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Y)) {
+            if capture_mode
+                && overlay_ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Y))
+            {
                 self.document.redo();
             }
             if capture_mode && !typing && overlay_ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
@@ -445,11 +495,20 @@ impl RegionOverlayState {
                     );
 
                     let accent = Color32::from_rgb(59, 130, 246);
-                    let primary_bounds = self.primary_monitor.map(to_screen_rect).filter(|rect| rect.is_positive());
+                    let primary_bounds = self
+                        .primary_monitor
+                        .map(to_screen_rect)
+                        .filter(|rect| rect.is_positive());
                     let toolbar_anchor = if let Some(bounds) = primary_bounds {
                         toolbar_anchor_in_overlay(0, 0, bounds, scale_x, scale_y)
                     } else {
-                        toolbar_anchor_in_overlay(self.origin_x, self.origin_y, screen_rect, scale_x, scale_y)
+                        toolbar_anchor_in_overlay(
+                            self.origin_x,
+                            self.origin_y,
+                            screen_rect,
+                            scale_x,
+                            scale_y,
+                        )
                     };
                     let toolbar_rect = egui::Area::new(egui::Id::new("sharex_region_floating_bar"))
                         .order(egui::Order::Foreground)
@@ -459,15 +518,48 @@ impl RegionOverlayState {
                         .interactable(capture_mode)
                         .show(overlay_ctx, |ui| {
                             egui::Frame::NONE
-                                .fill(Color32::from_rgba_unmultiplied(24, 28, 34, 242))
-                                .stroke(Stroke::new(1.0_f32, accent))
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(Margin::symmetric(10, 6))
+                                .fill(Color32::from_rgba_unmultiplied(15, 18, 24, 236))
+                                .stroke(Stroke::new(
+                                    1.0_f32,
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+                                ))
+                                .corner_radius(CornerRadius::same(10))
+                                .shadow(Shadow {
+                                    offset: [0, 6],
+                                    blur: 18,
+                                    spread: 0,
+                                    color: Color32::from_black_alpha(120),
+                                })
+                                .inner_margin(Margin::symmetric(8, 5))
                                 .show(ui, |ui| {
                                     if capture_mode {
-                                        self.render_floating_toolbar(ui, accent, &mut toolbar_action);
+                                        self.render_floating_toolbar(
+                                            ui,
+                                            accent,
+                                            &mut toolbar_action,
+                                        );
                                     } else {
-                                        ui.label(RichText::new(self.mode.hint()).color(Color32::WHITE));
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 7.0;
+                                            let mode_icon = match self.mode {
+                                                OverlayMode::Ocr => Icon::OcrText,
+                                                OverlayMode::SelectRecordingRegion => {
+                                                    Icon::Recording
+                                                }
+                                                OverlayMode::ColorPicker => Icon::EyeDropper,
+                                                OverlayMode::Capture => Icon::Region,
+                                            };
+                                            let (icon_rect, _) = ui.allocate_exact_size(
+                                                Vec2::splat(15.0_f32),
+                                                Sense::hover(),
+                                            );
+                                            paint_icon(ui.painter(), icon_rect, mode_icon, accent);
+                                            ui.label(
+                                                RichText::new(self.mode.hint())
+                                                    .size(12.0)
+                                                    .color(Color32::from_rgb(236, 240, 246)),
+                                            );
+                                        });
                                     }
                                 });
                         })
@@ -477,7 +569,9 @@ impl RegionOverlayState {
                     let is_canvas = |pos: Pos2| {
                         screen_rect.contains(pos) && (!capture_mode || !toolbar_rect.contains(pos))
                     };
-                    let pointer_pos = overlay_ctx.input(|i| i.pointer.hover_pos()).filter(|&pos| is_canvas(pos));
+                    let pointer_pos = overlay_ctx
+                        .input(|i| i.pointer.hover_pos())
+                        .filter(|&pos| is_canvas(pos));
 
                     if pointer_pos.is_some() {
                         overlay_ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -562,7 +656,7 @@ impl RegionOverlayState {
                         overlay_ctx.request_repaint();
                     }
 
-                    let scrim = Color32::from_black_alpha(125);
+                    let scrim = Color32::from_black_alpha(112);
                     if let Some(sel_img) = active_region.or(visual_snap_rect) {
                         let sel = to_screen_rect(sel_img);
 
@@ -600,18 +694,16 @@ impl RegionOverlayState {
                         );
 
                         if active_region.is_some() {
-                            painter.rect_stroke(
+                            paint_dashed_border(
+                                &painter,
                                 sel,
-                                0.0,
-                                Stroke::new(2.0_f32, accent),
-                                egui::StrokeKind::Outside,
+                                Color32::WHITE,
+                                Color32::from_black_alpha(230),
+                                6.0_f32,
                             );
-                            painter.rect_stroke(
-                                sel,
-                                0.0,
-                                Stroke::new(1.0_f32, Color32::WHITE),
-                                egui::StrokeKind::Inside,
-                            );
+                            if !matches!(self.drag, Some(OverlayDrag::RegionSelect { .. })) {
+                                paint_selection_handles(&painter, sel);
+                            }
                         }
                     } else if !color_picker && self.active_tool == OverlayTool::Region {
                         painter.rect_filled(screen_rect, 0.0, scrim);
@@ -622,91 +714,117 @@ impl RegionOverlayState {
                     }
 
                     if let (Some((window, _)), Some(rect)) = (snapped_window, visual_snap_rect) {
-                        paint_snapped_window(&painter, to_screen_rect(rect), screen_rect, window);
+                        paint_snapped_window(
+                            &painter,
+                            to_screen_rect(rect),
+                            screen_rect,
+                            toolbar_rect,
+                            window,
+                        );
                     }
                     self.visual_snap_rect = visual_snap_rect;
                     self.visual_snap_target = target_snap_rect;
 
                     if let Some(pos) = pointer_pos {
                         if self.active_tool == OverlayTool::Region {
-                            let guide = Stroke::new(
-                                1.0_f32,
-                                Color32::from_rgba_unmultiplied(96, 165, 250, 165),
+                            let px = 1.0_f32 / painter.pixels_per_point();
+                            let snapped_pos = pos.round_to_pixels(painter.pixels_per_point());
+                            let shadow_guide = Stroke::new(px, Color32::from_black_alpha(80));
+                            let light_guide = Stroke::new(
+                                px,
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 155),
                             );
                             painter.line_segment(
                                 [
-                                    Pos2::new(screen_rect.min.x, pos.y),
-                                    Pos2::new(screen_rect.max.x, pos.y),
+                                    Pos2::new(screen_rect.min.x, snapped_pos.y + px),
+                                    Pos2::new(screen_rect.max.x, snapped_pos.y + px),
                                 ],
-                                guide,
+                                shadow_guide,
                             );
                             painter.line_segment(
                                 [
-                                    Pos2::new(pos.x, screen_rect.min.y),
-                                    Pos2::new(pos.x, screen_rect.max.y),
+                                    Pos2::new(snapped_pos.x + px, screen_rect.min.y),
+                                    Pos2::new(snapped_pos.x + px, screen_rect.max.y),
                                 ],
-                                guide,
+                                shadow_guide,
+                            );
+                            painter.line_segment(
+                                [
+                                    Pos2::new(screen_rect.min.x, snapped_pos.y),
+                                    Pos2::new(screen_rect.max.x, snapped_pos.y),
+                                ],
+                                light_guide,
+                            );
+                            painter.line_segment(
+                                [
+                                    Pos2::new(snapped_pos.x, screen_rect.min.y),
+                                    Pos2::new(snapped_pos.x, screen_rect.max.y),
+                                ],
+                                light_guide,
                             );
                         }
 
                         let img_pt = to_image(pos);
-                        let hud = if !capture_mode {
+                        let hud = if let Some(sel) = active_region {
                             format!(
-                                "X: {}  Y: {}",
+                                "{} × {}",
+                                sel.width.round() as u32,
+                                sel.height.round() as u32,
+                            )
+                        } else if let Some(snap_rect) = target_snap_rect {
+                            format!(
+                                "{} × {}",
+                                snap_rect.width.round() as u32,
+                                snap_rect.height.round() as u32,
+                            )
+                        } else if !capture_mode || self.active_tool == OverlayTool::Region {
+                            format!(
+                                "{}, {}",
                                 self.origin_x + img_pt.x.floor() as i32,
                                 self.origin_y + img_pt.y.floor() as i32,
                             )
-                        } else if let Some(sel) = active_region {
-                            format!(
-                                "X: {}  Y: {}  W: {}  H: {}  |  Tool: {}  |  Enter: save  |  Esc: cancel",
-                                self.origin_x + sel.x.round() as i32,
-                                self.origin_y + sel.y.round() as i32,
-                                sel.width.round() as u32,
-                                sel.height.round() as u32,
-                                self.active_tool.label()
-                            )
                         } else {
                             format!(
-                                "X: {}  Y: {}  |  Tool: {}  |  Drag to {}  |  Esc: cancel",
+                                "{} · {}, {}",
+                                self.active_tool.label(),
                                 self.origin_x + img_pt.x.round() as i32,
                                 self.origin_y + img_pt.y.round() as i32,
-                                self.active_tool.label(),
-                                if self.active_tool == OverlayTool::Region {
-                                    "select region"
-                                } else {
-                                    "annotate"
-                                }
                             )
                         };
 
-                        let galley =
-                            painter.layout_no_wrap(hud, FontId::monospace(12.5), Color32::WHITE);
-                        let badge_size = galley.size() + Vec2::new(14.0, 8.0);
+                        let galley = painter.layout_no_wrap(
+                            hud,
+                            FontId::monospace(11.5_f32),
+                            Color32::from_rgb(242, 245, 250),
+                        );
+                        let badge_size = galley.size() + Vec2::new(14.0, 7.0);
                         let clamp_badge = |top_left: Pos2| {
-                            top_left.min(screen_rect.max - badge_size).max(screen_rect.min)
+                            top_left
+                                .min(screen_rect.max - badge_size)
+                                .max(screen_rect.min)
                         };
-                        let mut badge_pos = clamp_badge(pos + Vec2::new(16.0, 18.0));
+                        let mut badge_pos = clamp_badge(pos + Vec2::new(14.0, 16.0));
                         if Rect::from_min_size(badge_pos, badge_size).intersects(toolbar_rect) {
                             let below = toolbar_rect.max.y + 8.0;
                             let above = toolbar_rect.min.y - badge_size.y - 8.0;
                             badge_pos = clamp_badge(Pos2::new(
                                 badge_pos.x,
-                                if below + badge_size.y <= screen_rect.max.y { below } else { above },
+                                if below + badge_size.y <= screen_rect.max.y {
+                                    below
+                                } else {
+                                    above
+                                },
                             ));
                         }
                         let badge_rect = Rect::from_min_size(badge_pos, badge_size);
-                        painter.rect_filled(
-                            badge_rect,
-                            CornerRadius::same(4),
-                            Color32::from_rgba_unmultiplied(20, 24, 30, 232),
-                        );
+                        painter.rect_filled(badge_rect, CornerRadius::same(6), glass_bg());
                         painter.rect_stroke(
                             badge_rect,
-                            CornerRadius::same(4),
-                            Stroke::new(1.0_f32, accent),
+                            CornerRadius::same(6),
+                            Stroke::new(1.0_f32, glass_border()),
                             egui::StrokeKind::Inside,
                         );
-                        painter.galley(badge_pos + Vec2::new(7.0, 4.0), galley, Color32::WHITE);
+                        painter.galley(badge_pos + Vec2::new(7.0, 3.5), galley, Color32::WHITE);
 
                         if color_picker || self.show_magnifier {
                             let image = self.document.base_image();
@@ -715,15 +833,22 @@ impl RegionOverlayState {
                             let Ok(ColorSample { r, g, b, .. }) = sample_image(image, x, y) else {
                                 return;
                             };
-                            let loupe = compute_loupe_uv_rect([x, y], [image.width(), image.height()]);
+                            let loupe =
+                                compute_loupe_uv_rect([x, y], [image.width(), image.height()]);
                             let hex = format_picked_color(r, g, b);
-                            if !typing && overlay_ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::C)) {
+                            if !typing
+                                && overlay_ctx
+                                    .input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::C))
+                            {
                                 overlay_ctx.copy_text(hex.clone());
                             }
-                            let mut readout = format!("HEX {hex}\nRGB({r}, {g}, {b})");
+                            let mut readout = format!("{hex}\n{r}, {g}, {b}");
                             if color_picker {
-                                let (hue, saturation, lightness) = ColorSample::rgb(r, g, b).to_hsl();
-                                readout.push_str(&format!("\nHSL({hue:.0}°, {saturation:.0}%, {lightness:.0}%)"));
+                                let (hue, saturation, lightness) =
+                                    ColorSample::rgb(r, g, b).to_hsl();
+                                readout.push_str(&format!(
+                                    "\n{hue:.0}° {saturation:.0}% {lightness:.0}%"
+                                ));
                             }
                             paint_magnifier(
                                 &painter,
@@ -731,8 +856,11 @@ impl RegionOverlayState {
                                 screen_rect,
                                 [toolbar_rect, badge_rect],
                                 self.texture.id(),
-                                loupe,
-                                &readout,
+                                LoupeView {
+                                    region: loupe,
+                                    swatch: Color32::from_rgb(r, g, b),
+                                    footer: &readout,
+                                },
                             );
                         }
                     }
@@ -776,135 +904,225 @@ impl RegionOverlayState {
         accent: Color32,
         toolbar_action: &mut Option<OverlayModeOutcome>,
     ) {
+        let show_options = self.show_style_bar || self.active_tool != OverlayTool::Region;
         ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(2.0_f32, 6.0_f32);
             ui.horizontal(|ui| {
-                for tool in OverlayTool::ALL {
+                for (index, tool) in OverlayTool::ALL.into_iter().enumerate() {
+                    if index == 2 {
+                        paint_toolbar_divider(ui);
+                    }
                     let selected = self.active_tool == tool;
-                    let btn = egui::Button::new(RichText::new(tool.label()).size(12.0).color(
-                        if selected {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgb(220, 226, 234)
-                        },
-                    ))
-                    .fill(if selected {
-                        accent
-                    } else {
-                        Color32::from_rgb(38, 43, 52)
-                    });
-                    if ui.add(btn).clicked() {
+                    if toolbar_icon_button(ui, tool.icon(), tool.tooltip(), selected, accent)
+                        .clicked()
+                    {
                         self.active_tool = tool;
                         self.drag = None;
                     }
                 }
-            });
 
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.snap_to_windows, "Snap windows");
-                ui.checkbox(&mut self.show_magnifier, "Loupe")
-                    .on_hover_text("Press C on the canvas to copy the hex color");
-            });
-            ui.horizontal(|ui| {
-                for swatch in SHAREX_PALETTE {
-                    let is_current = self.color == swatch;
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
-                    ui.painter()
-                        .rect_filled(rect, CornerRadius::same(3), to_egui_color(swatch));
-                    ui.painter().rect_stroke(
-                        rect,
-                        CornerRadius::same(3),
-                        Stroke::new(
-                            if is_current { 2.0_f32 } else { 1.0_f32 },
-                            if is_current {
-                                Color32::WHITE
-                            } else {
-                                Color32::from_rgb(70, 78, 90)
-                            },
-                        ),
-                        egui::StrokeKind::Inside,
+                paint_toolbar_divider(ui);
+
+                let (swatch_rect, swatch_resp) =
+                    ui.allocate_exact_size(Vec2::splat(28.0_f32), Sense::click());
+                if swatch_resp.hovered() || self.show_style_bar {
+                    ui.painter().rect_filled(
+                        swatch_rect,
+                        CornerRadius::same(6),
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 22),
                     );
-                    if resp.clicked() {
-                        self.color = swatch;
-                    }
+                }
+                ui.painter().circle_filled(
+                    swatch_rect.center(),
+                    7.0_f32,
+                    to_egui_color(self.color),
+                );
+                ui.painter().circle_stroke(
+                    swatch_rect.center(),
+                    7.5_f32,
+                    Stroke::new(
+                        1.25_f32,
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 210),
+                    ),
+                );
+                if swatch_resp.on_hover_text("Color & tool options").clicked() {
+                    self.show_style_bar = !self.show_style_bar;
                 }
 
-                ui.separator();
-                match self.active_tool {
-                    OverlayTool::Text => {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.text_draft).desired_width(110.0),
-                        );
-                        ui.add(
-                            egui::DragValue::new(&mut self.font_size)
-                                .range(12.0..=56.0)
-                                .prefix("Sz "),
-                        );
-                    }
-                    OverlayTool::Pixelate | OverlayTool::Blur => {
-                        ui.add(
-                            egui::DragValue::new(&mut self.effect_strength)
-                                .range(4..=32)
-                                .prefix("Str "),
-                        );
-                    }
-                    OverlayTool::StepNumber => {
-                        ui.label(
-                            RichText::new(format!("#{}", self.document.next_step_number()))
-                                .color(Color32::WHITE),
-                        );
-                    }
-                    _ => {
-                        ui.add(
-                            egui::DragValue::new(&mut self.stroke_width)
-                                .range(1.0..=24.0)
-                                .suffix("px"),
-                        );
-                    }
+                paint_toolbar_divider(ui);
+
+                let toggle_bg = Color32::from_rgba_unmultiplied(59, 130, 246, 85);
+                if toolbar_icon_button(
+                    ui,
+                    Icon::SnapMagnet,
+                    "Snap to visible windows",
+                    self.snap_to_windows,
+                    toggle_bg,
+                )
+                .clicked()
+                {
+                    self.snap_to_windows = !self.snap_to_windows;
+                }
+                if toolbar_icon_button(
+                    ui,
+                    Icon::Loupe,
+                    "Pixel magnifier (press C to copy HEX)",
+                    self.show_magnifier,
+                    toggle_bg,
+                )
+                .clicked()
+                {
+                    self.show_magnifier = !self.show_magnifier;
                 }
 
-                ui.separator();
-                if ui
-                    .add_enabled(self.document.can_undo(), egui::Button::new("Undo"))
-                    .clicked()
+                paint_toolbar_divider(ui);
+
+                if overlay_action_icon_button(
+                    ui,
+                    Icon::Undo,
+                    "Undo (Ctrl+Z)",
+                    self.document.can_undo(),
+                    None,
+                )
+                .clicked()
                 {
                     self.document.undo();
                 }
-                if ui
-                    .add_enabled(self.document.can_redo(), egui::Button::new("Redo"))
-                    .clicked()
+                if overlay_action_icon_button(
+                    ui,
+                    Icon::Redo,
+                    "Redo (Ctrl+Y)",
+                    self.document.can_redo(),
+                    None,
+                )
+                .clicked()
                 {
                     self.document.redo();
                 }
-                if ui
-                    .add_enabled(
-                        self.document.selected_id().is_some(),
-                        egui::Button::new("Del"),
+                if self.document.selected_id().is_some()
+                    && overlay_action_icon_button(
+                        ui,
+                        Icon::Trash,
+                        "Delete selected (Del)",
+                        true,
+                        Some(Color32::from_rgb(239, 68, 68)),
                     )
                     .clicked()
                 {
                     self.document.delete_selected();
                 }
 
-                ui.separator();
-                ui.checkbox(&mut self.auto_capture_on_drag, "Auto-capture");
+                paint_toolbar_divider(ui);
 
-                let cap_btn = egui::Button::new(
-                    RichText::new("Capture [Enter]")
-                        .size(12.0)
-                        .color(Color32::WHITE),
+                if overlay_action_icon_button(
+                    ui,
+                    Icon::Check,
+                    "Capture now (Enter)",
+                    true,
+                    Some(Color32::from_rgb(34, 197, 94)),
                 )
-                .fill(accent);
-                if ui.add(cap_btn).clicked() {
+                .clicked()
+                {
                     *toolbar_action = self.finalize_selection(false);
                 }
-                if ui.button("Full Editor").clicked() {
+                if overlay_action_icon_button(ui, Icon::Editor, "Open in Full Editor", true, None)
+                    .clicked()
+                {
                     *toolbar_action = self.finalize_selection(true);
                 }
-                if ui.button("Cancel [Esc]").clicked() {
+                if overlay_action_icon_button(
+                    ui,
+                    Icon::Close,
+                    "Cancel (Esc / Right-click)",
+                    true,
+                    Some(Color32::from_rgb(239, 68, 68)),
+                )
+                .clicked()
+                {
                     *toolbar_action = Some(OverlayModeOutcome::Cancelled);
                 }
             });
+
+            if show_options {
+                let (sep_rect, _) = ui
+                    .allocate_exact_size(Vec2::new(ui.available_width(), 1.0_f32), Sense::hover());
+                ui.painter().line_segment(
+                    [sep_rect.left_center(), sep_rect.right_center()],
+                    Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 18)),
+                );
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0_f32;
+                    for swatch in SHAREX_PALETTE {
+                        let is_current = self.color == swatch;
+                        let (rect, resp) =
+                            ui.allocate_exact_size(Vec2::splat(16.0_f32), Sense::click());
+                        ui.painter()
+                            .circle_filled(rect.center(), 6.5_f32, to_egui_color(swatch));
+                        if is_current {
+                            ui.painter().circle_stroke(
+                                rect.center(),
+                                7.5_f32,
+                                Stroke::new(1.5_f32, Color32::WHITE),
+                            );
+                        } else if resp.hovered() {
+                            ui.painter().circle_stroke(
+                                rect.center(),
+                                7.5_f32,
+                                Stroke::new(
+                                    1.0_f32,
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 130),
+                                ),
+                            );
+                        }
+                        if resp.clicked() {
+                            self.color = swatch;
+                        }
+                    }
+
+                    paint_toolbar_divider(ui);
+
+                    match self.active_tool {
+                        OverlayTool::Text => {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.text_draft)
+                                    .desired_width(110.0_f32),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.font_size)
+                                    .range(12.0_f32..=56.0_f32)
+                                    .prefix("Sz "),
+                            );
+                        }
+                        OverlayTool::Pixelate | OverlayTool::Blur => {
+                            ui.add(
+                                egui::DragValue::new(&mut self.effect_strength)
+                                    .range(4..=32)
+                                    .prefix("Str "),
+                            );
+                        }
+                        OverlayTool::StepNumber => {
+                            ui.label(
+                                RichText::new(format!("#{}", self.document.next_step_number()))
+                                    .size(12.0_f32)
+                                    .monospace()
+                                    .color(Color32::WHITE),
+                            );
+                        }
+                        _ => {
+                            ui.add(
+                                egui::DragValue::new(&mut self.stroke_width)
+                                    .range(1.0_f32..=24.0_f32)
+                                    .suffix(" px"),
+                            );
+                        }
+                    }
+
+                    paint_toolbar_divider(ui);
+
+                    ui.checkbox(&mut self.auto_capture_on_drag, "Auto-capture")
+                        .on_hover_text("Finish immediately when releasing a region drag");
+                });
+            }
         });
     }
 
@@ -1342,47 +1560,141 @@ fn clipped_window_rect(
     })
 }
 
+fn paint_toolbar_divider(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(7.0_f32, 20.0_f32), Sense::hover());
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.center().x, rect.top() + 2.0_f32),
+            Pos2::new(rect.center().x, rect.bottom() - 2.0_f32),
+        ],
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 24)),
+    );
+}
+
+fn overlay_action_icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    tooltip: &str,
+    enabled: bool,
+    tint: Option<Color32>,
+) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.0_f32), sense);
+    let hovered = enabled && response.hovered();
+    let bg = if hovered {
+        tint.map_or(Color32::from_rgba_unmultiplied(255, 255, 255, 24), |c| {
+            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 44)
+        })
+    } else if enabled && icon == Icon::Check {
+        Color32::from_rgba_unmultiplied(34, 197, 94, 34)
+    } else {
+        Color32::TRANSPARENT
+    };
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, CornerRadius::same(6), bg);
+    }
+    let fg = if !enabled {
+        Color32::from_rgba_unmultiplied(148, 163, 184, 72)
+    } else if hovered {
+        tint.unwrap_or(Color32::WHITE)
+    } else if icon == Icon::Check {
+        Color32::from_rgb(74, 222, 128)
+    } else {
+        Color32::from_rgb(184, 194, 210)
+    };
+    paint_icon(ui.painter(), rect.shrink(6.0_f32), icon, fg);
+    response.on_hover_text(tooltip)
+}
+
+fn paint_selection_handles(painter: &egui::Painter, bounds: Rect) {
+    let half = 3.5_f32;
+    let points = [
+        bounds.left_top(),
+        bounds.right_top(),
+        bounds.left_bottom(),
+        bounds.right_bottom(),
+        Pos2::new(bounds.center().x, bounds.top()),
+        Pos2::new(bounds.center().x, bounds.bottom()),
+        Pos2::new(bounds.left(), bounds.center().y),
+        Pos2::new(bounds.right(), bounds.center().y),
+    ];
+    for center in points {
+        let handle = Rect::from_center_size(center, Vec2::splat(half * 2.0_f32));
+        painter.rect_filled(handle, CornerRadius::same(1), Color32::WHITE);
+        painter.rect_stroke(
+            handle,
+            CornerRadius::same(1),
+            Stroke::new(1.0_f32, Color32::from_black_alpha(210)),
+            egui::StrokeKind::Outside,
+        );
+    }
+}
+
 fn paint_snapped_window(
     painter: &egui::Painter,
     bounds: Rect,
     screen_rect: Rect,
+    toolbar_rect: Rect,
     window: &WindowInfo,
 ) {
     painter.rect_filled(
         bounds,
         0.0,
-        Color32::from_rgba_unmultiplied(34, 197, 94, 20),
+        Color32::from_rgba_unmultiplied(59, 130, 246, 16),
     );
-    paint_snap_border(painter, bounds);
+    paint_dashed_border(
+        painter,
+        bounds,
+        Color32::WHITE,
+        Color32::from_black_alpha(225),
+        5.0_f32,
+    );
 
     let text = match (window.app_name.as_str(), window.title.as_str()) {
-        ("", "") => "Window".into(),
+        ("", "") => return,
         ("", title) => title.into(),
         (app, title) if title.is_empty() || app == title => app.into(),
-        (app, title) => format!("{app} / {title}"),
+        (app, title) => format!("{app} · {title}"),
     };
-    let padding = Vec2::new(6.0, 3.0);
+    let padding = Vec2::new(8.0_f32, 4.0_f32);
+    let max_width = (bounds.width().min(420.0_f32) - 2.0_f32 * padding.x).max(60.0_f32);
     let mut label = egui::text::LayoutJob::simple(
         text,
-        FontId::proportional(12.0),
-        SNAP_COLOR,
-        (screen_rect.width() - 2.0 * padding.x).max(0.0),
+        FontId::proportional(11.5_f32),
+        Color32::from_rgb(238, 242, 248),
+        max_width,
     );
     label.wrap.max_rows = 1;
     let galley = painter.layout_job(label);
-    let size = galley.size() + 2.0 * padding;
-    let pos = (bounds.min + Vec2::splat(3.0))
-        .min(screen_rect.max - size)
-        .max(screen_rect.min);
-    painter.rect_filled(
-        Rect::from_min_size(pos, size),
-        CornerRadius::same(3),
-        Color32::from_black_alpha(232),
+    let size = galley.size() + 2.0_f32 * padding;
+    let mut pos = (bounds.min + Vec2::splat(8.0_f32))
+        .min(screen_rect.max - size - Vec2::splat(4.0_f32))
+        .max(screen_rect.min + Vec2::splat(4.0_f32));
+    if Rect::from_min_size(pos, size).intersects(toolbar_rect) {
+        pos.y = (toolbar_rect.max.y + 8.0_f32).min(screen_rect.max.y - size.y - 4.0_f32);
+    }
+    let chip = Rect::from_min_size(pos, size);
+    painter.rect_filled(chip, CornerRadius::same(6), glass_bg());
+    painter.rect_stroke(
+        chip,
+        CornerRadius::same(6),
+        Stroke::new(1.0_f32, glass_border()),
+        egui::StrokeKind::Inside,
     );
-    painter.galley(pos + padding, galley, SNAP_COLOR);
+    painter.galley(pos + padding, galley, Color32::WHITE);
 }
 
-fn paint_snap_border(painter: &egui::Painter, bounds: Rect) {
+fn paint_dashed_border(
+    painter: &egui::Painter,
+    bounds: Rect,
+    light_color: Color32,
+    dark_color: Color32,
+    dash_pixels: f32,
+) {
     let pixels_per_point = painter.pixels_per_point();
     let pixel = 1.0_f32 / pixels_per_point;
     let bounds = Rect::from_min_max(
@@ -1398,12 +1710,8 @@ fn paint_snap_border(painter: &egui::Painter, bounds: Rect) {
         };
         let mut light = true;
         while start < end {
-            let stop = (start + 6.0 * pixel).min(end);
-            let color = if light {
-                SNAP_COLOR
-            } else {
-                Color32::from_black_alpha(220)
-            };
+            let stop = (start + dash_pixels * pixel).min(end);
+            let color = if light { light_color } else { dark_color };
             let strips = if horizontal {
                 [bounds.top(), bounds.bottom() - pixel]
                     .map(|y| Rect::from_min_max(Pos2::new(start, y), Pos2::new(stop, y + pixel)))
@@ -1472,25 +1780,38 @@ fn compute_loupe_uv_rect(center: [u32; 2], size: [u32; 2]) -> LoupeRegion {
     }
 }
 
+struct LoupeView<'a> {
+    region: LoupeRegion,
+    swatch: Color32,
+    footer: &'a str,
+}
+
 fn paint_magnifier(
     painter: &egui::Painter,
     cursor: Pos2,
     screen_rect: Rect,
     obstacles: [Rect; 2],
     texture: egui::TextureId,
-    loupe: LoupeRegion,
-    footer: &str,
+    view: LoupeView<'_>,
 ) {
     const SIDE: usize = (MAGNIFIER_HALF_EXTENT * 2 + 1) as usize;
     let pixels_per_point = painter.pixels_per_point();
     let physical_pixel = 1.0_f32 / pixels_per_point;
     let cell_size = 10.0 * physical_pixel;
     let grid_size = SIDE as f32 * cell_size;
-    let galley = painter.layout_no_wrap(footer.into(), FontId::monospace(10.0), Color32::WHITE);
-    let padding = Vec2::new(5.0, 3.0);
+    let inset = 4.0_f32;
+    let swatch_side = 10.0_f32;
+    let swatch_gap = 6.0_f32;
+    let galley = painter.layout_no_wrap(
+        view.footer.into(),
+        FontId::monospace(10.5_f32),
+        Color32::from_rgb(232, 238, 246),
+    );
+    let footer_row_w = swatch_side + swatch_gap + galley.size().x;
+    let padding = Vec2::new(6.0_f32, 5.0_f32);
     let size = Vec2::new(
-        grid_size.max(galley.size().x + 2.0 * padding.x),
-        grid_size + galley.size().y + 2.0 * padding.y,
+        (grid_size + 2.0_f32 * inset).max(footer_row_w + 2.0_f32 * padding.x),
+        inset + grid_size + galley.size().y + 2.0_f32 * padding.y,
     );
     let right = cursor.x + 16.0;
     let left = cursor.x - 16.0 - size.x;
@@ -1520,15 +1841,35 @@ fn paint_magnifier(
         })
         .unwrap_or(positions[0]);
     let panel = Rect::from_min_size(pos, size);
-    painter.rect_filled(panel, 0.0, Color32::from_rgb(20, 24, 30));
+    painter.rect_filled(panel, CornerRadius::same(8), glass_bg());
 
     let grid_origin =
-        (pos + Vec2::new((size.x - grid_size) * 0.5, 0.0)).round_to_pixels(pixels_per_point);
+        (pos + Vec2::new((size.x - grid_size) * 0.5, inset)).round_to_pixels(pixels_per_point);
+    let full_grid_rect = Rect::from_min_size(grid_origin, Vec2::splat(grid_size));
     let loupe_grid_rect = Rect::from_min_max(
-        grid_origin + loupe.grid_cells.min.to_vec2() * cell_size,
-        grid_origin + loupe.grid_cells.max.to_vec2() * cell_size,
+        grid_origin + view.region.grid_cells.min.to_vec2() * cell_size,
+        grid_origin + view.region.grid_cells.max.to_vec2() * cell_size,
     );
-    painter.image(texture, loupe_grid_rect, loupe.uv_rect, Color32::WHITE);
+    painter.rect_filled(
+        full_grid_rect,
+        CornerRadius::same(3),
+        Color32::from_rgb(10, 12, 16),
+    );
+    painter.image(
+        texture,
+        loupe_grid_rect,
+        view.region.uv_rect,
+        Color32::WHITE,
+    );
+    painter.rect_stroke(
+        full_grid_rect,
+        CornerRadius::same(2),
+        Stroke::new(
+            physical_pixel,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 36),
+        ),
+        egui::StrokeKind::Inside,
+    );
     let center = Rect::from_min_size(
         grid_origin + Vec2::splat(MAGNIFIER_HALF_EXTENT as f32 * cell_size),
         Vec2::splat(cell_size),
@@ -1536,20 +1877,39 @@ fn paint_magnifier(
     painter.rect_stroke(
         center,
         0.0,
-        Stroke::new(physical_pixel, Color32::WHITE),
+        Stroke::new(physical_pixel, Color32::from_black_alpha(230)),
         egui::StrokeKind::Outside,
     );
     painter.rect_stroke(
-        panel,
+        center,
         0.0,
-        Stroke::new(physical_pixel, Color32::from_gray(135)),
+        Stroke::new(physical_pixel, Color32::WHITE),
         egui::StrokeKind::Inside,
     );
-    let footer_pos = Pos2::new(
-        panel.center().x - galley.size().x * 0.5,
-        pos.y + grid_size + padding.y,
+    painter.rect_stroke(
+        panel,
+        CornerRadius::same(8),
+        Stroke::new(1.0_f32, glass_border()),
+        egui::StrokeKind::Inside,
     );
-    painter.galley(footer_pos, galley, Color32::WHITE);
+    let footer_top = pos.y + inset + grid_size + padding.y;
+    let footer_left = panel.center().x - footer_row_w * 0.5;
+    let swatch_rect = Rect::from_min_size(
+        Pos2::new(footer_left, footer_top + 2.0_f32),
+        Vec2::splat(swatch_side),
+    );
+    painter.rect_filled(swatch_rect, CornerRadius::same(3), view.swatch);
+    painter.rect_stroke(
+        swatch_rect,
+        CornerRadius::same(3),
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 175)),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(
+        Pos2::new(footer_left + swatch_side + swatch_gap, footer_top),
+        galley,
+        Color32::WHITE,
+    );
 }
 
 #[cfg(test)]
