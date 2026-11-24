@@ -1,13 +1,17 @@
 use crate::editor_ui::{paint_annotation, paint_arrow, paint_ellipse_stroke, to_egui_color};
 use crate::win_focus::OverlayFocusGuard;
+use eframe::egui::emath::GuiRounding;
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke, Vec2,
 };
-use sharex_capture::DesktopSnapshot;
-use sharex_core::{CapturedImage, Region};
+use sharex_capture::{DesktopSnapshot, XcapCapturer, find_window_at_point};
+use sharex_core::{CapturedImage, Region, ScreenCapturer, WindowInfo};
 use sharex_editor::{AnnotationKind, EditorDocument, Point, RectF, RgbaColor, SHAREX_PALETTE};
 
 const OVERLAY_WINDOW_TITLE: &str = "ShareX Region Capture";
+const SNAP_COLOR: Color32 = Color32::from_rgb(34, 197, 94);
+const MIN_REGION_DRAG: f32 = 4.0;
+const MAGNIFIER_HALF_EXTENT: i32 = 5;
 
 /// Result produced by one frame of the interactive ShareX region capture overlay.
 pub enum OverlayOutcome {
@@ -74,6 +78,7 @@ impl OverlayTool {
 }
 
 enum OverlayDrag {
+    RegionPress { start: Point },
     RegionSelect { start: Point, current: Point },
     Shape { start: Point, current: Point },
     Freehand { points: Vec<Point> },
@@ -90,6 +95,9 @@ pub struct RegionOverlayState {
     active_tool: OverlayTool,
     selection: Option<RectF>,
     auto_capture_on_drag: bool,
+    windows: Vec<WindowInfo>,
+    snap_to_windows: bool,
+    show_magnifier: bool,
     color: RgbaColor,
     stroke_width: f32,
     font_size: f32,
@@ -101,6 +109,8 @@ pub struct RegionOverlayState {
 impl RegionOverlayState {
     pub fn open(ctx: &egui::Context, snapshot: DesktopSnapshot) -> Self {
         let focus_guard = OverlayFocusGuard::capture_current_foreground();
+        let mut windows = XcapCapturer::new().list_windows().unwrap_or_default();
+        windows.retain(|window| !window.title.contains("ShareX"));
         let color_img = egui::ColorImage::from_rgba_unmultiplied(
             [
                 snapshot.image.width() as usize,
@@ -122,6 +132,9 @@ impl RegionOverlayState {
             active_tool: OverlayTool::Region,
             selection: None,
             auto_capture_on_drag: true,
+            windows,
+            snap_to_windows: true,
+            show_magnifier: true,
             color: RgbaColor::RED,
             stroke_width: 4.0,
             font_size: 20.0,
@@ -204,7 +217,6 @@ impl RegionOverlayState {
             }
 
             let mut toolbar_action: Option<OverlayOutcome> = None;
-            let mut toolbar_rect = Rect::NOTHING;
 
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
@@ -220,11 +232,22 @@ impl RegionOverlayState {
                             screen_rect.min.y + pt.y * scale_y,
                         )
                     };
-                    let to_image = |pos: Pos2| {
+                    let to_image_unclamped = |pos: Pos2| {
                         Point::new(
-                            ((pos.x - screen_rect.min.x) / scale_x).clamp(0.0, img_w),
-                            ((pos.y - screen_rect.min.y) / scale_y).clamp(0.0, img_h),
+                            (pos.x - screen_rect.min.x) / scale_x,
+                            (pos.y - screen_rect.min.y) / scale_y,
                         )
+                    };
+                    let to_image = |pos: Pos2| {
+                        let point = to_image_unclamped(pos);
+                        Point::new(point.x.clamp(0.0, img_w), point.y.clamp(0.0, img_h))
+                    };
+                    let to_screen_rect = |rect: RectF| {
+                        Rect::from_min_max(
+                            to_screen(Point::new(rect.x, rect.y)),
+                            to_screen(Point::new(rect.right(), rect.bottom())),
+                        )
+                        .intersect(screen_rect)
                     };
 
                     let response = ui.allocate_rect(screen_rect, Sense::click_and_drag());
@@ -238,6 +261,56 @@ impl RegionOverlayState {
                     );
 
                     let accent = Color32::from_rgb(59, 130, 246);
+                    let toolbar_rect = egui::Area::new(egui::Id::new("sharex_region_floating_bar"))
+                        .order(egui::Order::Foreground)
+                        .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 10.0))
+                        .show(overlay_ctx, |ui| {
+                            egui::Frame::NONE
+                                .fill(Color32::from_rgba_unmultiplied(24, 28, 34, 242))
+                                .stroke(Stroke::new(1.0_f32, accent))
+                                .corner_radius(CornerRadius::same(6))
+                                .inner_margin(Margin::symmetric(10, 6))
+                                .show(ui, |ui| {
+                                    self.render_floating_toolbar(ui, accent, &mut toolbar_action);
+                                });
+                        })
+                        .response
+                        .rect;
+
+                    let is_canvas = |pos: Pos2| {
+                        screen_rect.contains(pos) && !toolbar_rect.contains(pos)
+                    };
+                    let pointer_pos = overlay_ctx.input(|i| i.pointer.hover_pos()).filter(|&pos| is_canvas(pos));
+
+                    if pointer_pos.is_some() {
+                        overlay_ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                        if response.secondary_clicked() {
+                            if self.active_tool == OverlayTool::Region {
+                                outcome = OverlayOutcome::Cancelled;
+                                return;
+                            }
+                            self.active_tool = OverlayTool::Region;
+                            self.drag = None;
+                        }
+                    }
+
+                    if self.active_tool == OverlayTool::Region {
+                        let selection = overlay_ctx.input(|input| {
+                            self.handle_region_input(&input.events, &is_canvas, &to_image_unclamped)
+                        });
+                        if let Some(selection) = selection {
+                            self.selection = Some(selection);
+                            if self.auto_capture_on_drag
+                                && let Some(captured) = self.finalize_capture(false)
+                            {
+                                outcome = captured;
+                                return;
+                            }
+                        }
+                    } else if pointer_pos.is_some() {
+                        self.handle_annotation_input(&response, &to_image);
+                    }
+
                     for item in self.document.annotations() {
                         let selected = self.document.selected_id() == Some(item.id);
                         paint_annotation(&painter, item, &to_screen, zoom, selected, accent);
@@ -249,14 +322,15 @@ impl RegionOverlayState {
                         }
                         _ => self.selection,
                     };
+                    let snapped_window = if matches!(self.drag, Some(OverlayDrag::RegionSelect { .. })) {
+                        None
+                    } else {
+                        pointer_pos.and_then(|pos| self.snapped_window_at(to_image(pos)))
+                    };
 
                     let scrim = Color32::from_black_alpha(125);
-                    if let Some(sel_img) = active_region {
-                        let sel = Rect::from_min_max(
-                            to_screen(Point::new(sel_img.x, sel_img.y)),
-                            to_screen(Point::new(sel_img.right(), sel_img.bottom())),
-                        )
-                        .intersect(screen_rect);
+                    if let Some(sel_img) = active_region.or(snapped_window.map(|(_, rect)| rect)) {
+                        let sel = to_screen_rect(sel_img);
 
                         painter.rect_filled(
                             Rect::from_min_max(
@@ -291,18 +365,20 @@ impl RegionOverlayState {
                             scrim,
                         );
 
-                        painter.rect_stroke(
-                            sel,
-                            0.0,
-                            Stroke::new(2.0_f32, accent),
-                            egui::StrokeKind::Outside,
-                        );
-                        painter.rect_stroke(
-                            sel,
-                            0.0,
-                            Stroke::new(1.0_f32, Color32::WHITE),
-                            egui::StrokeKind::Inside,
-                        );
+                        if active_region.is_some() {
+                            painter.rect_stroke(
+                                sel,
+                                0.0,
+                                Stroke::new(2.0_f32, accent),
+                                egui::StrokeKind::Outside,
+                            );
+                            painter.rect_stroke(
+                                sel,
+                                0.0,
+                                Stroke::new(1.0_f32, Color32::WHITE),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
                     } else if self.active_tool == OverlayTool::Region {
                         painter.rect_filled(screen_rect, 0.0, scrim);
                     }
@@ -311,49 +387,7 @@ impl RegionOverlayState {
                         self.paint_draft(&painter, draft, &to_screen, zoom, accent);
                     }
 
-                    let area_resp = egui::Area::new(egui::Id::new("sharex_region_floating_bar"))
-                        .order(egui::Order::Foreground)
-                        .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 10.0))
-                        .show(overlay_ctx, |ui| {
-                            egui::Frame::NONE
-                                .fill(Color32::from_rgba_unmultiplied(24, 28, 34, 242))
-                                .stroke(Stroke::new(1.0_f32, accent))
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(Margin::symmetric(10, 6))
-                                .show(ui, |ui| {
-                                    self.render_floating_toolbar(ui, accent, &mut toolbar_action);
-                                });
-                        });
-                    toolbar_rect = area_resp.response.rect;
-
-                    let pointer_pos = overlay_ctx.input(|i| i.pointer.hover_pos());
-                    let over_toolbar = pointer_pos.is_some_and(|p| toolbar_rect.contains(p))
-                        || overlay_ctx.is_pointer_over_area();
-
-                    if !over_toolbar {
-                        overlay_ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-
-                        if response.secondary_clicked() {
-                            if self.active_tool != OverlayTool::Region {
-                                self.active_tool = OverlayTool::Region;
-                                self.drag = None;
-                            } else {
-                                outcome = OverlayOutcome::Cancelled;
-                                return;
-                            }
-                        }
-
-                        if let Some(finished) =
-                            self.handle_canvas_input(&response, &to_image)
-                        {
-                            outcome = finished;
-                            return;
-                        }
-                    }
-
-                    if let Some(pos) = pointer_pos
-                        && !over_toolbar
-                    {
+                    if let Some(pos) = pointer_pos {
                         if self.active_tool == OverlayTool::Region {
                             let guide = Stroke::new(
                                 1.0_f32,
@@ -373,6 +407,10 @@ impl RegionOverlayState {
                                 ],
                                 guide,
                             );
+                        }
+
+                        if let Some((window, rect)) = snapped_window {
+                            paint_snapped_window(&painter, to_screen_rect(rect), screen_rect, window);
                         }
 
                         let img_pt = to_image(pos);
@@ -423,6 +461,29 @@ impl RegionOverlayState {
                             egui::StrokeKind::Inside,
                         );
                         painter.galley(badge_pos + Vec2::new(7.0, 4.0), galley, Color32::WHITE);
+
+                        if self.show_magnifier {
+                            let image = self.document.base_image();
+                            let (grid, rgba) = sample_magnifier_grid(
+                                image,
+                                img_pt.x.floor() as i32,
+                                img_pt.y.floor() as i32,
+                                MAGNIFIER_HALF_EXTENT,
+                            );
+                            let [r, g, b, _] = rgba;
+                            let hex = format!("#{r:02X}{g:02X}{b:02X}");
+                            if !typing && overlay_ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::C)) {
+                                overlay_ctx.copy_text(hex.clone());
+                            }
+                            paint_magnifier(
+                                &painter,
+                                pos,
+                                screen_rect,
+                                [toolbar_rect, badge_rect],
+                                &grid,
+                                &format!("HEX {hex}\nRGB({r}, {g}, {b})"),
+                            );
+                        }
                     }
                 });
 
@@ -464,6 +525,11 @@ impl RegionOverlayState {
             });
 
             ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.snap_to_windows, "Snap windows");
+                ui.checkbox(&mut self.show_magnifier, "Loupe")
+                    .on_hover_text("Press C on the canvas to copy the hex color");
+            });
             ui.horizontal(|ui| {
                 for swatch in SHAREX_PALETTE {
                     let is_current = self.color == swatch;
@@ -567,11 +633,101 @@ impl RegionOverlayState {
         });
     }
 
-    fn handle_canvas_input(
+    fn snapped_window_at(&self, point: Point) -> Option<(&WindowInfo, RectF)> {
+        if self.active_tool != OverlayTool::Region || !self.snap_to_windows {
+            return None;
+        }
+
+        let image = self.document.base_image();
+        let window = find_window_at_point(
+            self.origin_x + (point.x.floor() as i32).min(image.width() as i32 - 1),
+            self.origin_y + (point.y.floor() as i32).min(image.height() as i32 - 1),
+            &self.windows,
+        )?;
+        let rect = clipped_window_rect(
+            window,
+            self.origin_x,
+            self.origin_y,
+            image.width(),
+            image.height(),
+        )?;
+        Some((window, rect))
+    }
+
+    fn handle_region_input(
+        &mut self,
+        events: &[egui::Event],
+        is_canvas: &dyn Fn(Pos2) -> bool,
+        to_image: &dyn Fn(Pos2) -> Point,
+    ) -> Option<RectF> {
+        for event in events {
+            match *event {
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    ..
+                } if is_canvas(pos) => {
+                    self.drag = Some(OverlayDrag::RegionPress {
+                        start: to_image(pos),
+                    });
+                }
+                egui::Event::PointerMoved(pos) => self.move_region_pointer(to_image(pos)),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    ..
+                } => {
+                    let point = to_image(pos);
+                    self.move_region_pointer(point);
+                    match self.drag.take() {
+                        Some(OverlayDrag::RegionPress { .. }) if is_canvas(pos) => {
+                            if let Some((_, rect)) = self.snapped_window_at(point) {
+                                return Some(rect);
+                            }
+                        }
+                        Some(OverlayDrag::RegionSelect { start, current }) => {
+                            let rect = RectF::from_points(start, current);
+                            if rect.width >= MIN_REGION_DRAG && rect.height >= MIN_REGION_DRAG {
+                                return Some(rect);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                egui::Event::WindowFocused(false) => self.drag = None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn move_region_pointer(&mut self, point: Point) {
+        let image = self.document.base_image();
+        let clipped = Point::new(
+            point.x.clamp(0.0, image.width() as f32),
+            point.y.clamp(0.0, image.height() as f32),
+        );
+        match &mut self.drag {
+            Some(OverlayDrag::RegionPress { start })
+                if (start.x - point.x).hypot(start.y - point.y) >= MIN_REGION_DRAG =>
+            {
+                self.drag = Some(OverlayDrag::RegionSelect {
+                    start: *start,
+                    current: clipped,
+                });
+            }
+            Some(OverlayDrag::RegionSelect { current, .. }) => *current = clipped,
+            _ => {}
+        }
+    }
+
+    fn handle_annotation_input(
         &mut self,
         response: &egui::Response,
         to_image: &dyn Fn(Pos2) -> Point,
-    ) -> Option<OverlayOutcome> {
+    ) {
         if response.clicked_by(egui::PointerButton::Primary)
             && let Some(pos) = response.interact_pointer_pos()
         {
@@ -610,12 +766,6 @@ impl RegionOverlayState {
         {
             let pt = to_image(pos);
             match self.active_tool {
-                OverlayTool::Region => {
-                    self.drag = Some(OverlayDrag::RegionSelect {
-                        start: pt,
-                        current: pt,
-                    });
-                }
                 OverlayTool::Select => {
                     if let Some(id) = self.document.select_at(pt, 12.0) {
                         self.document.begin_move_undo();
@@ -637,7 +787,7 @@ impl RegionOverlayState {
                         current: pt,
                     });
                 }
-                OverlayTool::Text | OverlayTool::StepNumber => {}
+                OverlayTool::Region | OverlayTool::Text | OverlayTool::StepNumber => {}
             }
         }
 
@@ -646,8 +796,7 @@ impl RegionOverlayState {
         {
             let pt = to_image(pos);
             match &mut self.drag {
-                Some(OverlayDrag::RegionSelect { current, .. })
-                | Some(OverlayDrag::Shape { current, .. }) => {
+                Some(OverlayDrag::Shape { current, .. }) => {
                     *current = pt;
                 }
                 Some(OverlayDrag::Freehand { points }) => {
@@ -665,7 +814,7 @@ impl RegionOverlayState {
                     *last = pt;
                     self.document.translate_annotation(target_id, dx, dy);
                 }
-                None => {}
+                _ => {}
             }
         }
 
@@ -673,16 +822,9 @@ impl RegionOverlayState {
             && let Some(draft) = self.drag.take()
         {
             match draft {
-                OverlayDrag::RegionSelect { start, current } => {
-                    let rect = RectF::from_points(start, current);
-                    if rect.width >= 4.0 && rect.height >= 4.0 {
-                        self.selection = Some(rect);
-                        if self.auto_capture_on_drag {
-                            return self.finalize_capture(false);
-                        }
-                    }
-                }
-                OverlayDrag::MoveSelected { .. } => {}
+                OverlayDrag::RegionPress { .. }
+                | OverlayDrag::RegionSelect { .. }
+                | OverlayDrag::MoveSelected { .. } => {}
                 OverlayDrag::Freehand { points } => {
                     if points.len() >= 2 {
                         let kind = if self.active_tool == OverlayTool::Highlighter {
@@ -704,7 +846,7 @@ impl RegionOverlayState {
                 OverlayDrag::Shape { start, current } => {
                     let rect = RectF::from_points(start, current);
                     if rect.width < 3.0 && rect.height < 3.0 {
-                        return None;
+                        return;
                     }
                     match self.active_tool {
                         OverlayTool::Rectangle => {
@@ -763,8 +905,6 @@ impl RegionOverlayState {
                 }
             }
         }
-
-        None
     }
 
     fn paint_draft(
@@ -776,7 +916,9 @@ impl RegionOverlayState {
         accent: Color32,
     ) {
         match draft {
-            OverlayDrag::RegionSelect { .. } | OverlayDrag::MoveSelected { .. } => {}
+            OverlayDrag::RegionPress { .. }
+            | OverlayDrag::RegionSelect { .. }
+            | OverlayDrag::MoveSelected { .. } => {}
             OverlayDrag::Freehand { points } => {
                 if points.len() >= 2 {
                     let pts: Vec<Pos2> = points.iter().copied().map(to_screen).collect();
@@ -855,9 +997,6 @@ impl RegionOverlayState {
             let y = (sel.y.floor().max(0.0) as u32).min(max_h.saturating_sub(1));
             let w = (sel.width.round() as u32).min(max_w.saturating_sub(x));
             let h = (sel.height.round() as u32).min(max_h.saturating_sub(y));
-            if w < 4 || h < 4 {
-                return None;
-            }
             let local = Region::new(x as i32, y as i32, w, h).ok()?;
             let image = flat.crop(local).ok()?;
             let global =
@@ -873,5 +1012,263 @@ impl RegionOverlayState {
             global_region,
             open_in_editor,
         })
+    }
+}
+
+fn clipped_window_rect(
+    window: &WindowInfo,
+    origin_x: i32,
+    origin_y: i32,
+    image_width: u32,
+    image_height: u32,
+) -> Option<RectF> {
+    let x = i64::from(window.x) - i64::from(origin_x);
+    let y = i64::from(window.y) - i64::from(origin_y);
+    let left = x.max(0);
+    let top = y.max(0);
+    let right = (x + i64::from(window.width)).min(i64::from(image_width));
+    let bottom = (y + i64::from(window.height)).min(i64::from(image_height));
+    (left < right && top < bottom).then(|| {
+        RectF::from_points(
+            Point::new(left as f32, top as f32),
+            Point::new(right as f32, bottom as f32),
+        )
+    })
+}
+
+fn paint_snapped_window(
+    painter: &egui::Painter,
+    bounds: Rect,
+    screen_rect: Rect,
+    window: &WindowInfo,
+) {
+    painter.rect_stroke(
+        bounds,
+        0.0,
+        Stroke::new(2.0_f32, SNAP_COLOR),
+        egui::StrokeKind::Inside,
+    );
+
+    let text = match (window.app_name.as_str(), window.title.as_str()) {
+        ("", "") => "Window".into(),
+        ("", title) => title.into(),
+        (app, title) if title.is_empty() || app == title => app.into(),
+        (app, title) => format!("{app} / {title}"),
+    };
+    let padding = Vec2::new(6.0, 3.0);
+    let mut label = egui::text::LayoutJob::simple(
+        text,
+        FontId::proportional(12.0),
+        SNAP_COLOR,
+        (screen_rect.width() - 2.0 * padding.x).max(0.0),
+    );
+    label.wrap.max_rows = 1;
+    let galley = painter.layout_job(label);
+    let size = galley.size() + 2.0 * padding;
+    let pos = (bounds.min + Vec2::splat(3.0))
+        .min(screen_rect.max - size)
+        .max(screen_rect.min);
+    painter.rect_filled(
+        Rect::from_min_size(pos, size),
+        CornerRadius::same(3),
+        Color32::from_black_alpha(232),
+    );
+    painter.galley(pos + padding, galley, SNAP_COLOR);
+}
+
+fn sample_magnifier_grid(
+    image: &CapturedImage,
+    center_x: i32,
+    center_y: i32,
+    half_extent: i32,
+) -> (Vec<[u8; 4]>, [u8; 4]) {
+    let half_extent = half_extent.max(0);
+    let sample = |dx, dy| {
+        let x = (i64::from(center_x) + i64::from(dx)).clamp(0, i64::from(image.width() - 1));
+        let y = (i64::from(center_y) + i64::from(dy)).clamp(0, i64::from(image.height() - 1));
+        let offset = (y as usize * image.width() as usize + x as usize) * 4;
+        image.rgba()[offset..offset + 4].try_into().unwrap()
+    };
+    let side = half_extent as usize * 2 + 1;
+    let mut grid = Vec::with_capacity(side * side);
+    for dy in -half_extent..=half_extent {
+        for dx in -half_extent..=half_extent {
+            grid.push(sample(dx, dy));
+        }
+    }
+    (grid, sample(0, 0))
+}
+
+fn paint_magnifier(
+    painter: &egui::Painter,
+    cursor: Pos2,
+    screen_rect: Rect,
+    obstacles: [Rect; 2],
+    grid: &[[u8; 4]],
+    footer: &str,
+) {
+    const SIDE: usize = (MAGNIFIER_HALF_EXTENT * 2 + 1) as usize;
+    let pixels_per_point = painter.pixels_per_point();
+    let physical_pixel = 1.0_f32 / pixels_per_point;
+    let cell_size = 10.0 * physical_pixel;
+    let grid_size = SIDE as f32 * cell_size;
+    let galley = painter.layout_no_wrap(footer.into(), FontId::monospace(10.0), Color32::WHITE);
+    let padding = Vec2::new(5.0, 3.0);
+    let size = Vec2::new(
+        grid_size.max(galley.size().x + 2.0 * padding.x),
+        grid_size + galley.size().y + 2.0 * padding.y,
+    );
+    let right = cursor.x + 16.0;
+    let left = cursor.x - 16.0 - size.x;
+    let below = cursor.y + 16.0;
+    let above = cursor.y - 16.0 - size.y;
+    let candidates = [
+        Pos2::new(left, above),
+        Pos2::new(right, above),
+        Pos2::new(left, below),
+        Pos2::new(right, below),
+    ];
+    let positions = candidates.map(|pos| {
+        pos.round_to_pixels(pixels_per_point)
+            .min(screen_rect.max - size)
+            .max(screen_rect.min)
+    });
+    let pos = positions
+        .into_iter()
+        .find(|&pos| {
+            let panel = Rect::from_min_size(pos, size);
+            !panel.contains(cursor) && !obstacles.iter().any(|rect| panel.intersects(*rect))
+        })
+        .or_else(|| {
+            positions
+                .into_iter()
+                .find(|&pos| !Rect::from_min_size(pos, size).contains(cursor))
+        })
+        .unwrap_or(positions[0]);
+    let panel = Rect::from_min_size(pos, size);
+    painter.rect_filled(panel, 0.0, Color32::from_rgb(20, 24, 30));
+
+    let grid_origin =
+        (pos + Vec2::new((size.x - grid_size) * 0.5, 0.0)).round_to_pixels(pixels_per_point);
+    for (index, &[r, g, b, a]) in grid.iter().enumerate() {
+        let offset = Vec2::new((index % SIDE) as f32, (index / SIDE) as f32) * cell_size;
+        let cell = Rect::from_min_size(grid_origin + offset, Vec2::splat(cell_size));
+        painter.rect_filled(cell, 0.0, Color32::from_rgba_unmultiplied(r, g, b, a));
+    }
+
+    let grid_color = Color32::from_black_alpha(72);
+    for index in 1..SIDE {
+        let offset = index as f32 * cell_size;
+        painter.rect_filled(
+            Rect::from_min_size(
+                grid_origin + Vec2::new(offset, 0.0),
+                Vec2::new(physical_pixel, grid_size),
+            ),
+            0.0,
+            grid_color,
+        );
+        painter.rect_filled(
+            Rect::from_min_size(
+                grid_origin + Vec2::new(0.0, offset),
+                Vec2::new(grid_size, physical_pixel),
+            ),
+            0.0,
+            grid_color,
+        );
+    }
+    let center = Rect::from_min_size(
+        grid_origin + Vec2::splat(MAGNIFIER_HALF_EXTENT as f32 * cell_size),
+        Vec2::splat(cell_size),
+    );
+    painter.rect_stroke(
+        center,
+        0.0,
+        Stroke::new(physical_pixel, Color32::WHITE),
+        egui::StrokeKind::Outside,
+    );
+    painter.rect_stroke(
+        center,
+        0.0,
+        Stroke::new(physical_pixel, Color32::RED),
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_stroke(
+        panel,
+        0.0,
+        Stroke::new(physical_pixel, Color32::from_gray(135)),
+        egui::StrokeKind::Inside,
+    );
+    let footer_pos = Pos2::new(
+        panel.center().x - galley.size().x * 0.5,
+        pos.y + grid_size + padding.y,
+    );
+    painter.galley(footer_pos, galley, Color32::WHITE);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sharex_core::WindowId;
+
+    const PIXELS: [[u8; 4]; 4] = [
+        [1, 2, 3, 4],
+        [5, 6, 7, 8],
+        [9, 10, 11, 12],
+        [13, 14, 15, 16],
+    ];
+
+    fn sample_image() -> CapturedImage {
+        CapturedImage::from_rgba(2, 2, PIXELS.concat()).unwrap()
+    }
+
+    #[test]
+    fn magnifier_returns_exact_center_pixel_and_grid_size() {
+        let image = sample_image();
+        let (grid, center) = sample_magnifier_grid(&image, 1, 0, 5);
+        assert_eq!(grid.len(), 11 * 11);
+        assert_eq!(center, PIXELS[1]);
+        assert_eq!(grid[5 * 11 + 5], center);
+        assert_eq!(
+            sample_magnifier_grid(&image, 0, 1, 0),
+            (vec![PIXELS[2]], PIXELS[2])
+        );
+    }
+
+    #[test]
+    fn magnifier_repeats_edge_pixels_in_row_order() {
+        let (grid, center) = sample_magnifier_grid(&sample_image(), 0, 0, 1);
+        let [a, b, c, d] = PIXELS;
+        assert_eq!(grid, [a, a, b, a, a, b, c, c, d]);
+        assert_eq!(center, a);
+        let (grid, center) = sample_magnifier_grid(&sample_image(), 2, 2, 1);
+        assert_eq!(grid, [d; 9]);
+        assert_eq!(center, d);
+    }
+
+    #[test]
+    fn snapped_window_rect_clips_to_overlay_and_rejects_nonoverlap() {
+        let mut window = WindowInfo {
+            id: WindowId::new(1),
+            title: "Document".into(),
+            app_name: "Editor".into(),
+            x: -120,
+            y: -40,
+            width: 90,
+            height: 150,
+            is_minimized: false,
+            is_focused: true,
+        };
+        assert_eq!(
+            clipped_window_rect(&window, -100, -50, 60, 120),
+            Some(RectF {
+                x: 0.0,
+                y: 10.0,
+                width: 60.0,
+                height: 110.0
+            })
+        );
+        window.y = -70;
+        window.height = 20;
+        assert_eq!(clipped_window_rect(&window, -100, -50, 60, 120), None);
     }
 }
