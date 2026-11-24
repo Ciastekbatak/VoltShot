@@ -4,6 +4,7 @@ use crate::editor_ui::{EditorAction, EditorViewState};
 use crate::effects_ui::EffectsPanelState;
 use crate::hotkeys::{HotkeyRuntime, HotkeyStatus, TriggeredHotkey};
 use crate::i18n::{self, UiLanguage};
+use crate::icons::{Icon, paint_icon, palette_icon_button};
 use crate::notifications::{ToastAction, ToastManager};
 use crate::pin_window::PinManager;
 use crate::recording_ui::RecordingPanelState;
@@ -205,6 +206,7 @@ impl SharexGuiApp {
             }
         }
 
+        crate::fonts::install_native_fonts(&cc.egui_ctx);
         apply_sharex_theme(&cc.egui_ctx, config.dark_theme);
         let hotkeys = HotkeyRuntime::new(cc.egui_ctx.clone(), &config.hotkeys);
         let tray = TrayRuntime::new(cc.egui_ctx.clone());
@@ -1114,7 +1116,7 @@ impl SharexGuiApp {
         }
         match CapturedImage::load_from_file(path) {
             Ok(img) => {
-                let color = crate::image_texture::bounded_color_image(&img, 256);
+                let color = crate::image_texture::bounded_color_image(&img, 512);
                 let tex = ctx.load_texture(
                     format!("thumb_{}", path.display()),
                     color,
@@ -1192,6 +1194,7 @@ impl SharexGuiApp {
 
         if sidebar_primary_capture_button(
             ui,
+            Icon::Region,
             s.capture_region_cta,
             &self.hotkey_hint(HotkeyAction::CaptureRegion),
             p,
@@ -1206,6 +1209,7 @@ impl SharexGuiApp {
             .show(ui, |ui| {
                 if sidebar_action_button(
                     ui,
+                    Icon::Fullscreen,
                     s.fullscreen,
                     &self.hotkey_hint(HotkeyAction::CaptureFullscreen),
                     p,
@@ -1214,6 +1218,7 @@ impl SharexGuiApp {
                 }
                 if sidebar_action_button(
                     ui,
+                    Icon::Window,
                     s.active_window,
                     &self.hotkey_hint(HotkeyAction::CaptureActiveWindow),
                     p,
@@ -1222,11 +1227,30 @@ impl SharexGuiApp {
                 }
                 if sidebar_action_button(
                     ui,
+                    Icon::LastRegion,
                     s.last_region,
                     &self.hotkey_hint(HotkeyAction::CaptureLastRegion),
                     p,
                 ) {
                     self.capture_last_region(ctx, self.capture_settings());
+                }
+                if sidebar_action_button(
+                    ui,
+                    Icon::OcrText,
+                    s.ocr_tool,
+                    &self.hotkey_hint(HotkeyAction::CaptureOcr),
+                    p,
+                ) {
+                    self.start_overlay_with_mode(ctx, OverlayMode::Ocr);
+                }
+                if sidebar_action_button(
+                    ui,
+                    Icon::EyeDropper,
+                    s.color_tool,
+                    &self.hotkey_hint(HotkeyAction::PickScreenColor),
+                    p,
+                ) {
+                    self.start_overlay_with_mode(ctx, OverlayMode::ColorPicker);
                 }
 
                 ui.add_space(6.0_f32);
@@ -1268,6 +1292,7 @@ impl SharexGuiApp {
 
                 if sidebar_nav_button(
                     ui,
+                    Icon::Captures,
                     s.captures,
                     self.active_view == ActiveView::Captures,
                     None,
@@ -1283,6 +1308,7 @@ impl SharexGuiApp {
                 };
                 if sidebar_nav_button(
                     ui,
+                    Icon::Editor,
                     editor_label,
                     self.active_view == ActiveView::Editor,
                     editor_dirty.then_some(p.accent),
@@ -1292,6 +1318,7 @@ impl SharexGuiApp {
                 }
                 if sidebar_nav_button(
                     ui,
+                    Icon::Effects,
                     s.effects,
                     self.active_view == ActiveView::Effects,
                     None,
@@ -1299,7 +1326,14 @@ impl SharexGuiApp {
                 ) {
                     self.active_view = ActiveView::Effects;
                 }
-                if sidebar_nav_button(ui, s.tools, self.active_view == ActiveView::Tools, None, p) {
+                if sidebar_nav_button(
+                    ui,
+                    Icon::Tools,
+                    s.tools,
+                    self.active_view == ActiveView::Tools,
+                    None,
+                    p,
+                ) {
                     self.active_view = ActiveView::Tools;
                 }
                 let is_recording = self.recording.is_recording();
@@ -1310,6 +1344,7 @@ impl SharexGuiApp {
                 };
                 if sidebar_nav_button(
                     ui,
+                    Icon::Recording,
                     &recording_label,
                     self.active_view == ActiveView::Recording,
                     is_recording.then_some(p.danger),
@@ -1319,6 +1354,7 @@ impl SharexGuiApp {
                 }
                 if sidebar_nav_button(
                     ui,
+                    Icon::Upload,
                     s.uploaders,
                     self.active_view == ActiveView::Uploaders,
                     None,
@@ -1330,6 +1366,7 @@ impl SharexGuiApp {
                 let watchers_active = self.watcher.is_active() && self.watcher.watched_count() > 0;
                 if sidebar_nav_button(
                     ui,
+                    Icon::Workflow,
                     s.workflows,
                     self.active_view == ActiveView::Workflows,
                     watchers_active.then_some(p.success),
@@ -1339,6 +1376,7 @@ impl SharexGuiApp {
                 }
                 if sidebar_nav_button(
                     ui,
+                    Icon::Hotkeys,
                     s.hotkey_settings,
                     self.active_view == ActiveView::Hotkeys,
                     None,
@@ -1348,6 +1386,7 @@ impl SharexGuiApp {
                 }
                 if sidebar_nav_button(
                     ui,
+                    Icon::Settings,
                     s.application_settings,
                     self.active_view == ActiveView::Settings,
                     None,
@@ -1584,213 +1623,227 @@ impl SharexGuiApp {
         egui::ScrollArea::vertical()
             .id_salt("captures_gallery_scroll")
             .show(ui, |ui| {
-                for entry in &visible {
-                    let is_selected = self.is_capture_selected(entry);
-                    let card_id = ui.make_persistent_id(("capture_card", entry.id.as_str()));
-                    let hovered_prev =
-                        ui.data(|data| data.get_temp::<bool>(card_id).unwrap_or(false));
-                    let stroke_width = if is_selected { 1.5_f32 } else { 1.0_f32 };
-                    let stroke_color = if is_selected || hovered_prev {
-                        p.accent
-                    } else {
-                        p.border
-                    };
-                    let frame = egui::Frame::NONE
-                        .fill(p.card_bg)
-                        .stroke(Stroke::new(stroke_width, stroke_color))
-                        .corner_radius(CornerRadius::same(10))
-                        .inner_margin(Margin::same(12));
+                let gap = 12.0_f32;
+                let avail_w = ui.available_width().max(260.0_f32);
+                let cols = (((avail_w + gap) / 276.0_f32).floor() as usize).clamp(1, 4);
+                let card_w = ((avail_w - gap * ((cols - 1) as f32)) / (cols as f32)).max(220.0_f32);
+                let thumb_h = (card_w * 0.56_f32).clamp(132.0_f32, 184.0_f32);
 
-                    let card_resp = frame.show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let stage_size = Vec2::new(140.0_f32, 84.0_f32);
-                            let (stage_rect, stage_resp) =
-                                ui.allocate_exact_size(stage_size, egui::Sense::click());
-                            if stage_resp.clicked() {
-                                self.select_capture(entry);
-                            }
-                            if stage_resp.double_clicked()
-                                && let Some(path) = &entry.file_path
-                            {
-                                open_editor_path = Some(path.clone());
-                            }
-                            ui.painter().rect_filled(
-                                stage_rect,
-                                CornerRadius::same(6),
-                                p.sidebar_bg,
-                            );
-                            ui.painter().rect_stroke(
-                                stage_rect,
-                                CornerRadius::same(6),
-                                Stroke::new(1.0_f32, p.divider),
-                                egui::StrokeKind::Inside,
-                            );
-
-                            let thumb_tex = entry
-                                .file_path
-                                .as_deref()
-                                .and_then(|path| self.ensure_thumbnail(ctx, path));
-                            if let Some(tex_id) = thumb_tex {
-                                let inner = stage_rect.shrink(4.0_f32);
-                                let aspect = if entry.height > 0 {
-                                    entry.width as f32 / entry.height as f32
-                                } else {
-                                    inner.width() / inner.height().max(1.0_f32)
-                                };
-                                let fit_size = if inner.width() / inner.height().max(1.0_f32)
-                                    > aspect
-                                {
-                                    Vec2::new(
-                                        (inner.height() * aspect).min(inner.width()),
-                                        inner.height(),
-                                    )
-                                } else {
-                                    Vec2::new(
-                                        inner.width(),
-                                        (inner.width() / aspect.max(0.01_f32)).min(inner.height()),
-                                    )
-                                };
-                                let img_rect =
-                                    egui::Rect::from_center_size(inner.center(), fit_size);
-                                egui::Image::new((tex_id, fit_size))
-                                    .corner_radius(CornerRadius::same(4))
-                                    .paint_at(ui, img_rect);
+                for row in visible.chunks(cols) {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        for entry in row {
+                            let is_selected = self.is_capture_selected(entry);
+                            let card_id =
+                                ui.make_persistent_id(("capture_card", entry.id.as_str()));
+                            let hovered_prev =
+                                ui.data(|data| data.get_temp::<bool>(card_id).unwrap_or(false));
+                            let stroke_width = if is_selected { 1.5_f32 } else { 1.0_f32 };
+                            let stroke_color = if is_selected || hovered_prev {
+                                p.accent
                             } else {
-                                ui.painter().text(
-                                    stage_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    s.no_preview,
-                                    egui::FontId::proportional(11.0_f32),
-                                    p.text_muted,
-                                );
-                            }
+                                p.border
+                            };
 
-                            ui.add_space(10.0_f32);
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    let title = entry
-                                        .file_path
-                                        .as_ref()
-                                        .and_then(|fp| fp.file_name())
-                                        .map(|n| n.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| entry.id.as_str().to_owned());
-                                    let title_widget = egui::Label::new(
-                                        RichText::new(title)
-                                            .strong()
-                                            .size(14.0_f32)
-                                            .color(p.text_primary),
-                                    )
-                                    .truncate()
-                                    .sense(egui::Sense::click());
-                                    if ui
-                                        .add(title_widget)
-                                        .on_hover_text("Select capture")
-                                        .clicked()
-                                    {
+                            let card_resp = egui::Frame::NONE
+                                .fill(p.card_bg)
+                                .stroke(Stroke::new(stroke_width, stroke_color))
+                                .corner_radius(CornerRadius::same(10))
+                                .inner_margin(Margin::same(10))
+                                .show(ui, |ui| {
+                                    ui.set_width(card_w - 20.0_f32);
+                                    let stage_size = Vec2::new(card_w - 20.0_f32, thumb_h);
+                                    let (stage_rect, stage_resp) =
+                                        ui.allocate_exact_size(stage_size, egui::Sense::click());
+                                    if stage_resp.clicked() {
                                         self.select_capture(entry);
                                     }
-                                    egui::Frame::NONE
-                                        .fill(p.surface_elevated)
-                                        .stroke(Stroke::new(1.0_f32, p.border))
-                                        .corner_radius(CornerRadius::same(4))
-                                        .inner_margin(Margin::symmetric(5, 1))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                RichText::new(
-                                                    entry.format.extension().to_ascii_uppercase(),
-                                                )
-                                                .monospace()
-                                                .size(10.0_f32)
-                                                .color(p.text_muted),
-                                            );
-                                        });
-                                });
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} × {}  ·  {}",
-                                        entry.width,
-                                        entry.height,
-                                        entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
-                                    ))
-                                    .size(12.0_f32)
-                                    .color(p.text_muted),
-                                );
-                                if let Some(path) = &entry.file_path {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(path.display().to_string())
-                                                .size(11.0_f32)
-                                                .color(p.text_muted),
-                                        )
-                                        .truncate(),
-                                    );
-                                }
-                                self.render_capture_tags(ui, p, entry);
-                                ui.add_space(4.0_f32);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0_f32;
-                                    if let Some(path) = &entry.file_path {
-                                        let exists = path.exists();
-                                        if ui
-                                            .add_enabled(
-                                                exists,
-                                                compact_card_button(s.edit, p, false),
-                                            )
-                                            .clicked()
-                                        {
-                                            open_editor_path = Some(path.clone());
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                exists,
-                                                compact_card_button("Pin", p, false),
-                                            )
-                                            .on_hover_text(s.pin_to_screen)
-                                            .clicked()
-                                        {
-                                            pin_file_path = Some(path.clone());
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                exists,
-                                                compact_card_button(s.copy_image, p, false),
-                                            )
-                                            .clicked()
-                                        {
-                                            copy_img_path = Some(path.clone());
-                                        }
-                                        if ui
-                                            .add(compact_card_button(s.copy_path, p, false))
-                                            .clicked()
-                                        {
-                                            copy_text_val = Some(path.display().to_string());
-                                        }
-                                        let delete_resp = ui.scope(|ui| {
-                                            ui.visuals_mut().widgets.hovered.bg_fill =
-                                                Color32::from_rgba_unmultiplied(239, 68, 68, 34);
-                                            ui.visuals_mut().widgets.hovered.weak_bg_fill =
-                                                Color32::from_rgba_unmultiplied(239, 68, 68, 34);
-                                            ui.visuals_mut().widgets.hovered.bg_stroke =
-                                                Stroke::new(1.0_f32, p.danger);
-                                            ui.add_enabled(
-                                                exists,
-                                                compact_card_button(s.delete_file, p, true),
-                                            )
-                                        });
-                                        if delete_resp.inner.clicked() {
-                                            delete_file_path = Some(path.clone());
-                                        }
+                                    if stage_resp.double_clicked()
+                                        && let Some(path) = &entry.file_path
+                                    {
+                                        open_editor_path = Some(path.clone());
                                     }
-                                });
-                            });
-                        });
-                    });
+                                    ui.painter().rect_filled(
+                                        stage_rect,
+                                        CornerRadius::same(7),
+                                        p.sidebar_bg,
+                                    );
+                                    ui.painter().rect_stroke(
+                                        stage_rect,
+                                        CornerRadius::same(7),
+                                        Stroke::new(1.0_f32, p.divider),
+                                        egui::StrokeKind::Inside,
+                                    );
 
-                    let is_hovered = card_resp.response.hovered();
-                    if is_hovered != hovered_prev {
-                        ui.data_mut(|data| data.insert_temp(card_id, is_hovered));
-                    }
-                    ui.add_space(8.0_f32);
+                                    let thumb_tex = entry
+                                        .file_path
+                                        .as_deref()
+                                        .and_then(|path| self.ensure_thumbnail(ctx, path));
+                                    if let Some(tex_id) = thumb_tex {
+                                        let inner = stage_rect.shrink(3.0_f32);
+                                        let aspect = if entry.height > 0 {
+                                            entry.width as f32 / entry.height as f32
+                                        } else {
+                                            inner.width() / inner.height().max(1.0_f32)
+                                        };
+                                        let fit_size =
+                                            if inner.width() / inner.height().max(1.0_f32) > aspect
+                                            {
+                                                Vec2::new(
+                                                    (inner.height() * aspect).min(inner.width()),
+                                                    inner.height(),
+                                                )
+                                            } else {
+                                                Vec2::new(
+                                                    inner.width(),
+                                                    (inner.width() / aspect.max(0.01_f32))
+                                                        .min(inner.height()),
+                                                )
+                                            };
+                                        let img_rect =
+                                            egui::Rect::from_center_size(inner.center(), fit_size);
+                                        egui::Image::new((tex_id, fit_size))
+                                            .corner_radius(CornerRadius::same(5))
+                                            .paint_at(ui, img_rect);
+                                    } else {
+                                        ui.painter().text(
+                                            stage_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            s.no_preview,
+                                            egui::FontId::proportional(11.5_f32),
+                                            p.text_muted,
+                                        );
+                                    }
+
+                                    ui.add_space(8.0_f32);
+                                    ui.horizontal(|ui| {
+                                        let title = entry
+                                            .file_path
+                                            .as_ref()
+                                            .and_then(|fp| fp.file_name())
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| entry.id.as_str().to_owned());
+                                        let title_widget = egui::Label::new(
+                                            RichText::new(title)
+                                                .strong()
+                                                .size(12.5_f32)
+                                                .color(p.text_primary),
+                                        )
+                                        .truncate()
+                                        .sense(egui::Sense::click());
+                                        if ui
+                                            .add(title_widget)
+                                            .on_hover_text("Select capture")
+                                            .clicked()
+                                        {
+                                            self.select_capture(entry);
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{}×{}",
+                                                        entry.width, entry.height
+                                                    ))
+                                                    .monospace()
+                                                    .size(10.5_f32)
+                                                    .color(p.text_muted),
+                                                );
+                                            },
+                                        );
+                                    });
+
+                                    self.render_capture_tags(ui, p, entry);
+
+                                    ui.add_space(4.0_f32);
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(
+                                                entry.timestamp.format("%H:%M:%S").to_string(),
+                                            )
+                                            .size(11.0_f32)
+                                            .color(p.text_muted),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.spacing_mut().item_spacing.x = 2.0_f32;
+                                                if let Some(path) = &entry.file_path {
+                                                    let exists = path.exists();
+                                                    if exists
+                                                        && palette_icon_button(
+                                                            ui,
+                                                            Icon::Trash,
+                                                            s.delete_file,
+                                                            true,
+                                                            p,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        delete_file_path = Some(path.clone());
+                                                    }
+                                                    if palette_icon_button(
+                                                        ui,
+                                                        Icon::Link,
+                                                        s.copy_path,
+                                                        false,
+                                                        p,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        copy_text_val =
+                                                            Some(path.display().to_string());
+                                                    }
+                                                    if exists
+                                                        && palette_icon_button(
+                                                            ui,
+                                                            Icon::Copy,
+                                                            s.copy_image,
+                                                            false,
+                                                            p,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        copy_img_path = Some(path.clone());
+                                                    }
+                                                    if exists
+                                                        && palette_icon_button(
+                                                            ui,
+                                                            Icon::Pin,
+                                                            s.pin_to_screen,
+                                                            false,
+                                                            p,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        pin_file_path = Some(path.clone());
+                                                    }
+                                                    if exists
+                                                        && palette_icon_button(
+                                                            ui,
+                                                            Icon::Editor,
+                                                            s.edit,
+                                                            false,
+                                                            p,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        open_editor_path = Some(path.clone());
+                                                    }
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+
+                            let is_hovered = card_resp.response.hovered();
+                            if is_hovered != hovered_prev {
+                                ui.data_mut(|data| data.insert_temp(card_id, is_hovered));
+                            }
+                        }
+                    });
+                    ui.add_space(gap);
                 }
             });
 
@@ -2729,11 +2782,12 @@ fn capture_history_query(filter: &str) -> HistoryQuery {
 
 fn sidebar_primary_capture_button(
     ui: &mut egui::Ui,
+    icon: Icon,
     label: &str,
     hotkey: &str,
     p: &SharexPalette,
 ) -> bool {
-    let desired = Vec2::new(ui.available_width(), 34.0_f32);
+    let desired = Vec2::new(ui.available_width(), 35.0_f32);
     let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
     let bg = if resp.hovered() {
         p.accent_hover
@@ -2742,18 +2796,23 @@ fn sidebar_primary_capture_button(
     };
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(7), bg);
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.min.x + 17.0_f32, rect.center().y),
+        Vec2::splat(14.0_f32),
+    );
+    paint_icon(painter, icon_rect, icon, Color32::WHITE);
     painter.text(
-        egui::pos2(rect.min.x + 12.0_f32, rect.center().y),
+        egui::pos2(rect.min.x + 31.0_f32, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        label,
+        label.trim_start_matches("+ "),
         egui::FontId::proportional(13.0_f32),
         Color32::WHITE,
     );
 
     let galley = painter.layout_no_wrap(
         hotkey.to_owned(),
-        egui::FontId::monospace(10.0_f32),
-        Color32::from_rgba_unmultiplied(255, 255, 255, 210),
+        egui::FontId::monospace(9.5_f32),
+        Color32::from_rgba_unmultiplied(255, 255, 255, 215),
     );
     let badge_w = galley.size().x + 10.0_f32;
     let badge_h = galley.size().y + 4.0_f32;
@@ -2780,15 +2839,35 @@ fn sidebar_primary_capture_button(
     resp.clicked()
 }
 
-fn sidebar_action_button(ui: &mut egui::Ui, label: &str, hotkey: &str, p: &SharexPalette) -> bool {
+fn sidebar_action_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    hotkey: &str,
+    p: &SharexPalette,
+) -> bool {
     let desired = Vec2::new(ui.available_width(), 29.0_f32);
     let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
     let painter = ui.painter();
     if resp.hovered() {
         painter.rect_filled(rect, CornerRadius::same(6), p.hover_bg);
     }
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.min.x + 15.0_f32, rect.center().y),
+        Vec2::splat(13.5_f32),
+    );
+    paint_icon(
+        painter,
+        icon_rect,
+        icon,
+        if resp.hovered() {
+            p.accent_hover
+        } else {
+            p.text_muted
+        },
+    );
     painter.text(
-        egui::pos2(rect.min.x + 8.0_f32, rect.center().y),
+        egui::pos2(rect.min.x + 29.0_f32, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
         egui::FontId::proportional(12.5_f32),
@@ -2797,7 +2876,7 @@ fn sidebar_action_button(ui: &mut egui::Ui, label: &str, hotkey: &str, p: &Share
 
     let galley = painter.layout_no_wrap(
         hotkey.to_owned(),
-        egui::FontId::monospace(10.0_f32),
+        egui::FontId::monospace(9.5_f32),
         p.text_muted,
     );
     let badge_w = galley.size().x + 8.0_f32;
@@ -2829,6 +2908,7 @@ fn sidebar_action_button(ui: &mut egui::Ui, label: &str, hotkey: &str, p: &Share
 
 fn sidebar_nav_button(
     ui: &mut egui::Ui,
+    icon: Icon,
     label: &str,
     active: bool,
     dot_color: Option<Color32>,
@@ -2852,10 +2932,22 @@ fn sidebar_nav_button(
     } else {
         p.text_muted
     };
+    let icon_color = if active {
+        p.accent
+    } else if resp.hovered() {
+        p.text_primary
+    } else {
+        p.text_muted
+    };
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.min.x + 17.0_f32, rect.center().y),
+        Vec2::splat(14.0_f32),
+    );
+    paint_icon(painter, icon_rect, icon, icon_color);
     let font = egui::FontId::proportional(13.0_f32);
     let galley = painter.layout_no_wrap(label.to_owned(), font, text_color);
     let text_pos = egui::pos2(
-        rect.min.x + 12.0_f32,
+        rect.min.x + 31.0_f32,
         rect.center().y - galley.size().y * 0.5_f32,
     );
     if active {
@@ -2875,18 +2967,6 @@ fn sidebar_nav_button(
         );
     }
     resp.clicked()
-}
-
-fn compact_card_button<'a>(label: &'a str, p: &SharexPalette, danger: bool) -> egui::Button<'a> {
-    egui::Button::new(RichText::new(label).size(11.5_f32).color(if danger {
-        p.danger
-    } else {
-        p.text_primary
-    }))
-    .fill(p.surface_elevated)
-    .stroke(Stroke::new(1.0_f32, p.border))
-    .corner_radius(CornerRadius::same(5))
-    .min_size(Vec2::new(0.0_f32, 24.0_f32))
 }
 
 fn paint_empty_viewfinder(ui: &mut egui::Ui, size: f32, p: &SharexPalette) {
