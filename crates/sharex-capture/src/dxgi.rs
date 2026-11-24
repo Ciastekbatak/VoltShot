@@ -15,14 +15,16 @@ use windows::{
                 DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180,
                 DXGI_MODE_ROTATION_ROTATE270, DXGI_MODE_ROTATION_UNSPECIFIED,
             },
-            CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC,
-            IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
+            CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT,
+            DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput,
+            IDXGIOutput1, IDXGIOutputDuplication,
         },
     },
     core::{Error, Interface},
 };
 
-const FRAME_TIMEOUT_MS: u32 = 100;
+const FRAME_TIMEOUT_MS: u32 = 25;
+const FRAME_ATTEMPTS: u32 = 3;
 
 /// Captures the attached output at the given zero-based index in DXGI adapter/output order.
 pub fn capture_monitor_dxgi(output_index: u32) -> Result<CapturedImage, CoreError> {
@@ -92,15 +94,7 @@ fn capture_output(
     let context = context.ok_or_else(|| missing("D3D11 device context"))?;
     let duplication = unsafe { output.DuplicateOutput(&device) }.map_err(dxgi_error)?;
 
-    let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
-    let mut resource = None;
-    unsafe { duplication.AcquireNextFrame(FRAME_TIMEOUT_MS, &mut frame_info, &mut resource) }
-        .map_err(dxgi_error)?;
-    let _frame = AcquiredFrame(&duplication);
-    let source: ID3D11Texture2D = resource
-        .ok_or_else(|| missing("desktop frame"))?
-        .cast()
-        .map_err(dxgi_error)?;
+    let (_frame, source) = acquire_presented_frame(&duplication)?;
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     unsafe { source.GetDesc(&mut desc) };
     if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
@@ -194,6 +188,39 @@ fn dxgi_error(error: Error) -> CoreError {
 
 fn missing(resource: &str) -> CoreError {
     CoreError::CaptureFailed(format!("DXGI did not return a {resource}"))
+}
+
+fn acquire_presented_frame(
+    duplication: &IDXGIOutputDuplication,
+) -> Result<(AcquiredFrame<'_>, ID3D11Texture2D), CoreError> {
+    let mut saw_unpresented_frame = false;
+    for _ in 0..FRAME_ATTEMPTS {
+        let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+        let mut resource = None;
+        match unsafe {
+            duplication.AcquireNextFrame(FRAME_TIMEOUT_MS, &mut frame_info, &mut resource)
+        } {
+            Ok(()) => {}
+            Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => continue,
+            Err(error) => return Err(dxgi_error(error)),
+        }
+        let frame = AcquiredFrame(duplication);
+        if frame_info.LastPresentTime == 0 {
+            saw_unpresented_frame = true;
+            continue;
+        }
+        let source = resource
+            .ok_or_else(|| missing("desktop frame"))?
+            .cast()
+            .map_err(dxgi_error)?;
+        return Ok((frame, source));
+    }
+    if saw_unpresented_frame {
+        return Err(CoreError::CaptureFailed(
+            "DXGI returned unpresented frame".into(),
+        ));
+    }
+    Err(dxgi_error(Error::from_hresult(DXGI_ERROR_WAIT_TIMEOUT)))
 }
 
 struct AcquiredFrame<'a>(&'a IDXGIOutputDuplication);

@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::editor_ui::{paint_annotation, paint_arrow, paint_ellipse_stroke, to_egui_color};
 use crate::win_focus::OverlayFocusGuard;
 use eframe::egui::emath::GuiRounding;
@@ -191,11 +193,17 @@ pub struct RegionOverlayState {
     document: EditorDocument,
     texture: egui::TextureHandle,
     focus_guard: OverlayFocusGuard,
+    focus_acquired: bool,
+    viewport_fitted: bool,
+    viewport_inner_size: Option<Vec2>,
     active_tool: OverlayTool,
     selection: Option<RectF>,
     auto_capture_on_drag: bool,
     windows: Vec<WindowInfo>,
     snap_to_windows: bool,
+    visual_snap_rect: Option<RectF>,
+    visual_snap_target: Option<RectF>,
+    last_frame_time: Instant,
     show_magnifier: bool,
     color: RgbaColor,
     stroke_width: f32,
@@ -222,7 +230,7 @@ impl RegionOverlayState {
         let mut windows = if mode == OverlayMode::ColorPicker {
             Vec::new()
         } else {
-            capturer.list_windows().unwrap_or_default()
+            capturer.list_snap_windows().unwrap_or_default()
         };
         windows.retain(|window| !window.title.contains("ShareX"));
         let primary_monitor = capturer.list_monitors().ok().and_then(|monitors| {
@@ -251,11 +259,17 @@ impl RegionOverlayState {
             document: EditorDocument::new(snapshot.image),
             texture,
             focus_guard,
+            focus_acquired: false,
+            viewport_fitted: false,
+            viewport_inner_size: None,
             active_tool: OverlayTool::Region,
             selection: None,
             auto_capture_on_drag: true,
             windows,
             snap_to_windows: true,
+            visual_snap_rect: None,
+            visual_snap_target: None,
+            last_frame_time: Instant::now(),
             show_magnifier: true,
             color: RgbaColor::RED,
             stroke_width: 4.0,
@@ -311,9 +325,30 @@ impl RegionOverlayState {
 
         ctx.show_viewport_immediate(viewport_id, builder, |overlay_ctx, class| {
             if class != egui::ViewportClass::Embedded {
-                self.fit_viewport_to_snapshot(overlay_ctx, Vec2::new(img_w, img_h));
+                let ppp = overlay_ctx.pixels_per_point();
+                let size = Vec2::new(img_w, img_h) / ppp;
+                let (inner, outer, focused) = overlay_ctx.input(|input| {
+                    let viewport = input.viewport();
+                    (viewport.inner_rect, viewport.outer_rect, viewport.focused)
+                });
+                let inner_size = inner.map(|rect| rect.size());
+                if !self.viewport_fitted
+                    || inner_size != self.viewport_inner_size
+                    || inner_size.is_some_and(|current| exceeds_half_pixel(size - current, ppp))
+                {
+                    self.viewport_inner_size = inner_size;
+                    self.fit_viewport_to_snapshot(overlay_ctx, size, inner, outer);
+                }
+                if !self.focus_acquired {
+                    self.focus_acquired = focused == Some(true);
+                    if !self.focus_acquired {
+                        self.focus_guard.enforce_overlay_focus(OVERLAY_WINDOW_TITLE);
+                    }
+                }
             }
-            self.focus_guard.enforce_overlay_focus(OVERLAY_WINDOW_TITLE);
+            let now = Instant::now();
+            let frame_dt = now.duration_since(self.last_frame_time).as_secs_f32();
+            self.last_frame_time = now;
             let typing = overlay_ctx.wants_keyboard_input();
             let capture_mode = self.mode == OverlayMode::Capture;
             let color_picker = self.mode == OverlayMode::ColorPicker;
@@ -507,14 +542,28 @@ impl RegionOverlayState {
                         }
                         _ => self.selection,
                     };
-                    let snapped_window = if matches!(self.drag, Some(OverlayDrag::RegionSelect { .. })) {
+                    let snapped_window = if active_region.is_some() {
                         None
                     } else {
                         pointer_pos.and_then(|pos| self.snapped_window_at(to_image(pos)))
                     };
+                    let target_snap_rect = snapped_window.map(|(_, rect)| rect);
+                    let visual_snap_rect = target_snap_rect.map(|target| {
+                        self.visual_snap_rect.map_or(target, |current| {
+                            let dt = if self.visual_snap_target == target_snap_rect {
+                                frame_dt
+                            } else {
+                                frame_dt.min(overlay_ctx.input(|input| input.predicted_dt))
+                            };
+                            lerp_rect(current, target, 1.0 - (-dt * 30.0).exp())
+                        })
+                    });
+                    if visual_snap_rect != target_snap_rect {
+                        overlay_ctx.request_repaint();
+                    }
 
                     let scrim = Color32::from_black_alpha(125);
-                    if let Some(sel_img) = active_region.or(snapped_window.map(|(_, rect)| rect)) {
+                    if let Some(sel_img) = active_region.or(visual_snap_rect) {
                         let sel = to_screen_rect(sel_img);
 
                         painter.rect_filled(
@@ -572,6 +621,12 @@ impl RegionOverlayState {
                         self.paint_draft(&painter, draft, &to_screen, zoom, accent);
                     }
 
+                    if let (Some((window, _)), Some(rect)) = (snapped_window, visual_snap_rect) {
+                        paint_snapped_window(&painter, to_screen_rect(rect), screen_rect, window);
+                    }
+                    self.visual_snap_rect = visual_snap_rect;
+                    self.visual_snap_target = target_snap_rect;
+
                     if let Some(pos) = pointer_pos {
                         if self.active_tool == OverlayTool::Region {
                             let guide = Stroke::new(
@@ -592,10 +647,6 @@ impl RegionOverlayState {
                                 ],
                                 guide,
                             );
-                        }
-
-                        if let Some((window, rect)) = snapped_window {
-                            paint_snapped_window(&painter, to_screen_rect(rect), screen_rect, window);
                         }
 
                         let img_pt = to_image(pos);
@@ -659,13 +710,12 @@ impl RegionOverlayState {
 
                         if color_picker || self.show_magnifier {
                             let image = self.document.base_image();
-                            let (grid, rgba) = sample_magnifier_grid(
-                                image,
-                                img_pt.x.floor() as i32,
-                                img_pt.y.floor() as i32,
-                                MAGNIFIER_HALF_EXTENT,
-                            );
-                            let [r, g, b, _] = rgba;
+                            let x = (img_pt.x.floor() as u32).min(image.width() - 1);
+                            let y = (img_pt.y.floor() as u32).min(image.height() - 1);
+                            let Ok(ColorSample { r, g, b, .. }) = sample_image(image, x, y) else {
+                                return;
+                            };
+                            let loupe = compute_loupe_uv_rect([x, y], [image.width(), image.height()]);
                             let hex = format_picked_color(r, g, b);
                             if !typing && overlay_ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::C)) {
                                 overlay_ctx.copy_text(hex.clone());
@@ -680,7 +730,8 @@ impl RegionOverlayState {
                                 pos,
                                 screen_rect,
                                 [toolbar_rect, badge_rect],
-                                &grid,
+                                self.texture.id(),
+                                loupe,
                                 &readout,
                             );
                         }
@@ -695,28 +746,28 @@ impl RegionOverlayState {
         outcome
     }
 
-    fn fit_viewport_to_snapshot(&self, ctx: &egui::Context, image_size: Vec2) {
+    fn fit_viewport_to_snapshot(
+        &mut self,
+        ctx: &egui::Context,
+        desired_size: Vec2,
+        inner: Option<Rect>,
+        outer: Option<Rect>,
+    ) {
         let ppp = ctx.pixels_per_point();
         let desired_origin = Pos2::new(self.origin_x as f32 / ppp, self.origin_y as f32 / ppp);
-        let desired_size = image_size / ppp;
-        let (inner, outer) = ctx.input(|input| {
-            let viewport = input.viewport();
-            (viewport.inner_rect, viewport.outer_rect)
-        });
         let Some(inner) = inner else {
             return;
         };
         let offset = desired_origin - inner.min;
-        let tolerance = 0.5 / ppp;
-        if (offset.x.abs() > tolerance || offset.y.abs() > tolerance)
-            && let Some(outer) = outer
-        {
+        let needs_move = exceeds_half_pixel(offset, ppp);
+        let needs_resize = exceeds_half_pixel(desired_size - inner.size(), ppp);
+        if needs_move && let Some(outer) = outer {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(outer.min + offset));
         }
-        let size_error = desired_size - inner.size();
-        if size_error.x.abs() > tolerance || size_error.y.abs() > tolerance {
+        if needs_resize {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired_size));
         }
+        self.viewport_fitted = !needs_move && !needs_resize;
     }
 
     fn render_floating_toolbar(
@@ -1247,6 +1298,29 @@ fn format_picked_color(r: u8, g: u8, b: u8) -> String {
     ColorSample::rgb(r, g, b).to_hex()
 }
 
+fn exceeds_half_pixel(offset: Vec2, pixels_per_point: f32) -> bool {
+    let tolerance = 0.5 / pixels_per_point;
+    offset.x.abs() > tolerance || offset.y.abs() > tolerance
+}
+
+fn lerp_rect(current: RectF, target: RectF, alpha: f32) -> RectF {
+    let left = egui::lerp(current.x..=target.x, alpha);
+    let top = egui::lerp(current.y..=target.y, alpha);
+    let right = egui::lerp(current.right()..=target.right(), alpha);
+    let bottom = egui::lerp(current.bottom()..=target.bottom(), alpha);
+    let edge_deltas = [
+        left - target.x,
+        top - target.y,
+        right - target.right(),
+        bottom - target.bottom(),
+    ];
+    if edge_deltas.iter().all(|delta| delta.abs() <= 0.5) {
+        target
+    } else {
+        RectF::from_points(Point::new(left, top), Point::new(right, bottom))
+    }
+}
+
 fn clipped_window_rect(
     window: &WindowInfo,
     origin_x: i32,
@@ -1274,12 +1348,12 @@ fn paint_snapped_window(
     screen_rect: Rect,
     window: &WindowInfo,
 ) {
-    painter.rect_stroke(
+    painter.rect_filled(
         bounds,
         0.0,
-        Stroke::new(2.0_f32, SNAP_COLOR),
-        egui::StrokeKind::Inside,
+        Color32::from_rgba_unmultiplied(34, 197, 94, 20),
     );
+    paint_snap_border(painter, bounds);
 
     let text = match (window.app_name.as_str(), window.title.as_str()) {
         ("", "") => "Window".into(),
@@ -1308,6 +1382,46 @@ fn paint_snapped_window(
     painter.galley(pos + padding, galley, SNAP_COLOR);
 }
 
+fn paint_snap_border(painter: &egui::Painter, bounds: Rect) {
+    let pixels_per_point = painter.pixels_per_point();
+    let pixel = 1.0_f32 / pixels_per_point;
+    let bounds = Rect::from_min_max(
+        bounds.min.round_to_pixels(pixels_per_point),
+        bounds.max.round_to_pixels(pixels_per_point),
+    );
+    let mut border = egui::Mesh::default();
+    for horizontal in [true, false] {
+        let (mut start, end) = if horizontal {
+            (bounds.left(), bounds.right())
+        } else {
+            (bounds.top() + pixel, bounds.bottom() - pixel)
+        };
+        let mut light = true;
+        while start < end {
+            let stop = (start + 6.0 * pixel).min(end);
+            let color = if light {
+                SNAP_COLOR
+            } else {
+                Color32::from_black_alpha(220)
+            };
+            let strips = if horizontal {
+                [bounds.top(), bounds.bottom() - pixel]
+                    .map(|y| Rect::from_min_max(Pos2::new(start, y), Pos2::new(stop, y + pixel)))
+            } else {
+                [bounds.left(), bounds.right() - pixel]
+                    .map(|x| Rect::from_min_max(Pos2::new(x, start), Pos2::new(x + pixel, stop)))
+            };
+            for strip in strips {
+                border.add_colored_rect(strip, color);
+            }
+            start = stop;
+            light = !light;
+        }
+    }
+    painter.add(border);
+}
+
+#[cfg(test)]
 fn sample_magnifier_grid(
     image: &CapturedImage,
     center_x: i32,
@@ -1331,12 +1445,40 @@ fn sample_magnifier_grid(
     (grid, sample(0, 0))
 }
 
+struct LoupeRegion {
+    uv_rect: Rect,
+    grid_cells: Rect,
+}
+
+fn compute_loupe_uv_rect(center: [u32; 2], size: [u32; 2]) -> LoupeRegion {
+    let axis = |center: u32, size: u32| {
+        let center = center.min(size - 1);
+        let half = MAGNIFIER_HALF_EXTENT as u32;
+        let min = center.saturating_sub(half);
+        let max = center.saturating_add(half + 1).min(size);
+        let grid_start = (half - (center - min)) as f32;
+        (
+            min as f32 / size as f32,
+            max as f32 / size as f32,
+            grid_start,
+            grid_start + (max - min) as f32,
+        )
+    };
+    let (u_min, u_max, x_min, x_max) = axis(center[0], size[0]);
+    let (v_min, v_max, y_min, y_max) = axis(center[1], size[1]);
+    LoupeRegion {
+        uv_rect: Rect::from_min_max(Pos2::new(u_min, v_min), Pos2::new(u_max, v_max)),
+        grid_cells: Rect::from_min_max(Pos2::new(x_min, y_min), Pos2::new(x_max, y_max)),
+    }
+}
+
 fn paint_magnifier(
     painter: &egui::Painter,
     cursor: Pos2,
     screen_rect: Rect,
     obstacles: [Rect; 2],
-    grid: &[[u8; 4]],
+    texture: egui::TextureId,
+    loupe: LoupeRegion,
     footer: &str,
 ) {
     const SIDE: usize = (MAGNIFIER_HALF_EXTENT * 2 + 1) as usize;
@@ -1382,32 +1524,11 @@ fn paint_magnifier(
 
     let grid_origin =
         (pos + Vec2::new((size.x - grid_size) * 0.5, 0.0)).round_to_pixels(pixels_per_point);
-    for (index, &[r, g, b, a]) in grid.iter().enumerate() {
-        let offset = Vec2::new((index % SIDE) as f32, (index / SIDE) as f32) * cell_size;
-        let cell = Rect::from_min_size(grid_origin + offset, Vec2::splat(cell_size));
-        painter.rect_filled(cell, 0.0, Color32::from_rgba_unmultiplied(r, g, b, a));
-    }
-
-    let grid_color = Color32::from_black_alpha(72);
-    for index in 1..SIDE {
-        let offset = index as f32 * cell_size;
-        painter.rect_filled(
-            Rect::from_min_size(
-                grid_origin + Vec2::new(offset, 0.0),
-                Vec2::new(physical_pixel, grid_size),
-            ),
-            0.0,
-            grid_color,
-        );
-        painter.rect_filled(
-            Rect::from_min_size(
-                grid_origin + Vec2::new(0.0, offset),
-                Vec2::new(grid_size, physical_pixel),
-            ),
-            0.0,
-            grid_color,
-        );
-    }
+    let loupe_grid_rect = Rect::from_min_max(
+        grid_origin + loupe.grid_cells.min.to_vec2() * cell_size,
+        grid_origin + loupe.grid_cells.max.to_vec2() * cell_size,
+    );
+    painter.image(texture, loupe_grid_rect, loupe.uv_rect, Color32::WHITE);
     let center = Rect::from_min_size(
         grid_origin + Vec2::splat(MAGNIFIER_HALF_EXTENT as f32 * cell_size),
         Vec2::splat(cell_size),
@@ -1417,12 +1538,6 @@ fn paint_magnifier(
         0.0,
         Stroke::new(physical_pixel, Color32::WHITE),
         egui::StrokeKind::Outside,
-    );
-    painter.rect_stroke(
-        center,
-        0.0,
-        Stroke::new(physical_pixel, Color32::RED),
-        egui::StrokeKind::Inside,
     );
     painter.rect_stroke(
         panel,
@@ -1558,6 +1673,57 @@ mod tests {
         assert_eq!(
             sample_magnifier_grid(&image, 0, 1, 0),
             (vec![PIXELS[2]], PIXELS[2])
+        );
+    }
+
+    #[test]
+    fn lerp_rect_converges_and_finishes_at_the_exact_target() {
+        let start = RectF::from_points(Point::new(0.0, 0.0), Point::new(300.0, 200.0));
+        let target = RectF::from_points(Point::new(400.0, 200.0), Point::new(520.0, 440.0));
+        let alpha = 1.0 - (-30.0_f32 / 120.0).exp();
+        let first = lerp_rect(start, target, alpha);
+        assert!(first.x > start.x && first.x < target.x);
+        assert!(first.right() > start.right() && first.right() < target.right());
+        let two_frames = lerp_rect(first, target, alpha);
+        let one_frame = lerp_rect(start, target, 1.0 - (-30.0_f32 / 60.0).exp());
+        assert!((two_frames.x - one_frame.x).abs() < 0.001);
+        assert!((two_frames.right() - one_frame.right()).abs() < 0.001);
+        assert_eq!(
+            (0..40).fold(start, |rect, _| lerp_rect(rect, target, alpha)),
+            target
+        );
+    }
+
+    #[test]
+    fn loupe_uvs_clamp_to_edges_without_displacing_the_center_cell() {
+        let top_left = compute_loupe_uv_rect([0, 0], [20, 40]);
+        assert_eq!(
+            top_left.uv_rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(0.3, 0.15))
+        );
+        assert_eq!(
+            top_left.grid_cells,
+            Rect::from_min_max(Pos2::new(5.0, 5.0), Pos2::new(11.0, 11.0))
+        );
+
+        let bottom_right = compute_loupe_uv_rect([19, 39], [20, 40]);
+        assert_eq!(
+            bottom_right.uv_rect,
+            Rect::from_min_max(Pos2::new(0.7, 0.85), Pos2::new(1.0, 1.0))
+        );
+        assert_eq!(
+            bottom_right.grid_cells,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(6.0, 6.0))
+        );
+
+        let single_pixel = compute_loupe_uv_rect([0, 0], [1, 1]);
+        assert_eq!(
+            single_pixel.uv_rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
+        );
+        assert_eq!(
+            single_pixel.grid_cells,
+            Rect::from_min_max(Pos2::new(5.0, 5.0), Pos2::new(6.0, 6.0))
         );
     }
 

@@ -9,13 +9,15 @@ use xcap::{Monitor, Window};
 pub mod dxgi;
 /// Vertical stitching for sequences of scrolling screenshots.
 pub mod scrolling;
+#[cfg(target_os = "windows")]
+mod win_fast;
 
 pub use scrolling::{ScrollStitchOptions, ScrollStitchResult, stitch_scrolling_frames};
 
 /// Monitor capture backend. Window captures always use `xcap`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureBackend {
-    /// Try Desktop Duplication on Windows, falling back to `xcap` on error.
+    /// Try GDI on Windows, falling back to `xcap` on error.
     #[default]
     Auto,
     /// Require Windows Desktop Duplication without a fallback.
@@ -101,14 +103,16 @@ impl XcapCapturer {
     }
 
     fn capture_monitor(&self, monitor: &Monitor) -> Result<CapturedImage, CoreError> {
-        match self.backend {
-            CaptureBackend::Dxgi => return Self::capture_monitor_dxgi(monitor),
-            CaptureBackend::Auto if cfg!(target_os = "windows") => {
-                if let Ok(image) = Self::capture_monitor_dxgi(monitor) {
-                    return Ok(image);
-                }
-            }
-            CaptureBackend::Auto | CaptureBackend::Xcap => {}
+        if self.backend == CaptureBackend::Dxgi {
+            return Self::capture_monitor_dxgi(monitor);
+        }
+        #[cfg(target_os = "windows")]
+        if self.backend == CaptureBackend::Auto
+            && let (Ok(x), Ok(y), Ok(width), Ok(height)) =
+                (monitor.x(), monitor.y(), monitor.width(), monitor.height())
+            && let Ok(image) = win_fast::capture_screen_area(x, y, width, height)
+        {
+            return Ok(image);
         }
         let buffer = monitor
             .capture_image()
@@ -220,8 +224,14 @@ impl XcapCapturer {
         })
     }
 
-    /// Captures and stitches all connected monitors into one virtual desktop snapshot.
+    /// Captures all connected monitors into one virtual desktop snapshot.
     pub fn capture_virtual_desktop(&self) -> Result<DesktopSnapshot, CoreError> {
+        #[cfg(target_os = "windows")]
+        if self.backend == CaptureBackend::Auto
+            && let Ok(snapshot) = win_fast::capture_virtual_desktop_gdi()
+        {
+            return Ok(snapshot);
+        }
         let monitors = Monitor::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
         if monitors.len() == 1 {
             return self.capture_primary_from_monitors(&monitors);
@@ -231,6 +241,15 @@ impl XcapCapturer {
             .map(Self::monitor_to_info)
             .collect::<Result<Vec<_>, _>>()?;
         self.capture_virtual_desktop_from_monitors(monitors.iter().zip(infos))
+    }
+
+    /// Lists windows suitable for overlay snapping, in front-to-back order on Windows.
+    pub fn list_snap_windows(&self) -> Result<Vec<WindowInfo>, CoreError> {
+        #[cfg(target_os = "windows")]
+        return Ok(win_fast::list_snap_windows_win32());
+
+        #[cfg(not(target_os = "windows"))]
+        self.list_windows()
     }
 
     fn capture_virtual_desktop_from_monitors<'a>(
