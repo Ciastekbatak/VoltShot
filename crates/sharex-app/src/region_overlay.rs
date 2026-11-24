@@ -7,6 +7,7 @@ use eframe::egui::{
 use sharex_capture::{DesktopSnapshot, XcapCapturer, find_window_at_point};
 use sharex_core::{CapturedImage, Region, ScreenCapturer, WindowInfo};
 use sharex_editor::{AnnotationKind, EditorDocument, Point, RectF, RgbaColor, SHAREX_PALETTE};
+use sharex_tools::{ColorSample, sample_image};
 
 const OVERLAY_WINDOW_TITLE: &str = "ShareX Region Capture";
 const SNAP_COLOR: Color32 = Color32::from_rgb(34, 197, 94);
@@ -21,6 +22,102 @@ pub enum OverlayOutcome {
         image: CapturedImage,
         global_region: Region,
         open_in_editor: bool,
+    },
+}
+
+/// Determines what the overlay returns when the user makes a selection.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayMode {
+    #[default]
+    Capture,
+    Ocr,
+    SelectRecordingRegion,
+    ColorPicker,
+}
+
+impl OverlayMode {
+    const fn hint(self) -> &'static str {
+        match self {
+            Self::Capture => "Capture Region",
+            Self::Ocr => "OCR Region: drag over text or click a window. Esc to cancel.",
+            Self::SelectRecordingRegion => {
+                "Select Recording Region: drag an area or click a window. Esc to cancel."
+            }
+            Self::ColorPicker => "Color Picker: click any pixel to copy HEX. Esc to cancel.",
+        }
+    }
+
+    fn finish_region(
+        self,
+        document: &EditorDocument,
+        selection: Option<RectF>,
+        origin: (i32, i32),
+        open_in_editor: bool,
+    ) -> Option<OverlayModeOutcome> {
+        let base = document.base_image();
+        let (width, height) = (base.width(), base.height());
+        let local = match selection {
+            Some(selection) => {
+                let x = (selection.x.floor() as u32).min(width - 1);
+                let y = (selection.y.floor() as u32).min(height - 1);
+                let w = (selection.width.round() as u32).min(width - x);
+                let h = (selection.height.round() as u32).min(height - y);
+                Region::new(x as i32, y as i32, w, h).ok()?
+            }
+            None if self == Self::Capture => Region::new(0, 0, width, height).ok()?,
+            None => return None,
+        };
+        let global_region = Region::new(
+            origin.0.checked_add(local.x())?,
+            origin.1.checked_add(local.y())?,
+            local.width(),
+            local.height(),
+        )
+        .ok()?;
+
+        match self {
+            Self::Capture => {
+                let flat = document.flatten().ok()?;
+                let image = if selection.is_some() {
+                    flat.crop(local).ok()?
+                } else {
+                    flat
+                };
+                Some(OverlayModeOutcome::Captured {
+                    image,
+                    global_region,
+                    open_in_editor,
+                })
+            }
+            Self::Ocr => Some(OverlayModeOutcome::OcrRegion {
+                image: base.crop(local).ok()?,
+                global_region,
+            }),
+            Self::SelectRecordingRegion => Some(OverlayModeOutcome::RecordingRegion(global_region)),
+            Self::ColorPicker => None,
+        }
+    }
+}
+
+/// Result produced by one frame of a mode-aware region overlay.
+pub enum OverlayModeOutcome {
+    Pending,
+    Cancelled,
+    Captured {
+        image: CapturedImage,
+        global_region: Region,
+        open_in_editor: bool,
+    },
+    OcrRegion {
+        image: CapturedImage,
+        global_region: Region,
+    },
+    RecordingRegion(Region),
+    ColorPicked {
+        hex: String,
+        r: u8,
+        g: u8,
+        b: u8,
     },
 }
 
@@ -89,6 +186,8 @@ enum OverlayDrag {
 pub struct RegionOverlayState {
     origin_x: i32,
     origin_y: i32,
+    primary_monitor: Option<RectF>,
+    mode: OverlayMode,
     document: EditorDocument,
     texture: egui::TextureHandle,
     focus_guard: OverlayFocusGuard,
@@ -107,10 +206,34 @@ pub struct RegionOverlayState {
 }
 
 impl RegionOverlayState {
+    /// Opens the overlay in capture mode.
     pub fn open(ctx: &egui::Context, snapshot: DesktopSnapshot) -> Self {
+        Self::open_with_mode(ctx, snapshot, OverlayMode::Capture)
+    }
+
+    /// Opens the overlay over the supplied desktop snapshot in the requested mode.
+    pub fn open_with_mode(
+        ctx: &egui::Context,
+        snapshot: DesktopSnapshot,
+        mode: OverlayMode,
+    ) -> Self {
         let focus_guard = OverlayFocusGuard::capture_current_foreground();
-        let mut windows = XcapCapturer::new().list_windows().unwrap_or_default();
+        let capturer = XcapCapturer::new();
+        let mut windows = if mode == OverlayMode::ColorPicker {
+            Vec::new()
+        } else {
+            capturer.list_windows().unwrap_or_default()
+        };
         windows.retain(|window| !window.title.contains("ShareX"));
+        let primary_monitor = capturer.list_monitors().ok().and_then(|monitors| {
+            let primary = monitors.into_iter().find(|monitor| monitor.is_primary)?;
+            Some(RectF {
+                x: (i64::from(primary.x) - i64::from(snapshot.origin_x)) as f32,
+                y: (i64::from(primary.y) - i64::from(snapshot.origin_y)) as f32,
+                width: primary.width as f32,
+                height: primary.height as f32,
+            })
+        });
         let color_img = egui::ColorImage::from_rgba_unmultiplied(
             [
                 snapshot.image.width() as usize,
@@ -126,6 +249,8 @@ impl RegionOverlayState {
         Self {
             origin_x: snapshot.origin_x,
             origin_y: snapshot.origin_y,
+            primary_monitor,
+            mode,
             document: EditorDocument::new(snapshot.image),
             texture,
             focus_guard,
@@ -148,9 +273,30 @@ impl RegionOverlayState {
         self.focus_guard.restore_previous();
     }
 
+    /// Shows the capture overlay with the legacy capture-only result.
     pub fn show(&mut self, ctx: &egui::Context) -> OverlayOutcome {
+        match self.show_mode(ctx) {
+            OverlayModeOutcome::Pending => OverlayOutcome::Pending,
+            OverlayModeOutcome::Captured {
+                image,
+                global_region,
+                open_in_editor,
+            } => OverlayOutcome::Captured {
+                image,
+                global_region,
+                open_in_editor,
+            },
+            OverlayModeOutcome::Cancelled
+            | OverlayModeOutcome::OcrRegion { .. }
+            | OverlayModeOutcome::RecordingRegion(_)
+            | OverlayModeOutcome::ColorPicked { .. } => OverlayOutcome::Cancelled,
+        }
+    }
+
+    /// Shows one overlay frame and returns the result for the active mode.
+    pub fn show_mode(&mut self, ctx: &egui::Context) -> OverlayModeOutcome {
         let viewport_id = egui::ViewportId::from_hash_of("sharex_region_capture_overlay");
-        let ppp = ctx.pixels_per_point().max(1.0);
+        let ppp = ctx.pixels_per_point();
         let img_w = self.document.base_image().width() as f32;
         let img_h = self.document.base_image().height() as f32;
 
@@ -159,40 +305,46 @@ impl RegionOverlayState {
             .with_decorations(false)
             .with_always_on_top()
             .with_resizable(false)
+            .with_clamp_size_to_monitor_size(false)
             .with_position([self.origin_x as f32 / ppp, self.origin_y as f32 / ppp])
             .with_inner_size([img_w / ppp, img_h / ppp])
             .with_active(true);
 
-        let mut outcome = OverlayOutcome::Pending;
+        let mut outcome = OverlayModeOutcome::Pending;
 
-        ctx.show_viewport_immediate(viewport_id, builder, |overlay_ctx, _class| {
+        ctx.show_viewport_immediate(viewport_id, builder, |overlay_ctx, class| {
+            if class != egui::ViewportClass::Embedded {
+                self.fit_viewport_to_snapshot(overlay_ctx, Vec2::new(img_w, img_h));
+            }
             self.focus_guard.enforce_overlay_focus(OVERLAY_WINDOW_TITLE);
             let typing = overlay_ctx.wants_keyboard_input();
+            let capture_mode = self.mode == OverlayMode::Capture;
+            let color_picker = self.mode == OverlayMode::ColorPicker;
 
             if overlay_ctx.input(|i| i.viewport().close_requested())
                 || overlay_ctx.input(|i| i.key_pressed(egui::Key::Escape))
             {
-                outcome = OverlayOutcome::Cancelled;
+                outcome = OverlayModeOutcome::Cancelled;
                 return;
             }
 
-            if overlay_ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
+            if capture_mode && overlay_ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
                 self.document.undo();
             }
-            if overlay_ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Y)) {
+            if capture_mode && overlay_ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Y)) {
                 self.document.redo();
             }
-            if !typing && overlay_ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            if capture_mode && !typing && overlay_ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
                 self.document.delete_selected();
             }
-            if !typing && overlay_ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if let Some(captured) = self.finalize_capture(false) {
+            if capture_mode && !typing && overlay_ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if let Some(captured) = self.finalize_selection(false) {
                     outcome = captured;
                 }
                 return;
             }
 
-            if !typing {
+            if capture_mode && !typing {
                 let shortcuts = [
                     (egui::Key::Space, OverlayTool::Region),
                     (egui::Key::V, OverlayTool::Select),
@@ -216,7 +368,7 @@ impl RegionOverlayState {
                 }
             }
 
-            let mut toolbar_action: Option<OverlayOutcome> = None;
+            let mut toolbar_action = None;
 
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
@@ -261,9 +413,18 @@ impl RegionOverlayState {
                     );
 
                     let accent = Color32::from_rgb(59, 130, 246);
+                    let primary_bounds = self.primary_monitor.map(to_screen_rect).filter(|rect| rect.is_positive());
+                    let toolbar_anchor = if let Some(bounds) = primary_bounds {
+                        toolbar_anchor_in_overlay(0, 0, bounds, scale_x, scale_y)
+                    } else {
+                        toolbar_anchor_in_overlay(self.origin_x, self.origin_y, screen_rect, scale_x, scale_y)
+                    };
                     let toolbar_rect = egui::Area::new(egui::Id::new("sharex_region_floating_bar"))
                         .order(egui::Order::Foreground)
-                        .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 10.0))
+                        .pivot(egui::Align2::CENTER_TOP)
+                        .fixed_pos(toolbar_anchor)
+                        .constrain_to(primary_bounds.unwrap_or(screen_rect))
+                        .interactable(capture_mode)
                         .show(overlay_ctx, |ui| {
                             egui::Frame::NONE
                                 .fill(Color32::from_rgba_unmultiplied(24, 28, 34, 242))
@@ -271,14 +432,18 @@ impl RegionOverlayState {
                                 .corner_radius(CornerRadius::same(6))
                                 .inner_margin(Margin::symmetric(10, 6))
                                 .show(ui, |ui| {
-                                    self.render_floating_toolbar(ui, accent, &mut toolbar_action);
+                                    if capture_mode {
+                                        self.render_floating_toolbar(ui, accent, &mut toolbar_action);
+                                    } else {
+                                        ui.label(RichText::new(self.mode.hint()).color(Color32::WHITE));
+                                    }
                                 });
                         })
                         .response
                         .rect;
 
                     let is_canvas = |pos: Pos2| {
-                        screen_rect.contains(pos) && !toolbar_rect.contains(pos)
+                        screen_rect.contains(pos) && (!capture_mode || !toolbar_rect.contains(pos))
                     };
                     let pointer_pos = overlay_ctx.input(|i| i.pointer.hover_pos()).filter(|&pos| is_canvas(pos));
 
@@ -286,7 +451,7 @@ impl RegionOverlayState {
                         overlay_ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
                         if response.secondary_clicked() {
                             if self.active_tool == OverlayTool::Region {
-                                outcome = OverlayOutcome::Cancelled;
+                                outcome = OverlayModeOutcome::Cancelled;
                                 return;
                             }
                             self.active_tool = OverlayTool::Region;
@@ -294,14 +459,37 @@ impl RegionOverlayState {
                         }
                     }
 
-                    if self.active_tool == OverlayTool::Region {
+                    if color_picker {
+                        let click = overlay_ctx.input(|input| {
+                            input.events.iter().find_map(|event| match *event {
+                                egui::Event::PointerButton {
+                                    pos,
+                                    button: egui::PointerButton::Primary,
+                                    pressed: true,
+                                    ..
+                                } if is_canvas(pos) => Some(to_image(pos)),
+                                _ => None,
+                            })
+                        });
+                        let image = self.document.base_image();
+                        if let Some(ColorSample { r, g, b, .. }) = click.and_then(|point| {
+                            let x = (point.x.floor() as u32).min(image.width() - 1);
+                            let y = (point.y.floor() as u32).min(image.height() - 1);
+                            sample_image(image, x, y).ok()
+                        }) {
+                            let hex = format_picked_color(r, g, b);
+                            overlay_ctx.copy_text(hex.clone());
+                            outcome = OverlayModeOutcome::ColorPicked { hex, r, g, b };
+                            return;
+                        }
+                    } else if self.active_tool == OverlayTool::Region {
                         let selection = overlay_ctx.input(|input| {
                             self.handle_region_input(&input.events, &is_canvas, &to_image_unclamped)
                         });
                         if let Some(selection) = selection {
                             self.selection = Some(selection);
-                            if self.auto_capture_on_drag
-                                && let Some(captured) = self.finalize_capture(false)
+                            if (!capture_mode || self.auto_capture_on_drag)
+                                && let Some(captured) = self.finalize_selection(false)
                             {
                                 outcome = captured;
                                 return;
@@ -379,7 +567,7 @@ impl RegionOverlayState {
                                 egui::StrokeKind::Inside,
                             );
                         }
-                    } else if self.active_tool == OverlayTool::Region {
+                    } else if !color_picker && self.active_tool == OverlayTool::Region {
                         painter.rect_filled(screen_rect, 0.0, scrim);
                     }
 
@@ -414,7 +602,13 @@ impl RegionOverlayState {
                         }
 
                         let img_pt = to_image(pos);
-                        let hud = if let Some(sel) = active_region {
+                        let hud = if !capture_mode {
+                            format!(
+                                "X: {}  Y: {}",
+                                self.origin_x + img_pt.x.floor() as i32,
+                                self.origin_y + img_pt.y.floor() as i32,
+                            )
+                        } else if let Some(sel) = active_region {
                             format!(
                                 "X: {}  Y: {}  W: {}  H: {}  |  Tool: {}  |  Enter: save  |  Esc: cancel",
                                 self.origin_x + sel.x.round() as i32,
@@ -439,16 +633,20 @@ impl RegionOverlayState {
 
                         let galley =
                             painter.layout_no_wrap(hud, FontId::monospace(12.5), Color32::WHITE);
-                        let badge_pos = Pos2::new(
-                            (pos.x + 16.0)
-                                .min(screen_rect.max.x - galley.size().x - 24.0)
-                                .max(12.0),
-                            (pos.y + 18.0)
-                                .min(screen_rect.max.y - 36.0)
-                                .max(toolbar_rect.max.y + 8.0),
-                        );
-                        let badge_rect =
-                            Rect::from_min_size(badge_pos, galley.size() + Vec2::new(14.0, 8.0));
+                        let badge_size = galley.size() + Vec2::new(14.0, 8.0);
+                        let clamp_badge = |top_left: Pos2| {
+                            top_left.min(screen_rect.max - badge_size).max(screen_rect.min)
+                        };
+                        let mut badge_pos = clamp_badge(pos + Vec2::new(16.0, 18.0));
+                        if Rect::from_min_size(badge_pos, badge_size).intersects(toolbar_rect) {
+                            let below = toolbar_rect.max.y + 8.0;
+                            let above = toolbar_rect.min.y - badge_size.y - 8.0;
+                            badge_pos = clamp_badge(Pos2::new(
+                                badge_pos.x,
+                                if below + badge_size.y <= screen_rect.max.y { below } else { above },
+                            ));
+                        }
+                        let badge_rect = Rect::from_min_size(badge_pos, badge_size);
                         painter.rect_filled(
                             badge_rect,
                             CornerRadius::same(4),
@@ -462,7 +660,7 @@ impl RegionOverlayState {
                         );
                         painter.galley(badge_pos + Vec2::new(7.0, 4.0), galley, Color32::WHITE);
 
-                        if self.show_magnifier {
+                        if color_picker || self.show_magnifier {
                             let image = self.document.base_image();
                             let (grid, rgba) = sample_magnifier_grid(
                                 image,
@@ -471,9 +669,14 @@ impl RegionOverlayState {
                                 MAGNIFIER_HALF_EXTENT,
                             );
                             let [r, g, b, _] = rgba;
-                            let hex = format!("#{r:02X}{g:02X}{b:02X}");
+                            let hex = format_picked_color(r, g, b);
                             if !typing && overlay_ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::C)) {
                                 overlay_ctx.copy_text(hex.clone());
+                            }
+                            let mut readout = format!("HEX {hex}\nRGB({r}, {g}, {b})");
+                            if color_picker {
+                                let (hue, saturation, lightness) = ColorSample::rgb(r, g, b).to_hsl();
+                                readout.push_str(&format!("\nHSL({hue:.0}°, {saturation:.0}%, {lightness:.0}%)"));
                             }
                             paint_magnifier(
                                 &painter,
@@ -481,7 +684,7 @@ impl RegionOverlayState {
                                 screen_rect,
                                 [toolbar_rect, badge_rect],
                                 &grid,
-                                &format!("HEX {hex}\nRGB({r}, {g}, {b})"),
+                                &readout,
                             );
                         }
                     }
@@ -495,11 +698,35 @@ impl RegionOverlayState {
         outcome
     }
 
+    fn fit_viewport_to_snapshot(&self, ctx: &egui::Context, image_size: Vec2) {
+        let ppp = ctx.pixels_per_point();
+        let desired_origin = Pos2::new(self.origin_x as f32 / ppp, self.origin_y as f32 / ppp);
+        let desired_size = image_size / ppp;
+        let (inner, outer) = ctx.input(|input| {
+            let viewport = input.viewport();
+            (viewport.inner_rect, viewport.outer_rect)
+        });
+        let Some(inner) = inner else {
+            return;
+        };
+        let offset = desired_origin - inner.min;
+        let tolerance = 0.5 / ppp;
+        if (offset.x.abs() > tolerance || offset.y.abs() > tolerance)
+            && let Some(outer) = outer
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(outer.min + offset));
+        }
+        let size_error = desired_size - inner.size();
+        if size_error.x.abs() > tolerance || size_error.y.abs() > tolerance {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired_size));
+        }
+    }
+
     fn render_floating_toolbar(
         &mut self,
         ui: &mut egui::Ui,
         accent: Color32,
-        toolbar_action: &mut Option<OverlayOutcome>,
+        toolbar_action: &mut Option<OverlayModeOutcome>,
     ) {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
@@ -621,13 +848,13 @@ impl RegionOverlayState {
                 )
                 .fill(accent);
                 if ui.add(cap_btn).clicked() {
-                    *toolbar_action = self.finalize_capture(false);
+                    *toolbar_action = self.finalize_selection(false);
                 }
                 if ui.button("Full Editor").clicked() {
-                    *toolbar_action = self.finalize_capture(true);
+                    *toolbar_action = self.finalize_selection(true);
                 }
                 if ui.button("Cancel [Esc]").clicked() {
-                    *toolbar_action = Some(OverlayOutcome::Cancelled);
+                    *toolbar_action = Some(OverlayModeOutcome::Cancelled);
                 }
             });
         });
@@ -987,32 +1214,40 @@ impl RegionOverlayState {
         }
     }
 
-    fn finalize_capture(&self, open_in_editor: bool) -> Option<OverlayOutcome> {
-        let flat = self.document.flatten().ok()?;
-        let max_w = flat.width();
-        let max_h = flat.height();
-
-        let (cropped, global_region) = if let Some(sel) = self.selection {
-            let x = (sel.x.floor().max(0.0) as u32).min(max_w.saturating_sub(1));
-            let y = (sel.y.floor().max(0.0) as u32).min(max_h.saturating_sub(1));
-            let w = (sel.width.round() as u32).min(max_w.saturating_sub(x));
-            let h = (sel.height.round() as u32).min(max_h.saturating_sub(y));
-            let local = Region::new(x as i32, y as i32, w, h).ok()?;
-            let image = flat.crop(local).ok()?;
-            let global =
-                Region::new(self.origin_x + x as i32, self.origin_y + y as i32, w, h).ok()?;
-            (image, global)
-        } else {
-            let global = Region::new(self.origin_x, self.origin_y, max_w, max_h).ok()?;
-            (flat, global)
-        };
-
-        Some(OverlayOutcome::Captured {
-            image: cropped,
-            global_region,
+    fn finalize_selection(&self, open_in_editor: bool) -> Option<OverlayModeOutcome> {
+        self.mode.finish_region(
+            &self.document,
+            self.selection,
+            (self.origin_x, self.origin_y),
             open_in_editor,
-        })
+        )
     }
+}
+
+fn toolbar_anchor_in_overlay(
+    origin_x: i32,
+    origin_y: i32,
+    screen_rect: Rect,
+    scale_x: f32,
+    scale_y: f32,
+) -> Pos2 {
+    let zero_x = screen_rect.min.x - origin_x as f32 * scale_x;
+    let zero_y = screen_rect.min.y - origin_y as f32 * scale_y;
+    let left = if zero_x < screen_rect.max.x {
+        zero_x.max(screen_rect.min.x)
+    } else {
+        screen_rect.min.x
+    };
+    let top = if zero_y + 10.0 < screen_rect.max.y {
+        zero_y.max(screen_rect.min.y)
+    } else {
+        screen_rect.min.y
+    };
+    Pos2::new((left + screen_rect.max.x) * 0.5, top + 10.0)
+}
+
+fn format_picked_color(r: u8, g: u8, b: u8) -> String {
+    ColorSample::rgb(r, g, b).to_hex()
 }
 
 fn clipped_window_rect(
@@ -1219,6 +1454,101 @@ mod tests {
 
     fn sample_image() -> CapturedImage {
         CapturedImage::from_rgba(2, 2, PIXELS.concat()).unwrap()
+    }
+
+    #[test]
+    fn toolbar_centers_on_a_single_monitor() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0));
+        assert_eq!(
+            toolbar_anchor_in_overlay(0, 0, screen, 1.0, 1.0),
+            Pos2::new(960.0, 10.0),
+        );
+    }
+
+    #[test]
+    fn toolbar_skips_the_bezel_on_a_left_extended_desktop() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(3840.0, 1080.0));
+        assert_eq!(
+            toolbar_anchor_in_overlay(-1920, 0, screen, 1.0, 1.0),
+            Pos2::new(2880.0, 10.0),
+        );
+    }
+
+    #[test]
+    fn toolbar_maps_negative_origins_into_scaled_overlay_points() {
+        let screen = Rect::from_min_size(Pos2::new(5.0, 15.0), Vec2::new(1920.0, 1080.0));
+        assert_eq!(
+            toolbar_anchor_in_overlay(-1920, -1080, screen, 0.5, 0.5),
+            Pos2::new(1445.0, 565.0),
+        );
+    }
+
+    #[test]
+    fn modes_default_to_capture_and_describe_the_requested_action() {
+        assert_eq!(OverlayMode::default(), OverlayMode::Capture);
+        assert_eq!(OverlayMode::Capture.hint(), "Capture Region");
+        assert!(OverlayMode::Ocr.hint().starts_with("OCR Region:"));
+        assert!(
+            OverlayMode::SelectRecordingRegion
+                .hint()
+                .starts_with("Select Recording Region:")
+        );
+        assert!(OverlayMode::ColorPicker.hint().starts_with("Color Picker:"));
+    }
+
+    #[test]
+    fn mode_outcomes_crop_ocr_and_return_global_recording_bounds() {
+        let document = EditorDocument::new(sample_image());
+        let selection = Some(RectF::from_points(
+            Point::new(0.0, 1.0),
+            Point::new(2.0, 2.0),
+        ));
+        let origin = (-1, -100);
+        let expected_region = Region::new(-1, -99, 2, 1).unwrap();
+
+        let Some(OverlayModeOutcome::OcrRegion {
+            image,
+            global_region,
+        }) = OverlayMode::Ocr.finish_region(&document, selection, origin, false)
+        else {
+            panic!("expected a cropped OCR region");
+        };
+        assert_eq!(global_region, expected_region);
+        assert_eq!(image.rgba(), PIXELS[2..].concat());
+
+        assert!(matches!(
+            OverlayMode::SelectRecordingRegion.finish_region(&document, selection, origin, false),
+            Some(OverlayModeOutcome::RecordingRegion(region)) if region == expected_region
+        ));
+        for mode in [
+            OverlayMode::Ocr,
+            OverlayMode::SelectRecordingRegion,
+            OverlayMode::ColorPicker,
+        ] {
+            assert!(mode.finish_region(&document, None, origin, false).is_none());
+        }
+        assert!(
+            OverlayMode::ColorPicker
+                .finish_region(&document, selection, origin, false)
+                .is_none()
+        );
+
+        let Some(OverlayModeOutcome::Captured {
+            image,
+            global_region,
+            open_in_editor: true,
+        }) = OverlayMode::Capture.finish_region(&document, None, origin, true)
+        else {
+            panic!("expected a full capture to open in the editor");
+        };
+        assert_eq!(global_region, Region::new(-1, -100, 2, 2).unwrap());
+        assert_eq!(image.rgba(), document.base_image().rgba());
+    }
+
+    #[test]
+    fn picked_color_formats_uppercase_zero_padded_hex() {
+        assert_eq!(format_picked_color(0, 10, 255), "#000AFF");
+        assert_eq!(format_picked_color(171, 205, 239), "#ABCDEF");
     }
 
     #[test]
