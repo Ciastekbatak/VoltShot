@@ -1,6 +1,6 @@
 use crate::i18n::Strings;
-use crate::theme::SharexPalette;
-use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
+use crate::theme::{SharexPalette, card_frame, section_label, view_heading};
+use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke, Vec2};
 use sharex_core::CapturedImage;
 use sharex_effects::{
     EffectColor, EffectPreset, ImageEffect, WatermarkAnchor, apply_effects, builtin_presets,
@@ -158,8 +158,8 @@ impl EffectsPanelState {
         let mut status_msg = None;
 
         ui.horizontal(|ui| {
-            ui.heading(s.effects);
-            ui.add_space(12.0);
+            view_heading(ui, s.effects, p);
+            ui.add_space(12.0_f32);
             if ui
                 .checkbox(
                     &mut self.apply_on_capture,
@@ -174,23 +174,20 @@ impl EffectsPanelState {
                 });
             }
         });
+        ui.add_space(6.0_f32);
         ui.separator();
+        ui.add_space(6.0_f32);
 
         ui.columns(2, |columns| {
             egui::ScrollArea::vertical().show(&mut columns[0], |ui| {
-                ui.label(
-                    RichText::new("PRESETS")
-                        .size(11.0)
-                        .strong()
-                        .color(p.text_muted),
-                );
-                ui.add_space(4.0);
+                section_label(ui, "Presets", p);
+                ui.add_space(4.0_f32);
 
                 let none_selected = self.selected_preset_idx.is_none();
                 if preset_row(ui, "None", "Original unmodified image", none_selected, p) {
                     self.selected_preset_idx = None;
                 }
-                ui.add_space(4.0);
+                ui.add_space(4.0_f32);
 
                 let preset_summaries: Vec<(String, String)> = self
                     .presets()
@@ -204,7 +201,7 @@ impl EffectsPanelState {
                     if preset_row(ui, name, summary, is_selected, p) {
                         self.selected_preset_idx = Some(idx);
                     }
-                    ui.add_space(4.0);
+                    ui.add_space(4.0_f32);
                 }
 
                 let custom_index = self.custom_index();
@@ -218,35 +215,20 @@ impl EffectsPanelState {
                     self.selected_preset_idx = Some(custom_index);
                 }
 
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new("CUSTOM PIPELINE BUILDER")
-                        .size(11.0)
-                        .strong()
-                        .color(p.text_muted),
-                );
-                ui.add_space(4.0);
+                ui.add_space(10.0_f32);
+                section_label(ui, "Custom Pipeline Builder", p);
+                ui.add_space(4.0_f32);
 
-                egui::Frame::NONE
-                    .fill(p.card_bg)
-                    .stroke(Stroke::new(1.0_f32, p.border))
-                    .corner_radius(CornerRadius::same(5))
-                    .inner_margin(Margin::same(10))
-                    .show(ui, |ui| {
-                        self.show_pipeline(ui);
-                    });
+                card_frame(p).show(ui, |ui| {
+                    self.show_pipeline(ui);
+                });
 
                 self.show_preset_toml(ui, p);
             });
 
             columns[1].vertical(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("LIVE PREVIEW")
-                            .size(11.0)
-                            .strong()
-                            .color(p.text_muted),
-                    );
+                    section_label(ui, "Live Preview", p);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let has_latest = latest_capture.is_some_and(Path::exists);
                         if ui
@@ -516,19 +498,19 @@ fn preset_row(
     selected: bool,
     p: &SharexPalette,
 ) -> bool {
-    let desired = Vec2::new(ui.available_width(), 46.0);
+    let desired = Vec2::new(ui.available_width(), 48.0_f32);
     let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
     let bg = if selected {
-        p.accent
+        p.accent_subtle
     } else if resp.hovered() {
         p.hover_bg
     } else {
         p.card_bg
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(5), bg);
+    ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
     ui.painter().rect_stroke(
         rect,
-        CornerRadius::same(5),
+        CornerRadius::same(8),
         Stroke::new(
             if selected { 1.5_f32 } else { 1.0_f32 },
             if selected || resp.hovered() {
@@ -539,29 +521,29 @@ fn preset_row(
         ),
         egui::StrokeKind::Inside,
     );
-    let title_color = if selected {
-        Color32::WHITE
-    } else {
-        p.text_primary
-    };
-    let sub_color = if selected {
-        Color32::from_rgba_unmultiplied(240, 245, 255, 220)
-    } else {
-        p.text_muted
-    };
+    if selected {
+        let indicator = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x, rect.min.y + 8.0_f32),
+            Vec2::new(3.0_f32, rect.height() - 16.0_f32),
+        );
+        ui.painter()
+            .rect_filled(indicator, CornerRadius::same(2), p.accent);
+    }
+    let title_color = p.text_primary;
+    let sub_color = p.text_muted;
     let label_painter = ui.painter().with_clip_rect(rect);
     label_painter.text(
-        egui::pos2(rect.min.x + 10.0, rect.min.y + 14.0),
+        egui::pos2(rect.min.x + 12.0_f32, rect.min.y + 15.0_f32),
         egui::Align2::LEFT_CENTER,
         title,
-        egui::FontId::proportional(13.5),
+        egui::FontId::proportional(13.5_f32),
         title_color,
     );
     label_painter.text(
-        egui::pos2(rect.min.x + 10.0, rect.min.y + 32.0),
+        egui::pos2(rect.min.x + 12.0_f32, rect.min.y + 33.0_f32),
         egui::Align2::LEFT_CENTER,
         subtitle,
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(11.0_f32),
         sub_color,
     );
     resp.clicked()

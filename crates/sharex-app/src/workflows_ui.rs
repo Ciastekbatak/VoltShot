@@ -1,4 +1,4 @@
-use crate::theme::SharexPalette;
+use crate::theme::{SharexPalette, card_frame, section_label, view_heading};
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
 use serde::{Deserialize, Serialize};
 use sharex_core::{
@@ -173,9 +173,11 @@ impl WorkflowsPanelState {
         let mut action = WorkflowsUiAction::None;
 
         ui.horizontal(|ui| {
-            ui.heading("Workflows & Watch Folders");
+            view_heading(ui, "Workflows & Watch Folders", p);
         });
+        ui.add_space(6.0_f32);
         ui.separator();
+        ui.add_space(6.0_f32);
 
         if let Some(status) = &self.status_message {
             let (text, color) = match status {
@@ -220,12 +222,7 @@ impl WorkflowsPanelState {
         let mut action = WorkflowsUiAction::None;
 
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("PER-HOTKEY WORKFLOW PRESETS")
-                    .size(11.5)
-                    .strong()
-                    .color(p.text_muted),
-            );
+            section_label(ui, "Per-Hotkey Workflow Presets", p);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Save Workflows").clicked() {
                     match self.save(workflows_path) {
@@ -251,19 +248,14 @@ impl WorkflowsPanelState {
         ui.add_space(6.0);
 
         if self.registry.workflows.is_empty() {
-            egui::Frame::NONE
-                .fill(p.card_bg)
-                .stroke(Stroke::new(1.0_f32, p.border))
-                .corner_radius(CornerRadius::same(6))
-                .inner_margin(Margin::same(12))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(
-                            "No workflow presets yet. Click \"+ Add Workflow Preset\" to override capture settings per hotkey.",
-                        )
-                        .color(p.text_muted),
-                    );
-                });
+            card_frame(p).show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "No workflow presets yet. Click \"+ Add Workflow Preset\" to override capture settings per hotkey.",
+                    )
+                    .color(p.text_muted),
+                );
+            });
             return action;
         }
 
@@ -390,19 +382,14 @@ impl WorkflowsPanelState {
         ui.add_space(8.0);
 
         if self.watch_rules.is_empty() {
-            egui::Frame::NONE
-                .fill(p.card_bg)
-                .stroke(Stroke::new(1.0_f32, p.border))
-                .corner_radius(CornerRadius::same(6))
-                .inner_margin(Margin::same(12))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(
-                            "No watch folders configured. Click \"+ Add Watch Folder\" to monitor directories automatically.",
-                        )
-                        .color(p.text_muted),
-                    );
-                });
+            card_frame(p).show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "No watch folders configured. Click \"+ Add Watch Folder\" to monitor directories automatically.",
+                    )
+                    .color(p.text_muted),
+                );
+            });
             return action;
         }
 

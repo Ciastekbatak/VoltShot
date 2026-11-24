@@ -1,5 +1,5 @@
 use crate::i18n::Strings;
-use crate::theme::SharexPalette;
+use crate::theme::{SharexPalette, view_heading};
 use chrono::Utc;
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 use sharex_core::{CapturedImage, ClipboardSink, CoreError, ImageFormat, resolve_unique_path};
@@ -186,8 +186,8 @@ impl ToolsPanelState {
         tools_ctx: ToolsContext<'_>,
     ) -> Option<String> {
         ui.horizontal_wrapped(|ui| {
-            ui.heading(s.tools);
-            ui.add_space(12.0);
+            view_heading(ui, s.tools, p);
+            ui.add_space(12.0_f32);
             for (tab, label) in [
                 (ToolTab::QrCode, s.qr_code),
                 (ToolTab::Color, s.color_tool),
@@ -199,17 +199,24 @@ impl ToolsPanelState {
             ] {
                 let selected = self.active_tab == tab;
                 let btn = egui::Button::new(RichText::new(label).color(if selected {
-                    Color32::WHITE
-                } else {
                     p.text_primary
+                } else {
+                    p.text_muted
                 }))
-                .fill(if selected { p.accent } else { p.card_bg });
+                .fill(if selected { p.accent_subtle } else { p.card_bg })
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    if selected { p.accent } else { p.border },
+                ))
+                .corner_radius(CornerRadius::same(6));
                 if ui.add(btn).clicked() {
                     self.active_tab = tab;
                 }
             }
         });
+        ui.add_space(6.0_f32);
         ui.separator();
+        ui.add_space(6.0_f32);
 
         egui::ScrollArea::vertical()
             .id_salt("tools_panel")

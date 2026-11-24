@@ -1,5 +1,5 @@
 use crate::i18n::Strings;
-use crate::theme::SharexPalette;
+use crate::theme::{SharexPalette, view_heading};
 use eframe::egui::{self, RichText};
 use sharex_core::{
     AppConfig, ClipboardSink, CoreError, ImageFormat, UploadRequest, UploadResult, Uploader,
@@ -545,8 +545,10 @@ impl UploadersPanelState {
         s: &Strings,
         capture: Option<(&Path, bool)>,
     ) {
-        ui.heading(s.uploaders);
+        view_heading(ui, s.uploaders, p);
+        ui.add_space(6.0_f32);
         ui.separator();
+        ui.add_space(6.0_f32);
         egui::ScrollArea::vertical()
             .id_salt("uploaders_panel")
             .show(ui, |ui| {

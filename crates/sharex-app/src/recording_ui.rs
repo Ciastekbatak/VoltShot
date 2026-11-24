@@ -1,8 +1,8 @@
 use crate::i18n::Strings;
 use crate::recording_hud::{RecordingHudAction, show_recording_hud};
-use crate::theme::SharexPalette;
+use crate::theme::{SharexPalette, card_frame, status_dot, view_heading};
 use chrono::Utc;
-use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
+use eframe::egui::{self, Color32, RichText};
 use sharex_core::{ClipboardSink, Region, resolve_unique_path};
 use sharex_media::{
     AudioDevice, CapturePlatform, MediaError, RecordingConfig, RecordingFormat, RecordingState,
@@ -289,10 +289,11 @@ impl RecordingPanelState {
         }
 
         ui.horizontal(|ui| {
-            ui.heading(s.recording);
-            ui.add_space(10.0);
+            view_heading(ui, s.recording, p);
+            ui.add_space(10.0_f32);
             if is_recording {
                 let elapsed = self.recorder.elapsed().unwrap_or_default();
+                status_dot(ui, p.danger);
                 ui.label(
                     RichText::new(format!("REC {}", format_elapsed(elapsed)))
                         .strong()
@@ -303,40 +304,42 @@ impl RecordingPanelState {
                 ui.label(RichText::new("Finalizing...").strong().color(p.warning));
             }
         });
+        ui.add_space(6.0_f32);
         ui.separator();
+        ui.add_space(6.0_f32);
 
-        egui::Frame::NONE
-            .fill(p.card_bg)
-            .stroke(Stroke::new(1.0_f32, p.border))
-            .corner_radius(CornerRadius::same(5))
-            .inner_margin(Margin::same(10))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("FFmpeg:").strong());
-                    if let Some(path) = &self.ffmpeg_path {
-                        ui.label(
-                            RichText::new(format!("Available ({})", path.display()))
-                                .color(p.success),
-                        );
+        card_frame(p).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                status_dot(
+                    ui,
+                    if self.ffmpeg_path.is_some() {
+                        p.success
                     } else {
-                        ui.label(
-                            RichText::new(
-                                "Not found in PATH (install FFmpeg to record MP4/WebM/GIF)",
-                            )
+                        p.warning
+                    },
+                );
+                ui.label(RichText::new("FFmpeg:").strong());
+                if let Some(path) = &self.ffmpeg_path {
+                    ui.label(
+                        RichText::new(format!("Available ({})", path.display())).color(p.success),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("Not found in PATH (install FFmpeg to record MP4/WebM/GIF)")
                             .color(p.warning),
-                        );
-                    }
-                    if ui
-                        .add_enabled(
-                            !is_recording && !is_finalizing,
-                            egui::Button::new("Re-check").small(),
-                        )
-                        .clicked()
-                    {
-                        self.check_ffmpeg();
-                    }
-                });
+                    );
+                }
+                if ui
+                    .add_enabled(
+                        !is_recording && !is_finalizing,
+                        egui::Button::new("Re-check").small(),
+                    )
+                    .clicked()
+                {
+                    self.check_ffmpeg();
+                }
             });
+        });
 
         ui.add_space(10.0);
         ui.add_enabled_ui(!is_recording && !is_finalizing, |ui| {
@@ -492,61 +495,56 @@ impl RecordingPanelState {
             }
         });
 
-        ui.add_space(12.0);
-        egui::Frame::NONE
-            .fill(p.card_bg)
-            .stroke(Stroke::new(1.0_f32, p.border))
-            .corner_radius(CornerRadius::same(5))
-            .inner_margin(Margin::same(12))
-            .show(ui, |ui| match self.recorder.state() {
-                RecordingState::Idle => {
-                    ui.label(RichText::new("Status: Idle — ready to record.").color(p.text_muted));
-                }
-                RecordingState::Recording { output_path, .. } => {
-                    let elapsed = self.recorder.elapsed().unwrap_or_default();
-                    ui.label(
-                        RichText::new(format!(
-                            "Status: Recording ({} / {:.1}s)",
-                            format_elapsed(elapsed),
-                            elapsed.as_secs_f32()
-                        ))
+        ui.add_space(12.0_f32);
+        card_frame(p).show(ui, |ui| match self.recorder.state() {
+            RecordingState::Idle => {
+                ui.label(RichText::new("Status: Idle — ready to record.").color(p.text_muted));
+            }
+            RecordingState::Recording { output_path, .. } => {
+                let elapsed = self.recorder.elapsed().unwrap_or_default();
+                ui.label(
+                    RichText::new(format!(
+                        "Status: Recording ({} / {:.1}s)",
+                        format_elapsed(elapsed),
+                        elapsed.as_secs_f32()
+                    ))
+                    .strong()
+                    .color(p.danger),
+                );
+                ui.label(
+                    RichText::new(format!("Output: {}", output_path.display()))
+                        .size(12.0)
+                        .color(p.text_muted),
+                );
+            }
+            RecordingState::Completed {
+                output_path,
+                duration,
+            } => {
+                let path_text = output_path.display().to_string();
+                ui.label(
+                    RichText::new(format!("Status: Completed ({})", format_elapsed(*duration)))
+                        .strong()
+                        .color(p.success),
+                );
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&path_text).monospace().size(12.0));
+                    if ui.small_button("Copy Path").clicked() {
+                        status_msg = Some(match clipboard.copy_text(&path_text) {
+                            Ok(()) => format!("Copied recording path: {path_text}"),
+                            Err(err) => format!("Clipboard error: {err}"),
+                        });
+                    }
+                });
+            }
+            RecordingState::Failed(reason) => {
+                ui.label(
+                    RichText::new(format!("Status: Failed — {reason}"))
                         .strong()
                         .color(p.danger),
-                    );
-                    ui.label(
-                        RichText::new(format!("Output: {}", output_path.display()))
-                            .size(12.0)
-                            .color(p.text_muted),
-                    );
-                }
-                RecordingState::Completed {
-                    output_path,
-                    duration,
-                } => {
-                    let path_text = output_path.display().to_string();
-                    ui.label(
-                        RichText::new(format!("Status: Completed ({})", format_elapsed(*duration)))
-                            .strong()
-                            .color(p.success),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&path_text).monospace().size(12.0));
-                        if ui.small_button("Copy Path").clicked() {
-                            status_msg = Some(match clipboard.copy_text(&path_text) {
-                                Ok(()) => format!("Copied recording path: {path_text}"),
-                                Err(err) => format!("Clipboard error: {err}"),
-                            });
-                        }
-                    });
-                }
-                RecordingState::Failed(reason) => {
-                    ui.label(
-                        RichText::new(format!("Status: Failed — {reason}"))
-                            .strong()
-                            .color(p.danger),
-                    );
-                }
-            });
+                );
+            }
+        });
 
         if let Some(msg) = &self.last_message {
             ui.add_space(6.0);
