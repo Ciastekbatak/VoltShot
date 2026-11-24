@@ -1,8 +1,16 @@
 pub mod http_uploader;
+pub mod presets;
+pub mod queue;
 pub mod sxcu;
 pub mod template;
 
 pub use http_uploader::{CustomUploaderStore, SxcuUploader};
+pub use presets::{
+    PresetCatalogEntry, discord_webhook_preset, github_gist_preset, github_gist_preset_for_request,
+    imgur_preset, imgur_preset_with_endpoint, list_builtin_presets, pastebin_preset,
+    pastebin_preset_for_request,
+};
+pub use queue::{QueuedUpload, QueuedUploadStatus, RetryPolicy, UploadQueue};
 pub use sxcu::{HttpMethod, SxcuBodyType, SxcuDefinition};
 pub use template::{ResponseContext, evaluate_template};
 
