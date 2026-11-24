@@ -41,6 +41,7 @@ mod platform {
     };
 
     const WM_SYNC_HOTKEYS: u32 = WM_APP + 1;
+    const WM_RETRY_CONFLICTS: u32 = WM_APP + 2;
 
     pub struct HotkeyRuntime {
         thread_id: u32,
@@ -92,7 +93,14 @@ mod platform {
 
         pub fn retry_conflicts(&mut self, bindings: &[HotkeyBinding]) {
             if self.has_conflicts() {
-                self.sync(bindings);
+                if let Ok(mut guard) = self.desired.lock() {
+                    *guard = bindings.to_vec();
+                }
+                if self.thread_id != 0 {
+                    unsafe {
+                        PostThreadMessageW(self.thread_id, WM_RETRY_CONFLICTS, 0, 0);
+                    }
+                }
             }
         }
 
@@ -186,6 +194,11 @@ mod platform {
                     apply_win32_bindings(&desired, &statuses, &mut registered);
                     ctx.request_repaint();
                 }
+                WM_RETRY_CONFLICTS
+                    if retry_conflicted_win32_bindings(&desired, &statuses, &mut registered) =>
+                {
+                    ctx.request_repaint();
+                }
                 _ => {}
             }
         }
@@ -243,6 +256,43 @@ mod platform {
         if let Ok(mut guard) = statuses.lock() {
             *guard = next_statuses;
         }
+    }
+
+    fn retry_conflicted_win32_bindings(
+        desired: &Arc<Mutex<Vec<HotkeyBinding>>>,
+        statuses: &Arc<Mutex<HashMap<String, HotkeyStatus>>>,
+        registered: &mut HashMap<i32, (String, HotkeyAction)>,
+    ) -> bool {
+        let bindings = desired.lock().map(|g| g.clone()).unwrap_or_default();
+        let mut changed = false;
+        let Ok(mut status_map) = statuses.lock() else {
+            return false;
+        };
+
+        for (index, binding) in bindings.iter().enumerate() {
+            if !matches!(status_map.get(&binding.id), Some(HotkeyStatus::Error(_))) {
+                continue;
+            }
+            if !binding.enabled {
+                status_map.insert(binding.id.clone(), HotkeyStatus::Disabled);
+                changed = true;
+                continue;
+            }
+            let Some(combo) = binding.combo else {
+                status_map.insert(binding.id.clone(), HotkeyStatus::Unbound);
+                changed = true;
+                continue;
+            };
+            let win_id = (index as i32) + 1;
+            let (mods, vk) = to_win32_hotkey(combo);
+            let ok = unsafe { RegisterHotKey(ptr::null_mut(), win_id, mods, vk) };
+            if ok != 0 {
+                registered.insert(win_id, (binding.id.clone(), binding.action));
+                status_map.insert(binding.id.clone(), HotkeyStatus::Active);
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn to_win32_hotkey(combo: HotkeyCombo) -> (u32, u32) {

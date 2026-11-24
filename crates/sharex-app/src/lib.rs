@@ -1,6 +1,7 @@
 pub mod autostart;
 pub mod cli;
 pub mod clipboard;
+pub mod drag_out;
 pub mod editor_ui;
 pub mod effects_ui;
 pub mod fonts;

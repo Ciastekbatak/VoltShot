@@ -112,10 +112,13 @@ pub(super) fn capture_screen_area(
         return Err(failure("desktop BitBlt failed"));
     }
 
-    let mut rgba = unsafe { slice::from_raw_parts(bits.cast::<u8>(), len) }.to_vec();
-    for pixel in rgba.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-        pixel[3] = 255;
+    let src = unsafe { slice::from_raw_parts(bits.cast::<u8>(), len) };
+    let mut rgba = vec![0u8; len];
+    for (dst_px, src_px) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        dst_px[0] = src_px[2];
+        dst_px[1] = src_px[1];
+        dst_px[2] = src_px[0];
+        dst_px[3] = 255;
     }
     CapturedImage::from_rgba(width, height, rgba)
 }

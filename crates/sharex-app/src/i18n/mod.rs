@@ -1,3 +1,7 @@
+mod asia_global;
+mod europe_east;
+mod europe_west;
+
 use std::fmt;
 use std::str::FromStr;
 
@@ -7,6 +11,30 @@ pub enum UiLanguage {
     #[default]
     En,
     Pl,
+    De,
+    Fr,
+    Es,
+    PtBr,
+    Pt,
+    It,
+    Nl,
+    Sv,
+    Cs,
+    Sk,
+    Hu,
+    Ro,
+    Tr,
+    Ru,
+    Uk,
+    El,
+    Ja,
+    Ko,
+    ZhCn,
+    ZhTw,
+    Vi,
+    Id,
+    Th,
+    Ar,
 }
 
 /// Error returned when parsing an unsupported language identifier.
@@ -24,12 +52,94 @@ impl fmt::Display for ParseUiLanguageError {
 impl std::error::Error for ParseUiLanguageError {}
 
 impl UiLanguage {
-    pub const ALL: [Self; 2] = [Self::En, Self::Pl];
+    pub const ALL: [Self; 26] = [
+        Self::En,
+        Self::Pl,
+        Self::De,
+        Self::Fr,
+        Self::Es,
+        Self::PtBr,
+        Self::Pt,
+        Self::It,
+        Self::Nl,
+        Self::Sv,
+        Self::Cs,
+        Self::Sk,
+        Self::Hu,
+        Self::Ro,
+        Self::Tr,
+        Self::Ru,
+        Self::Uk,
+        Self::El,
+        Self::Ja,
+        Self::Ko,
+        Self::ZhCn,
+        Self::ZhTw,
+        Self::Vi,
+        Self::Id,
+        Self::Th,
+        Self::Ar,
+    ];
 
     pub const fn code(self) -> &'static str {
         match self {
             Self::En => "en",
             Self::Pl => "pl",
+            Self::De => "de",
+            Self::Fr => "fr",
+            Self::Es => "es",
+            Self::PtBr => "pt-BR",
+            Self::Pt => "pt",
+            Self::It => "it",
+            Self::Nl => "nl",
+            Self::Sv => "sv",
+            Self::Cs => "cs",
+            Self::Sk => "sk",
+            Self::Hu => "hu",
+            Self::Ro => "ro",
+            Self::Tr => "tr",
+            Self::Ru => "ru",
+            Self::Uk => "uk",
+            Self::El => "el",
+            Self::Ja => "ja",
+            Self::Ko => "ko",
+            Self::ZhCn => "zh-CN",
+            Self::ZhTw => "zh-TW",
+            Self::Vi => "vi",
+            Self::Id => "id",
+            Self::Th => "th",
+            Self::Ar => "ar",
+        }
+    }
+
+    pub const fn short_code(self) -> &'static str {
+        match self {
+            Self::En => "EN",
+            Self::Pl => "PL",
+            Self::De => "DE",
+            Self::Fr => "FR",
+            Self::Es => "ES",
+            Self::PtBr => "BR",
+            Self::Pt => "PT",
+            Self::It => "IT",
+            Self::Nl => "NL",
+            Self::Sv => "SV",
+            Self::Cs => "CS",
+            Self::Sk => "SK",
+            Self::Hu => "HU",
+            Self::Ro => "RO",
+            Self::Tr => "TR",
+            Self::Ru => "RU",
+            Self::Uk => "UK",
+            Self::El => "EL",
+            Self::Ja => "JA",
+            Self::Ko => "KO",
+            Self::ZhCn => "CN",
+            Self::ZhTw => "TW",
+            Self::Vi => "VI",
+            Self::Id => "ID",
+            Self::Th => "TH",
+            Self::Ar => "AR",
         }
     }
 
@@ -37,7 +147,38 @@ impl UiLanguage {
         match self {
             Self::En => "English",
             Self::Pl => "Polski",
+            Self::De => "Deutsch",
+            Self::Fr => "Français",
+            Self::Es => "Español",
+            Self::PtBr => "Português (Brasil)",
+            Self::Pt => "Português",
+            Self::It => "Italiano",
+            Self::Nl => "Nederlands",
+            Self::Sv => "Svenska",
+            Self::Cs => "Čeština",
+            Self::Sk => "Slovenčina",
+            Self::Hu => "Magyar",
+            Self::Ro => "Română",
+            Self::Tr => "Türkçe",
+            Self::Ru => "Русский",
+            Self::Uk => "Українська",
+            Self::El => "Ελληνικά",
+            Self::Ja => "日本語",
+            Self::Ko => "한국어",
+            Self::ZhCn => "简体中文",
+            Self::ZhTw => "繁體中文",
+            Self::Vi => "Tiếng Việt",
+            Self::Id => "Bahasa Indonesia",
+            Self::Th => "ไทย",
+            Self::Ar => "العربية",
         }
+    }
+
+    pub const fn needs_extended_unicode_fonts(self) -> bool {
+        matches!(
+            self,
+            Self::Ja | Self::Ko | Self::ZhCn | Self::ZhTw | Self::Th | Self::Ar
+        )
     }
 
     pub const fn strings(self) -> &'static Strings {
@@ -59,6 +200,30 @@ impl FromStr for UiLanguage {
         match normalized.as_str() {
             "en" | "english" | "en-us" | "en_us" | "en-gb" | "en_gb" => Ok(Self::En),
             "pl" | "polish" | "polski" | "pl-pl" | "pl_pl" => Ok(Self::Pl),
+            "de" | "german" | "deutsch" | "de-de" | "de_de" => Ok(Self::De),
+            "fr" | "french" | "français" | "francais" | "fr-fr" | "fr_fr" => Ok(Self::Fr),
+            "es" | "spanish" | "español" | "espanol" | "es-es" | "es_es" => Ok(Self::Es),
+            "pt-br" | "pt_br" | "br" | "portuguese-br" => Ok(Self::PtBr),
+            "pt" | "portuguese" | "português" | "portugues" | "pt-pt" | "pt_pt" => Ok(Self::Pt),
+            "it" | "italian" | "italiano" | "it-it" | "it_it" => Ok(Self::It),
+            "nl" | "dutch" | "nederlands" | "nl-nl" | "nl_nl" => Ok(Self::Nl),
+            "sv" | "swedish" | "svenska" | "sv-se" | "sv_se" => Ok(Self::Sv),
+            "cs" | "cz" | "czech" | "čeština" | "cestina" | "cs-cz" | "cs_cz" => Ok(Self::Cs),
+            "sk" | "slovak" | "slovenčina" | "slovencina" | "sk-sk" | "sk_sk" => Ok(Self::Sk),
+            "hu" | "hungarian" | "magyar" | "hu-hu" | "hu_hu" => Ok(Self::Hu),
+            "ro" | "romanian" | "română" | "romana" | "ro-ro" | "ro_ro" => Ok(Self::Ro),
+            "tr" | "turkish" | "türkçe" | "turkce" | "tr-tr" | "tr_tr" => Ok(Self::Tr),
+            "ru" | "russian" | "русский" | "ru-ru" | "ru_ru" => Ok(Self::Ru),
+            "uk" | "ua" | "ukrainian" | "українська" | "uk-ua" | "uk_ua" => Ok(Self::Uk),
+            "el" | "gr" | "greek" | "ελληνικά" | "el-gr" | "el_gr" => Ok(Self::El),
+            "ja" | "jp" | "japanese" | "日本語" | "ja-jp" | "ja_jp" => Ok(Self::Ja),
+            "ko" | "kr" | "korean" | "한국어" | "ko-kr" | "ko_kr" => Ok(Self::Ko),
+            "zh" | "zh-cn" | "zh_cn" | "cn" | "chinese" | "简体中文" => Ok(Self::ZhCn),
+            "zh-tw" | "zh_tw" | "tw" | "繁體中文" => Ok(Self::ZhTw),
+            "vi" | "vn" | "vietnamese" | "tiếng việt" | "vi-vn" | "vi_vn" => Ok(Self::Vi),
+            "id" | "indonesian" | "bahasa indonesia" | "id-id" | "id_id" => Ok(Self::Id),
+            "th" | "thai" | "ไทย" | "th-th" | "th_th" => Ok(Self::Th),
+            "ar" | "arabic" | "العربية" | "ar-sa" | "ar_sa" => Ok(Self::Ar),
             _ => Err(ParseUiLanguageError {
                 input: s.to_owned(),
             }),
@@ -745,6 +910,30 @@ pub const fn strings(lang: UiLanguage) -> &'static Strings {
     match lang {
         UiLanguage::En => &EN_STRINGS,
         UiLanguage::Pl => &PL_STRINGS,
+        UiLanguage::De => &europe_west::DE_STRINGS,
+        UiLanguage::Fr => &europe_west::FR_STRINGS,
+        UiLanguage::Es => &europe_west::ES_STRINGS,
+        UiLanguage::PtBr => &europe_west::PT_BR_STRINGS,
+        UiLanguage::Pt => &europe_west::PT_STRINGS,
+        UiLanguage::It => &europe_west::IT_STRINGS,
+        UiLanguage::Nl => &europe_west::NL_STRINGS,
+        UiLanguage::Sv => &europe_west::SV_STRINGS,
+        UiLanguage::Cs => &europe_east::CS_STRINGS,
+        UiLanguage::Sk => &europe_east::SK_STRINGS,
+        UiLanguage::Hu => &europe_east::HU_STRINGS,
+        UiLanguage::Ro => &europe_east::RO_STRINGS,
+        UiLanguage::Tr => &europe_east::TR_STRINGS,
+        UiLanguage::Ru => &europe_east::RU_STRINGS,
+        UiLanguage::Uk => &europe_east::UK_STRINGS,
+        UiLanguage::El => &europe_east::EL_STRINGS,
+        UiLanguage::Ja => &asia_global::JA_STRINGS,
+        UiLanguage::Ko => &asia_global::KO_STRINGS,
+        UiLanguage::ZhCn => &asia_global::ZH_CN_STRINGS,
+        UiLanguage::ZhTw => &asia_global::ZH_TW_STRINGS,
+        UiLanguage::Vi => &asia_global::VI_STRINGS,
+        UiLanguage::Id => &asia_global::ID_STRINGS,
+        UiLanguage::Th => &asia_global::TH_STRINGS,
+        UiLanguage::Ar => &asia_global::AR_STRINGS,
     }
 }
 
@@ -1215,9 +1404,17 @@ mod tests {
             assert_eq!(input.parse::<UiLanguage>(), Ok(UiLanguage::Pl));
         }
 
+        for lang in UiLanguage::ALL {
+            assert_eq!(lang.code().parse::<UiLanguage>(), Ok(lang));
+        }
+        assert_eq!("de".parse::<UiLanguage>(), Ok(UiLanguage::De));
+        assert_eq!("french".parse::<UiLanguage>(), Ok(UiLanguage::Fr));
+        assert_eq!("ja".parse::<UiLanguage>(), Ok(UiLanguage::Ja));
+        assert_eq!("zh-CN".parse::<UiLanguage>(), Ok(UiLanguage::ZhCn));
+
         assert!("".parse::<UiLanguage>().is_err());
-        assert!("de".parse::<UiLanguage>().is_err());
-        assert!("french".parse::<UiLanguage>().is_err());
+        assert!("xx".parse::<UiLanguage>().is_err());
+        assert!("klingon".parse::<UiLanguage>().is_err());
     }
 
     #[test]

@@ -4,11 +4,27 @@ use crate::ffmpeg::{
 };
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn configure_no_window(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
+}
 
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const GIF_FINALIZE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -280,6 +296,7 @@ impl ScreenRecorder {
             });
         }
 
+        configure_no_window(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -445,12 +462,14 @@ fn make_gif_spool_path(output_path: &Path) -> PathBuf {
 
 fn finalize_spooled_gif(job: &GifSpoolJob) -> Result<(), MediaError> {
     let args = build_gif_transcode_args(&job.spool_path, &job.output_path, job.fps);
-    let mut child = Command::new(&job.ffmpeg_bin)
+    let mut command = Command::new(&job.ffmpeg_bin);
+    command
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    configure_no_window(&mut command);
+    let mut child = command.spawn()?;
     let stderr_handle = child.stderr.take().map(spawn_stderr_drain);
     let status = wait_with_timeout(&mut child, GIF_FINALIZE_TIMEOUT)?;
     let stderr = stderr_handle
@@ -477,10 +496,10 @@ fn spawn_stderr_drain<R: Read + Send + 'static>(mut reader: R) -> JoinHandle<Str
             match reader.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let remaining = MAX_CAPTURED_STDERR_BYTES.saturating_sub(captured.len());
-                    if remaining > 0 {
-                        let take = n.min(remaining);
-                        captured.extend_from_slice(&chunk[..take]);
+                    captured.extend_from_slice(&chunk[..n]);
+                    if captured.len() > MAX_CAPTURED_STDERR_BYTES {
+                        let excess = captured.len() - MAX_CAPTURED_STDERR_BYTES;
+                        captured.drain(..excess);
                     }
                 }
             }

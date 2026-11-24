@@ -1,10 +1,12 @@
-use eframe::egui::{self, Color32, CornerRadius, Margin, Pos2, Rect, RichText, Vec2};
+use eframe::egui::{
+    self, Color32, CornerRadius, Margin, Pos2, Rect, RichText, Sense, Stroke, Vec2,
+};
 use sharex_capture::XcapCapturer;
 use sharex_core::{Region, ScreenCapturer};
 use std::time::{Duration, Instant};
 
 const TITLE: &str = "ShareX Recording HUD";
-const HUD_SIZE: Vec2 = Vec2::new(288.0, 38.0);
+const HUD_SIZE: Vec2 = Vec2::new(364.0, 40.0);
 const GAP: f32 = 8.0;
 
 /// Control selected in the floating recording HUD.
@@ -177,8 +179,9 @@ pub fn show_recording_hud(
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
-                    .fill(ctx.style().visuals.window_fill())
-                    .inner_margin(Margin::symmetric(8, 0)),
+                    .fill(Color32::from_rgb(16, 19, 26))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 56, 72)))
+                    .inner_margin(Margin::symmetric(10, 6)),
             )
             .show(ctx, |ui| {
                 hud_controls(ui, elapsed, format_label, encoder_label)
@@ -194,10 +197,24 @@ fn hud_controls(
     encoder_label: &str,
 ) -> RecordingHudAction {
     ui.horizontal_centered(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0_f32;
         let pulse = (elapsed.as_secs_f32() * std::f32::consts::TAU).cos();
-        let red = Color32::from_rgba_unmultiplied(250, 75, 75, (200.0 + 55.0 * pulse) as u8);
-        ui.label(RichText::new("● REC").strong().color(red));
-        ui.label(RichText::new(format_elapsed(elapsed)).monospace());
+        let red = Color32::from_rgba_unmultiplied(248, 81, 73, (185.0 + 70.0 * pulse) as u8);
+        let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(10.0_f32), Sense::hover());
+        ui.painter().circle_filled(dot_rect.center(), 4.2_f32, red);
+        ui.label(
+            RichText::new("REC")
+                .size(11.5_f32)
+                .strong()
+                .color(Color32::from_rgb(248, 113, 113)),
+        );
+        ui.label(
+            RichText::new(format_elapsed(elapsed))
+                .size(12.5_f32)
+                .monospace()
+                .strong()
+                .color(Color32::from_rgb(241, 245, 249)),
+        );
 
         let label = if encoder_label.is_empty() {
             format_label.to_owned()
@@ -205,24 +222,55 @@ fn hud_controls(
             format!("{format_label} · {encoder_label}")
         };
         egui::Frame::NONE
-            .fill(ui.visuals().faint_bg_color)
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(6, 2))
-            .show(ui, |ui| ui.label(RichText::new(label).small().strong()));
+            .fill(Color32::from_rgb(29, 34, 45))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 56, 72)))
+            .corner_radius(CornerRadius::same(5))
+            .inner_margin(Margin::symmetric(7, 2))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(label)
+                        .size(10.5_f32)
+                        .color(Color32::from_rgb(186, 198, 216)),
+                )
+            });
 
-        let stop = egui::Button::new(RichText::new("Stop").color(Color32::WHITE))
-            .fill(Color32::from_rgb(24, 116, 68));
-        let abort = egui::Button::new(RichText::new("Abort").color(Color32::WHITE))
-            .fill(Color32::from_rgb(165, 36, 48));
-        let stop_clicked = ui.add(stop).clicked();
-        let abort_clicked = ui.add(abort).clicked();
-        if stop_clicked {
-            RecordingHudAction::Stop
-        } else if abort_clicked {
-            RecordingHudAction::Abort
-        } else {
-            RecordingHudAction::None
-        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0_f32;
+            let abort = egui::Button::new(
+                RichText::new("Abort")
+                    .size(11.5_f32)
+                    .strong()
+                    .color(Color32::from_rgb(252, 165, 165)),
+            )
+            .fill(Color32::from_rgba_unmultiplied(220, 38, 38, 42))
+            .stroke(Stroke::new(
+                1.0_f32,
+                Color32::from_rgba_unmultiplied(239, 68, 68, 120),
+            ))
+            .corner_radius(CornerRadius::same(5))
+            .min_size(Vec2::new(52.0_f32, 24.0_f32));
+            let stop = egui::Button::new(
+                RichText::new("Stop")
+                    .size(11.5_f32)
+                    .strong()
+                    .color(Color32::WHITE),
+            )
+            .fill(Color32::from_rgb(22, 163, 74))
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(5))
+            .min_size(Vec2::new(48.0_f32, 24.0_f32));
+
+            let abort_clicked = ui.add(abort).clicked();
+            let stop_clicked = ui.add(stop).clicked();
+            if stop_clicked {
+                RecordingHudAction::Stop
+            } else if abort_clicked {
+                RecordingHudAction::Abort
+            } else {
+                RecordingHudAction::None
+            }
+        })
+        .inner
     })
     .inner
 }

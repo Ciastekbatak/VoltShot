@@ -42,7 +42,9 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const THUMB_CACHE_CAPACITY: usize = 64;
+const THUMB_CACHE_CAPACITY: usize = 32;
+const THUMB_MAX_SIDE: usize = 360;
+const THUMBS_DECODED_PER_FRAME: usize = 2;
 const HISTORY_LIMIT: usize = 100;
 const AUTOSTART_APP_NAME: &str = "ShareX-RS";
 
@@ -71,6 +73,20 @@ pub fn launch_gui_with_fallback(
         width: 64,
         height: 64,
     };
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
+        desired_maximum_frame_latency: Some(1),
+        ..Default::default()
+    };
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(mut create) = wgpu_options.wgpu_setup {
+        create.power_preference = eframe::egui_wgpu::wgpu::PowerPreference::LowPower;
+        let base_desc = create.device_descriptor;
+        create.device_descriptor = std::sync::Arc::new(move |adapter| {
+            let mut desc = base_desc(adapter);
+            desc.memory_hints = eframe::egui_wgpu::wgpu::MemoryHints::MemoryUsage;
+            desc
+        });
+        wgpu_options.wgpu_setup = eframe::egui_wgpu::WgpuSetup::CreateNew(create);
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ShareX (Rust)")
@@ -78,6 +94,7 @@ pub fn launch_gui_with_fallback(
             .with_inner_size([1180.0, 740.0])
             .with_min_inner_size([880.0, 560.0])
             .with_visible(!start_minimized),
+        wgpu_options,
         ..Default::default()
     };
 
@@ -155,6 +172,9 @@ struct SharexGuiApp {
     tag_input: String,
     thumbnails: LruCache<PathBuf, egui::TextureHandle>,
     failed_thumbs: HashMap<PathBuf, bool>,
+    existing_files: HashMap<PathBuf, bool>,
+    drag_candidate: Option<(PathBuf, egui::Pos2)>,
+    extended_fonts_loaded: bool,
     editor: Option<EditorViewState>,
     effects: EffectsPanelState,
     tools: ToolsPanelState,
@@ -213,6 +233,12 @@ impl SharexGuiApp {
         }
 
         crate::fonts::install_native_fonts(&cc.egui_ctx);
+        let extended_fonts_loaded = if language.needs_extended_unicode_fonts() {
+            crate::fonts::install_extended_unicode_fonts(&cc.egui_ctx);
+            true
+        } else {
+            false
+        };
         apply_sharex_theme(&cc.egui_ctx, config.dark_theme);
         let hotkeys = HotkeyRuntime::new(cc.egui_ctx.clone(), &config.hotkeys);
         let tray = TrayRuntime::new(cc.egui_ctx.clone());
@@ -279,6 +305,9 @@ impl SharexGuiApp {
             tag_input: String::new(),
             thumbnails: LruCache::new(cache_cap),
             failed_thumbs: HashMap::new(),
+            existing_files: HashMap::new(),
+            drag_candidate: None,
+            extended_fonts_loaded,
             editor: None,
             effects: EffectsPanelState::new(),
             tools: ToolsPanelState::new(),
@@ -312,9 +341,13 @@ impl SharexGuiApp {
         }
     }
 
-    fn set_language(&mut self, language: UiLanguage) {
+    fn set_language(&mut self, ctx: &egui::Context, language: UiLanguage) {
         if self.language != language {
             self.language = language;
+            if language.needs_extended_unicode_fonts() && !self.extended_fonts_loaded {
+                crate::fonts::install_extended_unicode_fonts(ctx);
+                self.extended_fonts_loaded = true;
+            }
             self.config.ui_language = language.code().to_owned();
             self.persist_config_silent();
         }
@@ -1065,6 +1098,12 @@ impl SharexGuiApp {
             Ok(entries) => self.history_entries = entries,
             Err(err) => self.status_line = format!("History load failed: {err}"),
         }
+        self.existing_files.clear();
+        for entry in &self.history_entries {
+            if let Some(path) = &entry.file_path {
+                self.existing_files.insert(path.clone(), path.is_file());
+            }
+        }
         self.older_capture_path = None;
         if self.history_entries.len() == HISTORY_LIMIT && self.latest_capture_path().is_none() {
             match self.history_repository().list(None) {
@@ -1083,14 +1122,26 @@ impl SharexGuiApp {
         self.search_results = if query.text.is_none() && query.tag.is_none() {
             None
         } else {
-            Some(match self.history_repository().search(&query) {
+            let found = match self.history_repository().search(&query) {
                 Ok(entries) => entries,
                 Err(err) => {
                     self.status_line = format!("History search failed: {err}");
                     Vec::new()
                 }
-            })
+            };
+            for entry in &found {
+                if let Some(path) = &entry.file_path {
+                    self.existing_files
+                        .entry(path.clone())
+                        .or_insert_with(|| path.is_file());
+                }
+            }
+            Some(found)
         };
+    }
+
+    fn path_exists_cached(&self, path: &Path) -> bool {
+        self.existing_files.get(path).copied().unwrap_or(false)
     }
 
     fn save_capture_tags(&mut self, id: &CaptureId, tags: &[String]) -> bool {
@@ -1112,17 +1163,27 @@ impl SharexGuiApp {
         }
     }
 
-    fn ensure_thumbnail(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureId> {
+    fn ensure_thumbnail(
+        &mut self,
+        ctx: &egui::Context,
+        path: &Path,
+        decode_budget: &mut usize,
+    ) -> Option<egui::TextureId> {
         let key = path.to_path_buf();
         if let Some(tex) = self.thumbnails.get(&key) {
             return Some(tex.id());
         }
-        if self.failed_thumbs.contains_key(&key) || !path.exists() {
+        if self.failed_thumbs.contains_key(&key) || !self.path_exists_cached(path) {
             return None;
         }
+        if *decode_budget == 0 {
+            ctx.request_repaint();
+            return None;
+        }
+        *decode_budget -= 1;
         match CapturedImage::load_from_file(path) {
             Ok(img) => {
-                let color = crate::image_texture::bounded_color_image(&img, 512);
+                let color = crate::image_texture::bounded_color_image(&img, THUMB_MAX_SIDE);
                 let tex = ctx.load_texture(
                     format!("thumb_{}", path.display()),
                     color,
@@ -1159,38 +1220,24 @@ impl SharexGuiApp {
                 });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                egui::Frame::NONE
-                    .fill(p.card_bg)
-                    .stroke(Stroke::new(1.0_f32, p.border))
-                    .corner_radius(CornerRadius::same(6))
-                    .inner_margin(Margin::same(2))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0_f32;
-                        for (lang, code) in [(UiLanguage::Pl, "PL"), (UiLanguage::En, "EN")] {
-                            let selected = self.language == lang;
-                            let btn = egui::Button::new(
-                                RichText::new(code)
-                                    .size(10.5_f32)
-                                    .strong()
-                                    .color(if selected {
-                                        p.text_primary
-                                    } else {
-                                        p.text_muted
-                                    }),
-                            )
-                            .fill(if selected {
-                                p.hover_bg
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .stroke(Stroke::NONE)
-                            .corner_radius(CornerRadius::same(4))
-                            .min_size(Vec2::new(24.0_f32, 18.0_f32));
-                            if ui.add(btn).on_hover_text(lang.display_name()).clicked() {
-                                self.set_language(lang);
-                            }
+                let mut chosen = self.language;
+                egui::ComboBox::from_id_salt("sidebar_lang_picker")
+                    .selected_text(
+                        RichText::new(self.language.short_code())
+                            .size(10.5_f32)
+                            .strong()
+                            .color(p.text_primary),
+                    )
+                    .width(54.0_f32)
+                    .show_ui(ui, |ui| {
+                        for lang in UiLanguage::ALL {
+                            let label = format!("{} ({})", lang.display_name(), lang.short_code());
+                            ui.selectable_value(&mut chosen, lang, label);
                         }
                     });
+                if chosen != self.language {
+                    self.set_language(ctx, chosen);
+                }
             });
         });
 
@@ -1470,16 +1517,14 @@ impl SharexGuiApp {
 
     fn render_captures_view(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p: &SharexPalette) {
         let s = i18n::strings(self.language);
-
-        let visible = self
+        let visible_len = self
             .search_results
             .as_ref()
-            .unwrap_or(&self.history_entries)
-            .clone();
+            .map_or(self.history_entries.len(), Vec::len);
 
         ui.horizontal(|ui| {
             view_heading(ui, s.captures, p);
-            if !visible.is_empty() {
+            if visible_len > 0 {
                 egui::Frame::NONE
                     .fill(p.surface_elevated)
                     .stroke(Stroke::new(1.0_f32, p.border))
@@ -1487,7 +1532,7 @@ impl SharexGuiApp {
                     .inner_margin(Margin::symmetric(7, 2))
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(visible.len().to_string())
+                            RichText::new(visible_len.to_string())
                                 .size(11.0_f32)
                                 .color(p.text_muted),
                         );
@@ -1550,7 +1595,7 @@ impl SharexGuiApp {
         ui.separator();
         ui.add_space(6.0_f32);
 
-        if visible.is_empty() {
+        if visible_len == 0 {
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(56.0_f32);
@@ -1634,6 +1679,21 @@ impl SharexGuiApp {
         let mut copy_img_path: Option<PathBuf> = None;
         let mut copy_text_val: Option<String> = None;
         let mut delete_file_path: Option<PathBuf> = None;
+        let mut drag_out_path: Option<PathBuf> = None;
+        let mut select_index: Option<usize> = None;
+        let mut decode_budget = THUMBS_DECODED_PER_FRAME;
+        let (pointer_primary_down, pointer_pos) =
+            ctx.input(|input| (input.pointer.primary_down(), input.pointer.interact_pos()));
+
+        if !pointer_primary_down {
+            self.drag_candidate = None;
+        } else if let (Some((candidate_path, start_pos)), Some(current_pos)) =
+            (&self.drag_candidate, pointer_pos)
+            && current_pos.distance(*start_pos) >= 6.0_f32
+        {
+            drag_out_path = Some(candidate_path.clone());
+            self.drag_candidate = None;
+        }
 
         egui::ScrollArea::vertical()
             .id_salt("captures_gallery_scroll")
@@ -1648,13 +1708,40 @@ impl SharexGuiApp {
                 let inner_w = (card_outer_w - 20.0_f32).max(180.0_f32);
                 let thumb_h = (inner_w * 0.5625_f32).round().clamp(128.0_f32, 184.0_f32);
 
-                for row in visible.chunks(cols) {
+                let row_count = visible_len.div_ceil(cols);
+                for row_idx in 0..row_count {
+                    let row_start = row_idx * cols;
+                    let row_end = (row_start + cols).min(visible_len);
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = gap;
-                        for entry in row {
-                            let is_selected = self.is_capture_selected(entry);
+                        for idx in row_start..row_end {
+                            let (
+                                entry_id,
+                                entry_path,
+                                entry_width,
+                                entry_height,
+                                entry_timestamp,
+                                entry_has_tags,
+                            ) = {
+                                let entry = self
+                                    .search_results
+                                    .as_ref()
+                                    .map_or(&self.history_entries[idx], |res| &res[idx]);
+                                (
+                                    entry.id.clone(),
+                                    entry.file_path.clone(),
+                                    entry.width,
+                                    entry.height,
+                                    entry.timestamp,
+                                    !entry.tags.is_empty(),
+                                )
+                            };
+                            let is_selected = self
+                                .selected_capture
+                                .as_ref()
+                                .is_some_and(|selected| selected.id == entry_id);
                             let card_id =
-                                ui.make_persistent_id(("capture_card", entry.id.as_str()));
+                                ui.make_persistent_id(("capture_card", entry_id.as_str()));
                             let hovered_prev =
                                 ui.data(|data| data.get_temp::<bool>(card_id).unwrap_or(false));
                             let stroke_width = if is_selected { 1.5_f32 } else { 1.0_f32 };
@@ -1680,87 +1767,111 @@ impl SharexGuiApp {
                                             let stage_size = Vec2::new(inner_w, thumb_h);
                                             let (stage_rect, stage_resp) = ui.allocate_exact_size(
                                                 stage_size,
-                                                egui::Sense::click(),
+                                                egui::Sense::click_and_drag(),
                                             );
+                                            let file_exists = entry_path
+                                                .as_deref()
+                                                .is_some_and(|path| self.path_exists_cached(path));
+                                            if stage_resp
+                                                .drag_started_by(egui::PointerButton::Primary)
+                                                && file_exists
+                                                && let (Some(path), Some(pos)) = (
+                                                    &entry_path,
+                                                    stage_resp.interact_pointer_pos(),
+                                                )
+                                            {
+                                                self.drag_candidate = Some((path.clone(), pos));
+                                            }
                                             if stage_resp.clicked() {
-                                                self.select_capture(entry);
+                                                select_index = Some(idx);
                                             }
                                             if stage_resp.double_clicked()
-                                                && let Some(path) = &entry.file_path
+                                                && let Some(path) = &entry_path
                                             {
                                                 open_editor_path = Some(path.clone());
                                             }
-                                            ui.painter().rect_filled(
-                                                stage_rect,
-                                                CornerRadius::same(7),
-                                                p.sidebar_bg,
-                                            );
-                                            ui.painter().rect_stroke(
-                                                stage_rect,
-                                                CornerRadius::same(7),
-                                                Stroke::new(1.0_f32, p.divider),
-                                                egui::StrokeKind::Inside,
-                                            );
-
-                                            let thumb_tex = entry
-                                                .file_path
-                                                .as_deref()
-                                                .and_then(|path| self.ensure_thumbnail(ctx, path));
-                                            if let Some(tex_id) = thumb_tex {
-                                                let inner = stage_rect.shrink(3.0_f32);
-                                                let aspect = if entry.height > 0 {
-                                                    entry.width as f32 / entry.height as f32
-                                                } else {
-                                                    inner.width() / inner.height().max(1.0_f32)
-                                                };
-                                                let fit_size = if inner.width()
-                                                    / inner.height().max(1.0_f32)
-                                                    > aspect
-                                                {
-                                                    Vec2::new(
-                                                        (inner.height() * aspect)
-                                                            .min(inner.width()),
-                                                        inner.height(),
-                                                    )
-                                                } else {
-                                                    Vec2::new(
-                                                        inner.width(),
-                                                        (inner.width() / aspect.max(0.01_f32))
-                                                            .min(inner.height()),
-                                                    )
-                                                };
-                                                let img_rect = egui::Rect::from_center_size(
-                                                    inner.center(),
-                                                    fit_size,
-                                                );
-                                                egui::Image::new((tex_id, fit_size))
-                                                    .corner_radius(CornerRadius::same(5))
-                                                    .paint_at(ui, img_rect);
-                                            } else {
-                                                ui.painter().text(
-                                                    stage_rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    s.no_preview,
-                                                    egui::FontId::proportional(11.5_f32),
-                                                    p.text_muted,
+                                            if file_exists {
+                                                stage_resp.on_hover_text(
+                                                    "Click to select · Double-click to edit · Drag to drop into folders or apps",
                                                 );
                                             }
 
+                                            if ui.is_rect_visible(stage_rect) {
+                                                ui.painter().rect_filled(
+                                                    stage_rect,
+                                                    CornerRadius::same(7),
+                                                    p.sidebar_bg,
+                                                );
+                                                ui.painter().rect_stroke(
+                                                    stage_rect,
+                                                    CornerRadius::same(7),
+                                                    Stroke::new(1.0_f32, p.divider),
+                                                    egui::StrokeKind::Inside,
+                                                );
+
+                                                let thumb_tex =
+                                                    entry_path.as_deref().and_then(|path| {
+                                                        self.ensure_thumbnail(
+                                                            ctx,
+                                                            path,
+                                                            &mut decode_budget,
+                                                        )
+                                                    });
+                                                if let Some(tex_id) = thumb_tex {
+                                                    let inner = stage_rect.shrink(3.0_f32);
+                                                    let aspect = if entry_height > 0 {
+                                                        entry_width as f32 / entry_height as f32
+                                                    } else {
+                                                        inner.width() / inner.height().max(1.0_f32)
+                                                    };
+                                                    let fit_size = if inner.width()
+                                                        / inner.height().max(1.0_f32)
+                                                        > aspect
+                                                    {
+                                                        Vec2::new(
+                                                            (inner.height() * aspect)
+                                                                .min(inner.width()),
+                                                            inner.height(),
+                                                        )
+                                                    } else {
+                                                        Vec2::new(
+                                                            inner.width(),
+                                                            (inner.width() / aspect.max(0.01_f32))
+                                                                .min(inner.height()),
+                                                        )
+                                                    };
+                                                    let img_rect = egui::Rect::from_center_size(
+                                                        inner.center(),
+                                                        fit_size,
+                                                    );
+                                                    egui::Image::new((tex_id, fit_size))
+                                                        .corner_radius(CornerRadius::same(5))
+                                                        .paint_at(ui, img_rect);
+                                                } else {
+                                                    ui.painter().text(
+                                                        stage_rect.center(),
+                                                        egui::Align2::CENTER_CENTER,
+                                                        s.no_preview,
+                                                        egui::FontId::proportional(11.5_f32),
+                                                        p.text_muted,
+                                                    );
+                                                }
+                                            }
+
                                             ui.add_space(8.0_f32);
-                                            let title = entry
-                                                .file_path
+                                            let title = entry_path
                                                 .as_ref()
                                                 .and_then(|fp| fp.file_name())
                                                 .map(|n| n.to_string_lossy().into_owned())
-                                                .unwrap_or_else(|| entry.id.as_str().to_owned());
+                                                .unwrap_or_else(|| entry_id.as_str().to_owned());
                                             let dims_text =
-                                                format!("{}×{}", entry.width, entry.height);
+                                                format!("{entry_width}×{entry_height}");
                                             let (meta_rect, meta_resp) = ui.allocate_exact_size(
                                                 Vec2::new(inner_w, 18.0_f32),
                                                 egui::Sense::click(),
                                             );
                                             if meta_resp.on_hover_text(&title).clicked() {
-                                                self.select_capture(entry);
+                                                select_index = Some(idx);
                                             }
                                             let dims_galley = ui.painter().layout_no_wrap(
                                                 dims_text,
@@ -1806,9 +1917,16 @@ impl SharexGuiApp {
                                                 p.text_muted,
                                             );
 
-                                            if !entry.tags.is_empty() {
+                                            if entry_has_tags {
+                                                let entry_clone = self
+                                                    .search_results
+                                                    .as_ref()
+                                                    .map_or(&self.history_entries[idx], |res| {
+                                                        &res[idx]
+                                                    })
+                                                    .clone();
                                                 ui.add_space(4.0_f32);
-                                                self.render_capture_tags(ui, p, entry);
+                                                self.render_capture_tags(ui, p, &entry_clone);
                                             }
 
                                             ui.add_space(4.0_f32);
@@ -1816,8 +1934,7 @@ impl SharexGuiApp {
                                                 ui.set_width(inner_w);
                                                 ui.label(
                                                     RichText::new(
-                                                        entry
-                                                            .timestamp
+                                                        entry_timestamp
                                                             .format("%H:%M:%S")
                                                             .to_string(),
                                                     )
@@ -1830,9 +1947,8 @@ impl SharexGuiApp {
                                                     ),
                                                     |ui| {
                                                         ui.spacing_mut().item_spacing.x = 2.0_f32;
-                                                        if let Some(path) = &entry.file_path {
-                                                            let exists = path.exists();
-                                                            if exists
+                                                        if let Some(path) = &entry_path {
+                                                            if file_exists
                                                                 && palette_icon_button(
                                                                     ui,
                                                                     Icon::Trash,
@@ -1858,7 +1974,7 @@ impl SharexGuiApp {
                                                                     path.display().to_string(),
                                                                 );
                                                             }
-                                                            if exists
+                                                            if file_exists
                                                                 && palette_icon_button(
                                                                     ui,
                                                                     Icon::Copy,
@@ -1870,7 +1986,7 @@ impl SharexGuiApp {
                                                             {
                                                                 copy_img_path = Some(path.clone());
                                                             }
-                                                            if exists
+                                                            if file_exists
                                                                 && palette_icon_button(
                                                                     ui,
                                                                     Icon::Pin,
@@ -1882,7 +1998,7 @@ impl SharexGuiApp {
                                                             {
                                                                 pin_file_path = Some(path.clone());
                                                             }
-                                                            if exists
+                                                            if file_exists
                                                                 && palette_icon_button(
                                                                     ui,
                                                                     Icon::Editor,
@@ -1912,6 +2028,20 @@ impl SharexGuiApp {
                     ui.add_space(gap);
                 }
             });
+
+        if let Some(idx) = select_index {
+            let selected = self
+                .search_results
+                .as_ref()
+                .map_or(&self.history_entries[idx], |res| &res[idx])
+                .clone();
+            self.select_capture(&selected);
+        }
+        if let Some(path) = drag_out_path
+            && let Err(err) = crate::drag_out::start_file_drag(&path)
+        {
+            self.status_line = format!("Drag-and-drop failed: {err}");
+        }
 
         if let Some(path) = open_editor_path {
             self.open_file_in_editor(ctx, &path);
@@ -2514,19 +2644,27 @@ impl SharexGuiApp {
                             ui.end_row();
 
                             ui.label(RichText::new(s.language).color(p.text_muted));
-                            ui.horizontal(|ui| {
-                                for lang in UiLanguage::ALL {
-                                    if ui
-                                        .selectable_label(
-                                            self.language == lang,
+                            let mut chosen = self.language;
+                            egui::ComboBox::from_id_salt("settings_lang_picker")
+                                .selected_text(format!(
+                                    "{} ({})",
+                                    self.language.display_name(),
+                                    self.language.short_code()
+                                ))
+                                .width(220.0_f32)
+                                .show_ui(ui, |ui| {
+                                    for lang in UiLanguage::ALL {
+                                        let label = format!(
+                                            "{} ({})",
                                             lang.display_name(),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.set_language(lang);
+                                            lang.short_code()
+                                        );
+                                        ui.selectable_value(&mut chosen, lang, label);
                                     }
-                                }
-                            });
+                                });
+                            if chosen != self.language {
+                                self.set_language(ctx, chosen);
+                            }
                             ui.end_row();
                         });
                 });
@@ -2581,6 +2719,7 @@ impl eframe::App for SharexGuiApp {
             && !self.force_quit
             && self.tray.is_available()
         {
+            self.thumbnails.clear();
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }

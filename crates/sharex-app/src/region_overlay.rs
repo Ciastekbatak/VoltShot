@@ -13,6 +13,8 @@ use sharex_tools::{ColorSample, sample_image};
 const OVERLAY_WINDOW_TITLE: &str = "ShareX Region Capture";
 const MIN_REGION_DRAG: f32 = 4.0;
 const MAGNIFIER_HALF_EXTENT: i32 = 5;
+const MIN_LOUPE_HALF_EXTENT: i32 = 3;
+const MAX_LOUPE_HALF_EXTENT: i32 = 9;
 
 fn glass_bg() -> Color32 {
     Color32::from_rgba_unmultiplied(15, 18, 24, 236)
@@ -244,6 +246,7 @@ pub struct RegionOverlayState {
     windows: Vec<WindowInfo>,
     snap_to_windows: bool,
     show_magnifier: bool,
+    loupe_half_extent: i32,
     show_style_bar: bool,
     color: RgbaColor,
     stroke_width: f32,
@@ -308,6 +311,7 @@ impl RegionOverlayState {
             windows,
             snap_to_windows: true,
             show_magnifier: true,
+            loupe_half_extent: MAGNIFIER_HALF_EXTENT,
             show_style_bar: false,
             color: RgbaColor::RED,
             stroke_width: 4.0,
@@ -405,9 +409,11 @@ impl RegionOverlayState {
             {
                 self.document.redo();
             }
-            if capture_mode && !typing && overlay_ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
-                self.document.delete_selected();
-            }
+            let delete_requested = capture_mode
+                && !typing
+                && overlay_ctx.input(|i| {
+                    i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
+                });
             if capture_mode && !typing && overlay_ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                 if let Some(captured) = self.finalize_selection(false) {
                     outcome = captured;
@@ -564,6 +570,11 @@ impl RegionOverlayState {
 
                     if pointer_pos.is_some() {
                         overlay_ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                        let scroll_y = overlay_ctx.input(|i| i.raw_scroll_delta.y);
+                        if scroll_y.abs() >= 1.0_f32 {
+                            let step = if scroll_y > 0.0_f32 { 1 } else { -1 };
+                            self.apply_scroll_step(step, color_picker);
+                        }
                         if response.secondary_clicked() {
                             if self.active_tool == OverlayTool::Region {
                                 outcome = OverlayModeOutcome::Cancelled;
@@ -572,6 +583,10 @@ impl RegionOverlayState {
                             self.active_tool = OverlayTool::Region;
                             self.drag = None;
                         }
+                    }
+
+                    if delete_requested {
+                        delete_hovered_or_selected(&mut self.document, pointer_pos.map(&to_image));
                     }
 
                     if color_picker {
@@ -807,8 +822,11 @@ impl RegionOverlayState {
                             let Ok(ColorSample { r, g, b, .. }) = sample_image(image, x, y) else {
                                 return;
                             };
-                            let loupe =
-                                compute_loupe_uv_rect([x, y], [image.width(), image.height()]);
+                            let loupe = compute_loupe_uv_rect_with_extent(
+                                [x, y],
+                                [image.width(), image.height()],
+                                self.loupe_half_extent,
+                            );
                             let hex = format_picked_color(r, g, b);
                             if !typing
                                 && overlay_ctx
@@ -832,6 +850,7 @@ impl RegionOverlayState {
                                 self.texture.id(),
                                 LoupeView {
                                     region: loupe,
+                                    half_extent: self.loupe_half_extent,
                                     swatch: Color32::from_rgb(r, g, b),
                                     footer: &readout,
                                 },
@@ -977,7 +996,7 @@ impl RegionOverlayState {
                     && overlay_action_icon_button(
                         ui,
                         Icon::Trash,
-                        "Delete selected (Del)",
+                        "Delete selected / hovered (Del / Backspace)",
                         true,
                         Some(Color32::from_rgb(239, 68, 68)),
                     )
@@ -1452,6 +1471,24 @@ impl RegionOverlayState {
         }
     }
 
+    fn apply_scroll_step(&mut self, step: i32, color_picker: bool) {
+        if color_picker || self.active_tool == OverlayTool::Region {
+            self.loupe_half_extent = adjust_loupe_half_extent(self.loupe_half_extent, step);
+            return;
+        }
+        match self.active_tool {
+            OverlayTool::Pixelate | OverlayTool::Blur => {
+                self.effect_strength = adjust_effect_strength(self.effect_strength, step);
+            }
+            OverlayTool::Text | OverlayTool::StepNumber => {
+                self.font_size = (self.font_size + step as f32 * 2.0_f32).clamp(12.0_f32, 56.0_f32);
+            }
+            _ => {
+                self.stroke_width = (self.stroke_width + step as f32).clamp(1.0_f32, 24.0_f32);
+            }
+        }
+    }
+
     fn finalize_selection(&self, open_in_editor: bool) -> Option<OverlayModeOutcome> {
         self.mode.finish_region(
             &self.document,
@@ -1482,6 +1519,15 @@ fn toolbar_anchor_in_overlay(
         screen_rect.min.y
     };
     Pos2::new((left + screen_rect.max.x) * 0.5, top + 10.0)
+}
+
+fn delete_hovered_or_selected(document: &mut EditorDocument, cursor: Option<Point>) -> bool {
+    if let Some(point) = cursor
+        && document.select_at(point, 14.0).is_some()
+    {
+        return document.delete_selected();
+    }
+    document.delete_selected()
 }
 
 fn format_picked_color(r: u8, g: u8, b: u8) -> String {
@@ -1707,10 +1753,27 @@ struct LoupeRegion {
     grid_cells: Rect,
 }
 
+fn adjust_loupe_half_extent(current: i32, step: i32) -> i32 {
+    (current + step).clamp(MIN_LOUPE_HALF_EXTENT, MAX_LOUPE_HALF_EXTENT)
+}
+
+fn adjust_effect_strength(current: u32, step: i32) -> u32 {
+    (current as i32 + step * 2).clamp(4, 32) as u32
+}
+
+#[cfg(test)]
 fn compute_loupe_uv_rect(center: [u32; 2], size: [u32; 2]) -> LoupeRegion {
+    compute_loupe_uv_rect_with_extent(center, size, MAGNIFIER_HALF_EXTENT)
+}
+
+fn compute_loupe_uv_rect_with_extent(
+    center: [u32; 2],
+    size: [u32; 2],
+    half_extent: i32,
+) -> LoupeRegion {
+    let half = half_extent.clamp(1, MAX_LOUPE_HALF_EXTENT) as u32;
     let axis = |center: u32, size: u32| {
         let center = center.min(size - 1);
-        let half = MAGNIFIER_HALF_EXTENT as u32;
         let min = center.saturating_sub(half);
         let max = center.saturating_add(half + 1).min(size);
         let grid_start = (half - (center - min)) as f32;
@@ -1731,6 +1794,7 @@ fn compute_loupe_uv_rect(center: [u32; 2], size: [u32; 2]) -> LoupeRegion {
 
 struct LoupeView<'a> {
     region: LoupeRegion,
+    half_extent: i32,
     swatch: Color32,
     footer: &'a str,
 }
@@ -1743,11 +1807,14 @@ fn paint_magnifier(
     texture: egui::TextureId,
     view: LoupeView<'_>,
 ) {
-    const SIDE: usize = (MAGNIFIER_HALF_EXTENT * 2 + 1) as usize;
+    let half_extent = view
+        .half_extent
+        .clamp(MIN_LOUPE_HALF_EXTENT, MAX_LOUPE_HALF_EXTENT);
+    let side = (half_extent * 2 + 1) as usize;
     let pixels_per_point = painter.pixels_per_point();
     let physical_pixel = 1.0_f32 / pixels_per_point;
     let cell_size = 10.0 * physical_pixel;
-    let grid_size = SIDE as f32 * cell_size;
+    let grid_size = side as f32 * cell_size;
     let inset = 4.0_f32;
     let swatch_side = 10.0_f32;
     let swatch_gap = 6.0_f32;
@@ -1820,7 +1887,7 @@ fn paint_magnifier(
         egui::StrokeKind::Inside,
     );
     let center = Rect::from_min_size(
-        grid_origin + Vec2::splat(MAGNIFIER_HALF_EXTENT as f32 * cell_size),
+        grid_origin + Vec2::splat(half_extent as f32 * cell_size),
         Vec2::splat(cell_size),
     );
     painter.rect_stroke(
@@ -2054,5 +2121,42 @@ mod tests {
         window.y = -70;
         window.height = 20;
         assert_eq!(clipped_window_rect(&window, -100, -50, 60, 120), None);
+    }
+
+    #[test]
+    fn delete_hovered_or_selected_removes_hovered_arrow_without_prior_selection() {
+        let mut document = EditorDocument::new(sample_image());
+        let first_id = document.push_annotation(AnnotationKind::Arrow {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(100.0, 0.0),
+            color: RgbaColor::RED,
+            stroke_width: 4.0,
+        });
+        let second_id = document.push_annotation(AnnotationKind::Arrow {
+            start: Point::new(0.0, 80.0),
+            end: Point::new(100.0, 80.0),
+            color: RgbaColor::RED,
+            stroke_width: 4.0,
+        });
+        document.select_at(Point::new(50.0, 80.0), 10.0);
+        assert_eq!(document.selected_id(), Some(second_id));
+
+        assert!(delete_hovered_or_selected(
+            &mut document,
+            Some(Point::new(50.0, 2.0))
+        ));
+        assert_eq!(document.annotations().len(), 1);
+        assert_eq!(document.annotations()[0].id, second_id);
+        assert_ne!(document.annotations()[0].id, first_id);
+    }
+
+    #[test]
+    fn scroll_steps_resize_loupe_and_effect_strength_within_bounds() {
+        assert_eq!(adjust_loupe_half_extent(5, 1), 6);
+        assert_eq!(adjust_loupe_half_extent(9, 1), MAX_LOUPE_HALF_EXTENT);
+        assert_eq!(adjust_loupe_half_extent(3, -1), MIN_LOUPE_HALF_EXTENT);
+        assert_eq!(adjust_effect_strength(12, 1), 14);
+        assert_eq!(adjust_effect_strength(32, 1), 32);
+        assert_eq!(adjust_effect_strength(4, -1), 4);
     }
 }
