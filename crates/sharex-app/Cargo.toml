@@ -22,6 +22,7 @@ sharex-editor = { path = "../sharex-editor" }
 sharex-uploaders = { path = "../sharex-uploaders" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = "0.21"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
