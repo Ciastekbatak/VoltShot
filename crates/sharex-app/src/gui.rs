@@ -284,6 +284,8 @@ impl SharexGuiApp {
                 format,
                 file_path: saved_path.clone(),
                 upload_url: None,
+                tags: Vec::new(),
+                note: None,
             });
         }
 
@@ -842,6 +844,8 @@ impl SharexGuiApp {
                             format,
                             file_path: Some(path.clone()),
                             upload_url: None,
+                            tags: Vec::new(),
+                            note: None,
                         });
                         if let Some(ed) = self.editor.as_mut() {
                             ed.set_saved(path.clone());

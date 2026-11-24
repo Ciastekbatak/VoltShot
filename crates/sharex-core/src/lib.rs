@@ -1,6 +1,8 @@
 pub mod config;
 pub mod domain;
 pub mod history;
+#[cfg(feature = "sqlite")]
+pub mod history_sqlite;
 pub mod hotkeys;
 pub mod naming;
 pub mod pipeline;
@@ -11,7 +13,9 @@ pub use domain::{
     CaptureId, CaptureSource, CapturedImage, CoreError, ImageFormat, MonitorId, MonitorInfo,
     Region, WindowId, WindowInfo,
 };
-pub use history::{HistoryEntry, HistoryRepository, JsonlHistoryStore};
+pub use history::{HistoryEntry, HistoryQuery, HistoryRepository, JsonlHistoryStore};
+#[cfg(feature = "sqlite")]
+pub use history_sqlite::SqliteHistoryStore;
 pub use hotkeys::{
     HotkeyAction, HotkeyBinding, HotkeyCombo, KeyCode, KeyModifiers, default_sharex_hotkeys,
 };

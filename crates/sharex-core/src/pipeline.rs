@@ -135,6 +135,8 @@ impl CapturePipeline {
                 format: config.image_format,
                 file_path: saved_path.clone(),
                 upload_url: upload_url.clone(),
+                tags: Vec::new(),
+                note: None,
             })?;
             true
         } else {

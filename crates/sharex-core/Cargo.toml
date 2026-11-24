@@ -7,14 +7,18 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Pure domain model, filename formatting, configuration, history, and capture pipeline for ShareX in Rust."
 
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite"]
+
 [dependencies]
 chrono.workspace = true
 directories.workspace = true
+fs2 = "0.4"
 image.workspace = true
+rusqlite = { version = "0.32", features = ["bundled", "functions"], optional = true }
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
