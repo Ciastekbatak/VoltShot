@@ -83,6 +83,25 @@ impl AppConfig {
             .unwrap_or_else(|| PathBuf::from("sharex-data").join("config.toml"))
     }
 
+    /// Creates a self-contained portable configuration rooted at `base_dir`.
+    pub fn portable_for_dir(base_dir: &Path) -> Self {
+        Self {
+            output_dir: base_dir.join("Screenshots"),
+            file_name_pattern: DEFAULT_FILE_NAME_PATTERN.to_owned(),
+            image_format: ImageFormat::Png,
+            pipeline: PipelineConfig::default(),
+            history_path: base_dir.join("history.jsonl"),
+            hotkeys: default_sharex_hotkeys(),
+            last_region: None,
+            dark_theme: true,
+        }
+    }
+
+    /// Returns the portable configuration file path inside `base_dir`.
+    pub fn portable_config_path(base_dir: &Path) -> PathBuf {
+        base_dir.join("config.toml")
+    }
+
     pub fn validate(&self) -> Result<(), CoreError> {
         FileNamePattern::parse(&self.file_name_pattern)?;
         if self.output_dir.as_os_str().is_empty() {
@@ -148,5 +167,25 @@ mod tests {
             cfg.save(&cfg_path),
             Err(CoreError::InvalidFileNamePattern(_))
         ));
+    }
+
+    #[test]
+    fn portable_mode_keeps_all_paths_under_base_dir_and_round_trips() {
+        let dir = tempdir().expect("tempdir");
+        let base_dir = dir.path().join("ShareX-Portable");
+
+        let cfg = AppConfig::portable_for_dir(&base_dir);
+        let cfg_path = AppConfig::portable_config_path(&base_dir);
+
+        assert_eq!(cfg.output_dir, base_dir.join("Screenshots"));
+        assert_eq!(cfg.history_path, base_dir.join("history.jsonl"));
+        assert_eq!(cfg_path, base_dir.join("config.toml"));
+        assert_eq!(cfg.file_name_pattern, DEFAULT_FILE_NAME_PATTERN);
+        assert_eq!(cfg.image_format, ImageFormat::Png);
+        assert!(cfg.dark_theme);
+
+        cfg.save(&cfg_path).expect("save portable config");
+        let loaded = AppConfig::load_or_default(&cfg_path).expect("load portable config");
+        assert_eq!(loaded, cfg);
     }
 }
