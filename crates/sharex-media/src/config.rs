@@ -39,15 +39,20 @@ pub enum VideoEncoder {
     Auto,
     Libx264,
     NvencH264,
+    QsvH264,
+    AmfH264,
     LibvpxVp9,
     GifPalette,
 }
 
 impl VideoEncoder {
+    /// Resolves `Auto` to a concrete encoder and validates compatibility with `format`.
     pub fn resolve(self, format: RecordingFormat) -> Result<Self, MediaError> {
         match (format, self) {
             (RecordingFormat::Mp4H264, Self::Auto | Self::Libx264) => Ok(Self::Libx264),
             (RecordingFormat::Mp4H264, Self::NvencH264) => Ok(Self::NvencH264),
+            (RecordingFormat::Mp4H264, Self::QsvH264) => Ok(Self::QsvH264),
+            (RecordingFormat::Mp4H264, Self::AmfH264) => Ok(Self::AmfH264),
             (RecordingFormat::WebmVp9, Self::Auto | Self::LibvpxVp9) => Ok(Self::LibvpxVp9),
             (RecordingFormat::Gif, Self::Auto | Self::GifPalette) => Ok(Self::GifPalette),
             _ => Err(MediaError::InvalidConfig(format!(
@@ -55,6 +60,15 @@ impl VideoEncoder {
             ))),
         }
     }
+}
+
+/// Audio input device discovered from a platform FFmpeg capture backend.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct AudioDevice {
+    /// Human-readable device name passed to FFmpeg.
+    pub name: String,
+    /// Capture backend identifier (for example `"dshow"` or `"avfoundation"`).
+    pub backend: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -92,6 +106,8 @@ pub struct RecordingConfig {
     pub draw_cursor: bool,
     pub output_path: PathBuf,
     pub ffmpeg_path: Option<PathBuf>,
+    #[serde(default)]
+    pub audio_device: Option<String>,
 }
 
 impl RecordingConfig {
@@ -105,6 +121,7 @@ impl RecordingConfig {
             draw_cursor: true,
             output_path: output_path.into(),
             ffmpeg_path: None,
+            audio_device: None,
         }
     }
 
@@ -129,6 +146,13 @@ impl RecordingConfig {
         {
             return Err(MediaError::InvalidConfig(
                 "output_path must not be empty".to_owned(),
+            ));
+        }
+        if let Some(device) = &self.audio_device
+            && device.chars().any(|ch| matches!(ch, '\0' | '\n' | '\r'))
+        {
+            return Err(MediaError::InvalidConfig(
+                "audio_device must not contain NUL or newline characters".to_owned(),
             ));
         }
         self.encoder.resolve(self.format)?;
@@ -236,5 +260,56 @@ mod tests {
         assert_eq!(platform, CapturePlatform::MacOsAvFoundation);
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         assert_eq!(platform, CapturePlatform::LinuxX11Grab);
+    }
+
+    #[test]
+    fn hardware_h264_encoders_resolve_for_mp4_and_round_trip_serde() {
+        for encoder in [
+            VideoEncoder::NvencH264,
+            VideoEncoder::QsvH264,
+            VideoEncoder::AmfH264,
+        ] {
+            assert_eq!(
+                encoder
+                    .resolve(RecordingFormat::Mp4H264)
+                    .expect("valid mp4 encoder"),
+                encoder
+            );
+            assert!(encoder.resolve(RecordingFormat::WebmVp9).is_err());
+            assert!(encoder.resolve(RecordingFormat::Gif).is_err());
+
+            let encoded = serde_json::to_string(&encoder).expect("serialize encoder");
+            let decoded: VideoEncoder = serde_json::from_str(&encoded).expect("deserialize");
+            assert_eq!(decoded, encoder);
+        }
+    }
+
+    #[test]
+    fn recording_config_audio_device_defaults_to_none_and_rejects_control_chars() {
+        let config = RecordingConfig::new("capture.mp4");
+        assert_eq!(config.audio_device, None);
+
+        let legacy_json = r#"{
+            "region": null,
+            "fps": 30,
+            "format": "mp4_h264",
+            "encoder": "auto",
+            "crf": 23,
+            "draw_cursor": true,
+            "output_path": "capture.mp4",
+            "ffmpeg_path": null
+        }"#;
+        let decoded: RecordingConfig =
+            serde_json::from_str(legacy_json).expect("deserialize without audio_device");
+        assert_eq!(decoded.audio_device, None);
+
+        for bad in ["mic\n-f lavfi", "mic\r-i test", "mic\0null"] {
+            let mut invalid = RecordingConfig::new("capture.mp4");
+            invalid.audio_device = Some(bad.to_owned());
+            assert!(matches!(
+                invalid.validate(),
+                Err(MediaError::InvalidConfig(msg)) if msg.contains("audio_device")
+            ));
+        }
     }
 }
