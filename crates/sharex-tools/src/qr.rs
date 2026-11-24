@@ -63,6 +63,32 @@ pub fn generate_qr_image(
     CapturedImage::from_rgba(size, size, rgba)
 }
 
+/// Decodes all valid QR code payloads found in an RGBA `CapturedImage`.
+pub fn decode_qr_image(image: &CapturedImage) -> Result<Vec<String>, CoreError> {
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let rgba = image.rgba();
+
+    let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(width, height, |x, y| {
+        let idx = (y * width + x) * 4;
+        let r = f32::from(rgba[idx]);
+        let g = f32::from(rgba[idx + 1]);
+        let b = f32::from(rgba[idx + 2]);
+        (0.299 * r + 0.587 * g + 0.114 * b)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    });
+
+    let mut payloads = Vec::new();
+    for grid in prepared.detect_grids() {
+        if let Ok((_meta, content)) = grid.decode() {
+            payloads.push(content);
+        }
+    }
+
+    Ok(payloads)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +151,21 @@ mod tests {
         for chunk in img.rgba().chunks_exact(4) {
             assert!(chunk == black || chunk == white);
         }
+    }
+
+    #[test]
+    fn round_trips_generated_qr_image_through_decoder() {
+        let payload = "https://github.com/ShareX/ShareX";
+        let image = generate_qr_image(payload, 6, 4).expect("generate qr");
+        let decoded = decode_qr_image(&image).expect("decode qr");
+        assert_eq!(decoded, vec![payload.to_owned()]);
+    }
+
+    #[test]
+    fn decode_qr_image_returns_empty_vec_for_blank_solid_image() {
+        let blank = CapturedImage::from_rgba(128, 128, [255, 255, 255, 255].repeat(128 * 128))
+            .expect("valid blank image");
+        let decoded = decode_qr_image(&blank).expect("decode blank image");
+        assert!(decoded.is_empty());
     }
 }

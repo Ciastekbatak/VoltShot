@@ -1,3 +1,4 @@
+use crate::ocr_winrt::WinRtOcr;
 use serde::{Deserialize, Serialize};
 use sharex_core::{CapturedImage, CoreError, ImageFormat};
 use std::fs::{self, OpenOptions};
@@ -221,11 +222,19 @@ impl FallbackOcrChain {
     pub fn new(engines: Vec<Box<dyn OcrEngine>>) -> Self {
         Self { engines }
     }
+
+    /// Returns the ordered list of configured OCR engine names.
+    pub fn engine_names(&self) -> Vec<&'static str> {
+        self.engines.iter().map(|engine| engine.name()).collect()
+    }
 }
 
 impl Default for FallbackOcrChain {
     fn default() -> Self {
-        Self::new(vec![Box::new(TesseractCliOcr::new(None))])
+        Self::new(vec![
+            Box::new(WinRtOcr::new()),
+            Box::new(TesseractCliOcr::new(None)),
+        ])
     }
 }
 
