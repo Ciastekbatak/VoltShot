@@ -82,13 +82,15 @@ mod platform {
             }
         }
 
-        pub fn retry_conflicts(&mut self, bindings: &[HotkeyBinding]) {
-            let has_error = self
-                .statuses
+        pub fn has_conflicts(&self) -> bool {
+            self.statuses
                 .lock()
                 .map(|map| map.values().any(|s| matches!(s, HotkeyStatus::Error(_))))
-                .unwrap_or(false);
-            if has_error {
+                .unwrap_or(false)
+        }
+
+        pub fn retry_conflicts(&mut self, bindings: &[HotkeyBinding]) {
+            if self.has_conflicts() {
                 self.sync(bindings);
             }
         }
@@ -449,12 +451,14 @@ mod platform {
             }
         }
 
-        pub fn retry_conflicts(&mut self, bindings: &[HotkeyBinding]) {
-            if self
-                .statuses
+        pub fn has_conflicts(&self) -> bool {
+            self.statuses
                 .values()
                 .any(|s| matches!(s, HotkeyStatus::Error(_)))
-            {
+        }
+
+        pub fn retry_conflicts(&mut self, bindings: &[HotkeyBinding]) {
+            if self.has_conflicts() {
                 self.sync(bindings);
             }
         }

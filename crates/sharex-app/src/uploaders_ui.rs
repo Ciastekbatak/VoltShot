@@ -197,6 +197,10 @@ impl UploadersPanelState {
         Ok(())
     }
 
+    pub(crate) fn is_uploading(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub(crate) fn poll_upload(&mut self, clipboard: &dyn ClipboardSink) {
         let Some(receiver) = &self.pending else {
             return;

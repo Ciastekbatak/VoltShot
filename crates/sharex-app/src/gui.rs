@@ -1511,13 +1511,22 @@ impl SharexGuiApp {
 }
 
 impl eframe::App for SharexGuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(80));
-        self.uploaders.poll_upload(&self.clipboard);
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::from(palette(self.config.dark_theme).panel_bg).to_array()
+    }
 
-        if self.last_hotkey_retry.elapsed() >= Duration::from_secs(2) {
-            self.hotkeys.retry_conflicts(&self.config.hotkeys);
-            self.last_hotkey_retry = Instant::now();
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.uploaders.poll_upload(&self.clipboard);
+        if self.uploaders.is_uploading() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        if self.hotkeys.has_conflicts() {
+            if self.last_hotkey_retry.elapsed() >= Duration::from_secs(2) {
+                self.hotkeys.retry_conflicts(&self.config.hotkeys);
+                self.last_hotkey_retry = Instant::now();
+            }
+            ctx.request_repaint_after(Duration::from_secs(2));
         }
 
         for action in self.tray.poll_actions() {

@@ -572,7 +572,7 @@ impl ToolsPanelState {
             self.ocr_tesseract_path = find_tesseract(None);
             self.ocr_checked = true;
         }
-        let available = self.ocr_tesseract_path.is_some() || engine.is_available();
+        let available = self.ocr_tesseract_path.is_some();
 
         egui::Frame::NONE
             .fill(p.card_bg)
