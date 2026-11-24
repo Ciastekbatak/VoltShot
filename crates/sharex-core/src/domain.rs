@@ -197,6 +197,7 @@ impl Region {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CaptureSource {
     PrimaryMonitor,
+    ActiveWindow,
     Monitor { id: MonitorId },
     Region { region: Region },
 }
@@ -366,6 +367,23 @@ impl CapturedImage {
             message: err.to_string(),
         })?;
         Ok(out)
+    }
+
+    /// Decodes PNG, JPEG, or WebP bytes into a validated RGBA8 image.
+    pub fn from_encoded_bytes(bytes: &[u8]) -> Result<Self, CoreError> {
+        let decoded = image::load_from_memory(bytes).map_err(|err| CoreError::EncodeFailed {
+            format: ImageFormat::Png,
+            message: err.to_string(),
+        })?;
+        let rgba = decoded.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        Self::from_rgba(width, height, rgba.into_raw())
+    }
+
+    /// Loads an image file from disk into a validated RGBA8 image.
+    pub fn load_from_file(path: &std::path::Path) -> Result<Self, CoreError> {
+        let bytes = std::fs::read(path)?;
+        Self::from_encoded_bytes(&bytes)
     }
 }
 

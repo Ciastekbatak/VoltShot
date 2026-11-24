@@ -1,4 +1,5 @@
-use crate::domain::{CoreError, ImageFormat};
+use crate::domain::{CoreError, ImageFormat, Region};
+use crate::hotkeys::{HotkeyBinding, default_sharex_hotkeys};
 use crate::naming::FileNamePattern;
 use directories::{ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,8 @@ pub struct PipelineConfig {
     pub copy_image_to_clipboard: bool,
     pub copy_path_to_clipboard: bool,
     pub record_history: bool,
+    #[serde(default)]
+    pub open_in_editor: bool,
     pub uploader_id: Option<String>,
 }
 
@@ -24,9 +27,14 @@ impl Default for PipelineConfig {
             copy_image_to_clipboard: true,
             copy_path_to_clipboard: false,
             record_history: true,
+            open_in_editor: false,
             uploader_id: None,
         }
     }
+}
+
+fn default_dark_theme() -> bool {
+    true
 }
 
 /// Persisted application configuration.
@@ -37,6 +45,12 @@ pub struct AppConfig {
     pub image_format: ImageFormat,
     pub pipeline: PipelineConfig,
     pub history_path: PathBuf,
+    #[serde(default = "default_sharex_hotkeys")]
+    pub hotkeys: Vec<HotkeyBinding>,
+    #[serde(default)]
+    pub last_region: Option<Region>,
+    #[serde(default = "default_dark_theme")]
+    pub dark_theme: bool,
 }
 
 impl AppConfig {
@@ -57,6 +71,9 @@ impl AppConfig {
             image_format: ImageFormat::Png,
             pipeline: PipelineConfig::default(),
             history_path,
+            hotkeys: default_sharex_hotkeys(),
+            last_region: None,
+            dark_theme: true,
         }
     }
 

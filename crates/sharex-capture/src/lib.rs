@@ -1,7 +1,15 @@
 use sharex_core::{
     CaptureSource, CapturedImage, CoreError, MonitorId, MonitorInfo, Region, ScreenCapturer,
 };
-use xcap::Monitor;
+use xcap::{Monitor, Window};
+
+/// Captured virtual desktop frame paired with its global top-left screen origin.
+#[derive(Debug, Clone)]
+pub struct DesktopSnapshot {
+    pub image: CapturedImage,
+    pub origin_x: i32,
+    pub origin_y: i32,
+}
 
 /// Cross-platform screen capturer backed by `xcap`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -54,6 +62,65 @@ impl XcapCapturer {
         let height = buffer.height();
         CapturedImage::from_rgba(width, height, buffer.into_raw())
     }
+
+    fn capture_active_window() -> Result<CapturedImage, CoreError> {
+        let windows = Window::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
+        let target = windows
+            .iter()
+            .find(|w| {
+                w.is_focused().unwrap_or(false)
+                    && !w.is_minimized().unwrap_or(true)
+                    && w.width().unwrap_or(0) > 0
+                    && w.height().unwrap_or(0) > 0
+            })
+            .or_else(|| {
+                windows.iter().find(|w| {
+                    !w.is_minimized().unwrap_or(true)
+                        && w.width().unwrap_or(0) > 0
+                        && w.height().unwrap_or(0) > 0
+                })
+            })
+            .ok_or_else(|| CoreError::CaptureFailed("no visible active window found".into()))?;
+
+        let buffer = target
+            .capture_image()
+            .map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
+        CapturedImage::from_rgba(buffer.width(), buffer.height(), buffer.into_raw())
+    }
+
+    /// Captures the primary display together with its virtual screen origin for the region overlay.
+    pub fn capture_primary_snapshot(&self) -> Result<DesktopSnapshot, CoreError> {
+        let monitors = Monitor::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
+        if monitors.is_empty() {
+            return Err(CoreError::CaptureFailed("no monitors detected".into()));
+        }
+        let target = monitors
+            .iter()
+            .find(|m| m.is_primary().unwrap_or(false))
+            .unwrap_or(&monitors[0]);
+        let info = Self::monitor_to_info(target)?;
+        let image = Self::capture_monitor(target)?;
+        Ok(DesktopSnapshot {
+            image,
+            origin_x: info.x,
+            origin_y: info.y,
+        })
+    }
+
+    /// Captures and stitches all connected monitors into one virtual desktop snapshot.
+    pub fn capture_virtual_desktop(&self) -> Result<DesktopSnapshot, CoreError> {
+        let monitors = Monitor::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
+        if monitors.is_empty() {
+            return Err(CoreError::CaptureFailed("no monitors detected".into()));
+        }
+        let mut frames = Vec::with_capacity(monitors.len());
+        for monitor in &monitors {
+            let info = Self::monitor_to_info(monitor)?;
+            let image = Self::capture_monitor(monitor)?;
+            frames.push((info, image));
+        }
+        stitch_monitor_frames(&frames)
+    }
 }
 
 impl ScreenCapturer for XcapCapturer {
@@ -63,13 +130,14 @@ impl ScreenCapturer for XcapCapturer {
     }
 
     fn capture(&self, source: &CaptureSource) -> Result<CapturedImage, CoreError> {
-        let monitors = Monitor::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
-        if monitors.is_empty() {
-            return Err(CoreError::CaptureFailed("no monitors detected".into()));
-        }
-
         match source {
+            CaptureSource::ActiveWindow => Self::capture_active_window(),
             CaptureSource::PrimaryMonitor => {
+                let monitors =
+                    Monitor::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
+                if monitors.is_empty() {
+                    return Err(CoreError::CaptureFailed("no monitors detected".into()));
+                }
                 let target = monitors
                     .iter()
                     .find(|m| m.is_primary().unwrap_or(false))
@@ -77,6 +145,8 @@ impl ScreenCapturer for XcapCapturer {
                 Self::capture_monitor(target)
             }
             CaptureSource::Monitor { id } => {
+                let monitors =
+                    Monitor::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
                 let target = monitors
                     .iter()
                     .find(|m| m.id().ok() == Some(id.value()))
@@ -84,6 +154,11 @@ impl ScreenCapturer for XcapCapturer {
                 Self::capture_monitor(target)
             }
             CaptureSource::Region { region } => {
+                let monitors =
+                    Monitor::all().map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
+                if monitors.is_empty() {
+                    return Err(CoreError::CaptureFailed("no monitors detected".into()));
+                }
                 let infos: Vec<MonitorInfo> = monitors
                     .iter()
                     .map(Self::monitor_to_info)
@@ -100,6 +175,56 @@ impl ScreenCapturer for XcapCapturer {
             }
         }
     }
+}
+
+/// Stitches per-monitor captures into a single virtual desktop RGBA image.
+pub fn stitch_monitor_frames(
+    frames: &[(MonitorInfo, CapturedImage)],
+) -> Result<DesktopSnapshot, CoreError> {
+    if frames.is_empty() {
+        return Err(CoreError::CaptureFailed(
+            "no monitor frames to stitch".into(),
+        ));
+    }
+    let min_x = frames.iter().map(|(m, _)| m.x).min().unwrap_or(0);
+    let min_y = frames.iter().map(|(m, _)| m.y).min().unwrap_or(0);
+    let max_x = frames
+        .iter()
+        .map(|(m, img)| i64::from(m.x) + i64::from(img.width()))
+        .max()
+        .unwrap_or(0);
+    let max_y = frames
+        .iter()
+        .map(|(m, img)| i64::from(m.y) + i64::from(img.height()))
+        .max()
+        .unwrap_or(0);
+
+    let total_w = u32::try_from(max_x - i64::from(min_x))
+        .map_err(|_| CoreError::CaptureFailed("invalid stitched width".into()))?;
+    let total_h = u32::try_from(max_y - i64::from(min_y))
+        .map_err(|_| CoreError::CaptureFailed("invalid stitched height".into()))?;
+
+    let mut canvas = vec![0u8; (total_w as usize) * (total_h as usize) * 4];
+    for (info, img) in frames {
+        let dst_x = (info.x - min_x) as usize;
+        let dst_y = (info.y - min_y) as usize;
+        let src_w = img.width() as usize;
+        let src_h = img.height() as usize;
+        let src = img.rgba();
+        for row in 0..src_h {
+            let src_start = row * src_w * 4;
+            let dst_start = ((dst_y + row) * (total_w as usize) + dst_x) * 4;
+            canvas[dst_start..dst_start + src_w * 4]
+                .copy_from_slice(&src[src_start..src_start + src_w * 4]);
+        }
+    }
+
+    let image = CapturedImage::from_rgba(total_w, total_h, canvas)?;
+    Ok(DesktopSnapshot {
+        image,
+        origin_x: min_x,
+        origin_y: min_y,
+    })
 }
 
 /// Maps a global screen region onto the best-matching monitor and returns monitor-local crop coordinates.
@@ -213,5 +338,39 @@ mod tests {
             resolve_region_on_monitors(region, &monitors),
             Err(CoreError::InvalidRegion(_))
         ));
+    }
+
+    #[test]
+    fn stitches_two_monitors_with_negative_left_origin() {
+        let left_info = MonitorInfo {
+            id: MonitorId::new(1),
+            name: "Left".into(),
+            x: -2,
+            y: 0,
+            width: 2,
+            height: 2,
+            is_primary: false,
+        };
+        let right_info = MonitorInfo {
+            id: MonitorId::new(2),
+            name: "Right".into(),
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            is_primary: true,
+        };
+        let left_img = CapturedImage::from_rgba(2, 2, [255, 0, 0, 255].repeat(4)).expect("left");
+        let right_img = CapturedImage::from_rgba(2, 2, [0, 0, 255, 255].repeat(4)).expect("right");
+
+        let snapshot = stitch_monitor_frames(&[(left_info, left_img), (right_info, right_img)])
+            .expect("stitch succeeds");
+
+        assert_eq!(snapshot.origin_x, -2);
+        assert_eq!(snapshot.origin_y, 0);
+        assert_eq!(snapshot.image.width(), 4);
+        assert_eq!(snapshot.image.height(), 2);
+        assert_eq!(&snapshot.image.rgba()[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&snapshot.image.rgba()[8..12], &[0, 0, 255, 255]);
     }
 }

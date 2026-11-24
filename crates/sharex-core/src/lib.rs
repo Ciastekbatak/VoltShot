@@ -1,6 +1,7 @@
 pub mod config;
 pub mod domain;
 pub mod history;
+pub mod hotkeys;
 pub mod naming;
 pub mod pipeline;
 pub mod ports;
@@ -10,6 +11,9 @@ pub use domain::{
     CaptureId, CaptureSource, CapturedImage, CoreError, ImageFormat, MonitorId, MonitorInfo, Region,
 };
 pub use history::{HistoryEntry, HistoryRepository, JsonlHistoryStore};
+pub use hotkeys::{
+    HotkeyAction, HotkeyBinding, HotkeyCombo, KeyCode, KeyModifiers, default_sharex_hotkeys,
+};
 pub use naming::{FileNameContext, FileNamePattern, resolve_unique_path};
 pub use pipeline::{CapturePipeline, PipelineDeps, TaskReport};
 pub use ports::{
