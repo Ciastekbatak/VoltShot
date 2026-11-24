@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Starts the ShareX-style native desktop application window with global hotkeys.
 pub fn launch_gui(config_path: PathBuf) -> Result<(), eframe::Error> {
@@ -58,6 +58,7 @@ struct SharexGuiApp {
     editor: Option<EditorViewState>,
     overlay: Option<RegionOverlayState>,
     hotkeys: HotkeyRuntime,
+    last_hotkey_retry: Instant,
     capturer: XcapCapturer,
     clipboard: SystemClipboard,
     status_line: String,
@@ -102,6 +103,7 @@ impl SharexGuiApp {
             editor: None,
             overlay: None,
             hotkeys,
+            last_hotkey_retry: Instant::now(),
             capturer,
             clipboard: SystemClipboard::new(),
             status_line: initial_status,
@@ -231,6 +233,7 @@ impl SharexGuiApp {
         ctx: &egui::Context,
         image: CapturedImage,
         source: CaptureSource,
+        force_open_in_editor: bool,
     ) {
         let now = Utc::now();
         let format = self.config.image_format;
@@ -285,7 +288,7 @@ impl SharexGuiApp {
             None => format!("Captured region {}x{}.", image.width(), image.height()),
         };
 
-        if self.config.pipeline.open_in_editor {
+        if force_open_in_editor || self.config.pipeline.open_in_editor {
             self.editor = Some(EditorViewState::open(ctx, image, saved_path, format));
             self.active_view = ActiveView::Editor;
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -1049,7 +1052,12 @@ impl SharexGuiApp {
 
 impl eframe::App for SharexGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(120));
+        ctx.request_repaint_after(Duration::from_millis(80));
+
+        if self.last_hotkey_retry.elapsed() >= Duration::from_secs(2) {
+            self.hotkeys.retry_conflicts(&self.config.hotkeys);
+            self.last_hotkey_retry = Instant::now();
+        }
 
         let pending_actions = self.hotkeys.poll_actions();
         for action in pending_actions {
@@ -1066,6 +1074,7 @@ impl eframe::App for SharexGuiApp {
                 OverlayOutcome::Captured {
                     image,
                     global_region,
+                    open_in_editor,
                 } => {
                     self.overlay = None;
                     self.config.last_region = Some(global_region);
@@ -1076,6 +1085,7 @@ impl eframe::App for SharexGuiApp {
                         CaptureSource::Region {
                             region: global_region,
                         },
+                        open_in_editor,
                     );
                 }
             }

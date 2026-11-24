@@ -16,11 +16,21 @@ arboard.workspace = true
 chrono.workspace = true
 clap.workspace = true
 eframe.workspace = true
-global-hotkey.workspace = true
 sharex-capture = { path = "../sharex-capture" }
 sharex-core = { path = "../sharex-core" }
 sharex-editor = { path = "../sharex-editor" }
 sharex-uploaders = { path = "../sharex-uploaders" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+global-hotkey.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

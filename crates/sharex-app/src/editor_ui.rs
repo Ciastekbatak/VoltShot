@@ -797,7 +797,7 @@ impl EditorViewState {
     }
 }
 
-fn paint_annotation(
+pub(crate) fn paint_annotation(
     painter: &egui::Painter,
     annotation: &Annotation,
     to_screen: &dyn Fn(Point) -> Pos2,
@@ -982,7 +982,13 @@ fn rect_to_screen(r: RectF, to_screen: &dyn Fn(Point) -> Pos2) -> Rect {
     )
 }
 
-fn paint_arrow(painter: &egui::Painter, start: Pos2, end: Pos2, color: Color32, width: f32) {
+pub(crate) fn paint_arrow(
+    painter: &egui::Painter,
+    start: Pos2,
+    end: Pos2,
+    color: Color32,
+    width: f32,
+) {
     let delta = end - start;
     let len = delta.length();
     if len < 1.0 {
@@ -1004,7 +1010,7 @@ fn paint_arrow(painter: &egui::Painter, start: Pos2, end: Pos2, color: Color32, 
     ));
 }
 
-fn paint_ellipse_stroke(painter: &egui::Painter, rect: Rect, stroke: Stroke) {
+pub(crate) fn paint_ellipse_stroke(painter: &egui::Painter, rect: Rect, stroke: Stroke) {
     let center = rect.center();
     let rx = rect.width() * 0.5;
     let ry = rect.height() * 0.5;
@@ -1020,7 +1026,7 @@ fn paint_ellipse_stroke(painter: &egui::Painter, rect: Rect, stroke: Stroke) {
     painter.add(egui::Shape::line(pts, stroke));
 }
 
-fn to_egui_color(c: RgbaColor) -> Color32 {
+pub(crate) fn to_egui_color(c: RgbaColor) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
 }
 

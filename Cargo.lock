@@ -3358,6 +3358,7 @@ dependencies = [
  "sharex-editor",
  "sharex-uploaders",
  "tempfile",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
