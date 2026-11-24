@@ -204,6 +204,7 @@ struct SharexGuiApp {
     started_at: Instant,
     startup_trimmed: bool,
     hidden_pump: HiddenWindowPumper,
+    hidden_wake_frames: u8,
     capturer: XcapCapturer,
     clipboard: SystemClipboard,
     status_line: String,
@@ -340,6 +341,7 @@ impl SharexGuiApp {
             started_at: Instant::now(),
             startup_trimmed: false,
             hidden_pump: HiddenWindowPumper::spawn(),
+            hidden_wake_frames: 0,
             capturer,
             clipboard: SystemClipboard::new(),
             status_line: initial_status,
@@ -921,6 +923,8 @@ impl SharexGuiApp {
             return;
         }
         let closing = self.overlay.take();
+        self.hidden_wake_frames = self.hidden_wake_frames.max(4);
+        ctx.request_repaint();
         let capture_settings = self.overlay_capture_settings.take();
         if let Some(closing) = closing.as_ref()
             && !matches!(outcome, OverlayModeOutcome::Captured { .. })
@@ -2756,21 +2760,34 @@ impl eframe::App for SharexGuiApp {
         if self.overlay.is_some() {
             self.hidden_pump
                 .set_interval_ms(if crate::win_focus::is_main_window_hidden() {
-                    8
+                    16
                 } else {
                     0
                 });
             return;
         }
-        let needs_hidden_pump = crate::win_focus::is_main_window_hidden()
-            && (self.recording.is_recording()
-                || self.recording.is_finalizing()
-                || !self.pins.is_empty()
-                || self.toasts.active_count() > 0
-                || self.ocr_pending.is_some()
-                || self.uploaders.is_uploading());
-        self.hidden_pump
-            .set_interval_ms(if needs_hidden_pump { 50 } else { 0 });
+        let waking_after_close = self.hidden_wake_frames > 0;
+        if self.hidden_wake_frames > 0 {
+            self.hidden_wake_frames -= 1;
+            ctx.request_repaint();
+        }
+        let hidden = crate::win_focus::is_main_window_hidden();
+        let pump_ms = if !hidden {
+            0
+        } else if waking_after_close {
+            16
+        } else if self.recording.is_recording()
+            || self.recording.is_finalizing()
+            || !self.pins.is_empty()
+            || self.toasts.active_count() > 0
+            || self.ocr_pending.is_some()
+            || self.uploaders.is_uploading()
+        {
+            50
+        } else {
+            0
+        };
+        self.hidden_pump.set_interval_ms(pump_ms);
         self.poll_ocr(ctx);
         self.poll_capture_uploads(ctx);
         self.poll_watcher(ctx);
@@ -2915,6 +2932,7 @@ impl eframe::App for SharexGuiApp {
         if !self.config.show_toasts {
             self.toasts.dismiss_all();
         }
+        let had_toasts = self.toasts.active_count() > 0;
         match self.toasts.show_all(ctx, self.config.dark_theme) {
             ToastAction::None => {}
             ToastAction::OpenPath(path) => {
@@ -2929,6 +2947,15 @@ impl eframe::App for SharexGuiApp {
                     ctx.open_url(egui::OpenUrl::new_tab(url));
                 }
             }
+        }
+        if had_toasts && self.toasts.active_count() == 0 {
+            self.hidden_wake_frames = self.hidden_wake_frames.max(3);
+        }
+        if crate::win_focus::is_main_window_hidden()
+            && (self.hidden_wake_frames > 0 || self.toasts.active_count() > 0)
+        {
+            self.hidden_pump
+                .set_interval_ms(if self.hidden_wake_frames > 0 { 16 } else { 50 });
         }
 
         if self.recording.is_recording()

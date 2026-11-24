@@ -396,6 +396,7 @@ impl RegionOverlayState {
                 || overlay_ctx.input(|i| i.key_pressed(egui::Key::Escape))
             {
                 outcome = OverlayModeOutcome::Cancelled;
+                close_overlay_viewport(overlay_ctx);
                 return;
             }
 
@@ -417,6 +418,7 @@ impl RegionOverlayState {
             if capture_mode && !typing && overlay_ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                 if let Some(captured) = self.finalize_selection(false) {
                     outcome = captured;
+                    close_overlay_viewport(overlay_ctx);
                 }
                 return;
             }
@@ -578,6 +580,7 @@ impl RegionOverlayState {
                         if response.secondary_clicked() {
                             if self.active_tool == OverlayTool::Region {
                                 outcome = OverlayModeOutcome::Cancelled;
+                                close_overlay_viewport(overlay_ctx);
                                 return;
                             }
                             self.active_tool = OverlayTool::Region;
@@ -610,6 +613,7 @@ impl RegionOverlayState {
                             let hex = format_picked_color(r, g, b);
                             overlay_ctx.copy_text(hex.clone());
                             outcome = OverlayModeOutcome::ColorPicked { hex, r, g, b };
+                            close_overlay_viewport(overlay_ctx);
                             return;
                         }
                     } else if self.active_tool == OverlayTool::Region {
@@ -622,6 +626,7 @@ impl RegionOverlayState {
                                 && let Some(captured) = self.finalize_selection(false)
                             {
                                 outcome = captured;
+                                close_overlay_viewport(overlay_ctx);
                                 return;
                             }
                         }
@@ -861,8 +866,15 @@ impl RegionOverlayState {
 
             if let Some(act) = toolbar_action {
                 outcome = act;
+                close_overlay_viewport(overlay_ctx);
             }
         });
+
+        if !matches!(outcome, OverlayModeOutcome::Pending) {
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(false));
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+            ctx.request_repaint();
+        }
 
         outcome
     }
@@ -1519,6 +1531,11 @@ fn toolbar_anchor_in_overlay(
         screen_rect.min.y
     };
     Pos2::new((left + screen_rect.max.x) * 0.5, top + 10.0)
+}
+
+fn close_overlay_viewport(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
 }
 
 fn delete_hovered_or_selected(document: &mut EditorDocument, cursor: Option<Point>) -> bool {
