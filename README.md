@@ -7,8 +7,8 @@
 ### The Next-Gen Screenshot & Capture App — Inspired by ShareX, Built in Rust + DirectX 12
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-38bdf8?style=flat-square)](LICENSE)
-[![Built with Rust](https://img.shields.io/badge/Rust-Native%20DX12-f97316?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Platform: Windows 10/11](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0ea5e9?style=flat-square&logo=windows&logoColor=white)](#download--install)
+[![Built with Rust](https://img.shields.io/badge/Rust-DX12%20%7C%20Metal%20%7C%20Vulkan-f97316?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Platforms](https://img.shields.io/badge/Windows%20%7C%20Linux%20%7C%20macOS-0ea5e9?style=flat-square)](#download--install)
 [![Join Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/cRHrPusNGW)
 
 [Download Installer](#download--install) · [Performance Benchmark](#voltshot-vs-sharex-benchmark) · [Features](#features) · [Join our Discord](https://discord.gg/cRHrPusNGW)
@@ -65,9 +65,24 @@ Measured side-by-side on Windows 11 (`x86_64`) comparing **VoltShot v0.1.0 (Nati
    - **Optional Startup with Windows** — starts silently in your system tray (`Settings → Apps → Startup`).
    - **Run command** — press `Win + R` and type `VoltShot`.
 
-### Portable Build
+### Portable Build (Windows)
 
 Prefer zero installation? Download **`VoltShot-v0.1.0-windows-x86_64-portable.zip`**, unzip `VoltShot.exe` anywhere, and run with `--portable` to keep settings and captures right beside the executable.
+
+### Linux (`x86_64` — X11 & Wayland)
+
+- **Debian / Ubuntu (`.deb`):** Download **`VoltShot-v0.1.0-linux-x86_64.deb`** from [Releases](../../releases) and run:
+  ```bash
+  sudo apt install ./VoltShot-v0.1.0-linux-x86_64.deb
+  ```
+- **Any Linux Distro (`.tar.gz`):** Download **`VoltShot-v0.1.0-linux-x86_64.tar.gz`**, extract it, and run `./install.sh` (installs binary, desktop entry, and VoltShot icon to `~/.local`).
+- Native XDG autostart (`~/.config/autostart/voltshot.desktop`), AppIndicator system tray, and PipeWire/PulseAudio/ALSA capture shutter audio included.
+
+### macOS (`arm64` Apple Silicon & `x86_64` Intel)
+
+- Download **`VoltShot-v0.1.0-macos-arm64.dmg`** (Apple Silicon) or **`VoltShot-v0.1.0-macos-x86_64.dmg`** (Intel) from [Releases](../../releases), open the `.dmg`, and drag **VoltShot.app** into **Applications**.
+- On first launch, allow **Screen Recording** in **System Settings → Privacy & Security → Screen & System Audio Recording** (and optionally **Accessibility** for global hotkeys).
+- Native **Metal** GPU rendering, macOS Menu Bar tray (`NSStatusBar`), LaunchAgent startup (`~/Library/LaunchAgents`), `afplay` shutter audio, and Mac-friendly default hotkeys (`Ctrl+Shift+1..4`, `Ctrl+Shift+E/R/G/O/C` — no `PrintScreen` key required).
 
 ---
 

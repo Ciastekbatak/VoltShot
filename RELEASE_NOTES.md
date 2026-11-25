@@ -31,8 +31,11 @@ So I started building **VoltShot** from the ground up in Rust with native Direct
 
 ## 📦 Which File Should I Download?
 
-- **`VoltShot-Setup-v0.1.0-windows-x86_64.exe`** *(Recommended)* — Lightweight native Windows installer (~8 MB download, **no admin prompt required**). Installs VoltShot cleanly as a proper Windows app so you can find it in **Windows Search / Start Menu**, manage it in **Settings → Apps → Installed apps**, optionally launch at startup in the system tray, and uninstall cleanly anytime.
-- **`VoltShot-v0.1.0-windows-x86_64-portable.zip`** — Single self-contained `VoltShot.exe`. Unzip anywhere and run (pass `--portable` to store config alongside the exe).
+- **Windows Installer (`VoltShot-Setup-v0.1.0-windows-x86_64.exe`)** *(Recommended on Windows)* — Lightweight native installer (~9 MB, **no admin prompt required**) with Start Menu, Windows Search, Settings → Apps, and optional tray startup.
+- **Windows Portable (`VoltShot-v0.1.0-windows-x86_64-portable.zip`)** — Single self-contained `VoltShot.exe` (pass `--portable` to keep config beside the binary).
+- **Linux Debian/Ubuntu (`VoltShot-v0.1.0-linux-x86_64.deb`)** — Native `.deb` package with desktop entry, VoltShot icon, XDG autostart, and AppIndicator tray (`sudo apt install ./VoltShot-v0.1.0-linux-x86_64.deb`).
+- **Linux Portable (`VoltShot-v0.1.0-linux-x86_64.tar.gz`)** — Works on any Linux distro (includes `./install.sh` for `~/.local` install).
+- **macOS Apple Silicon (`VoltShot-v0.1.0-macos-arm64.dmg`)** & **macOS Intel (`VoltShot-v0.1.0-macos-x86_64.dmg`)** — Native Metal `VoltShot.app` bundle with Menu Bar tray, LaunchAgent autostart, and drag-to-Applications DMG (`.tar.gz` bundles also provided).
 
 ---
 

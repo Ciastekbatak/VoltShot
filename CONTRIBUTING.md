@@ -21,7 +21,9 @@ sudo apt-get install -y \
 	libwayland-dev \
 	libegl-dev \
 	libxkbcommon-dev \
-	libfontconfig-dev
+	libfontconfig-dev \
+	libgtk-3-dev \
+	libayatana-appindicator3-dev
 ```
 
 Windows and macOS require no extra system packages.

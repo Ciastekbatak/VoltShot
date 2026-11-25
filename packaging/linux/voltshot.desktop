@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=VoltShot
+GenericName=Screen Capture & Annotation Tool
+Comment=Next-gen screenshot, annotation editor, OCR, and screen recording app
+Exec=voltshot
+Icon=voltshot
+Terminal=false
+Categories=Graphics;Utility;2DGraphics;
+Keywords=screenshot;capture;screen;record;ocr;annotate;sharex;
+StartupNotify=true
+StartupWMClass=VoltShot
