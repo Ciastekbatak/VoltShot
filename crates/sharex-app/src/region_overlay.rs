@@ -238,6 +238,7 @@ pub struct RegionOverlayState {
     texture: egui::TextureHandle,
     focus_guard: OverlayFocusGuard,
     focus_acquired: bool,
+    overlay_revealed: bool,
     viewport_fitted: bool,
     viewport_inner_size: Option<Vec2>,
     active_tool: OverlayTool,
@@ -303,6 +304,7 @@ impl RegionOverlayState {
             texture,
             focus_guard,
             focus_acquired: false,
+            overlay_revealed: false,
             viewport_fitted: false,
             viewport_inner_size: None,
             active_tool: OverlayTool::Region,
@@ -353,38 +355,55 @@ impl RegionOverlayState {
         let img_w = self.document.base_image().width() as f32;
         let img_h = self.document.base_image().height() as f32;
 
+        let reveal_now = self.overlay_revealed;
         let builder = egui::ViewportBuilder::default()
             .with_title(OVERLAY_WINDOW_TITLE)
             .with_decorations(false)
             .with_always_on_top()
             .with_resizable(false)
+            .with_taskbar(false)
+            .with_transparent(true)
+            .with_visible(reveal_now)
             .with_clamp_size_to_monitor_size(false)
             .with_position([self.origin_x as f32 / ppp, self.origin_y as f32 / ppp])
             .with_inner_size([img_w / ppp, img_h / ppp])
-            .with_active(true);
+            .with_active(reveal_now);
 
         let mut outcome = OverlayModeOutcome::Pending;
 
         ctx.show_viewport_immediate(viewport_id, builder, |overlay_ctx, class| {
             if class != egui::ViewportClass::Embedded {
-                let ppp = overlay_ctx.pixels_per_point();
-                let size = Vec2::new(img_w, img_h) / ppp;
-                let (inner, outer, focused) = overlay_ctx.input(|input| {
-                    let viewport = input.viewport();
-                    (viewport.inner_rect, viewport.outer_rect, viewport.focused)
-                });
-                let inner_size = inner.map(|rect| rect.size());
-                if !self.viewport_fitted
-                    || inner_size != self.viewport_inner_size
-                    || inner_size.is_some_and(|current| exceeds_half_pixel(size - current, ppp))
-                {
-                    self.viewport_inner_size = inner_size;
-                    self.fit_viewport_to_snapshot(overlay_ctx, size, inner, outer);
-                }
-                if !self.focus_acquired {
-                    self.focus_acquired = focused == Some(true);
+                if !self.overlay_revealed {
+                    let prepared = crate::win_focus::prepare_overlay_window(
+                        OVERLAY_WINDOW_TITLE,
+                        self.origin_x,
+                        self.origin_y,
+                        img_w as i32,
+                        img_h as i32,
+                    );
+                    if prepared {
+                        self.viewport_fitted = true;
+                    }
+                } else {
+                    let ppp = overlay_ctx.pixels_per_point();
+                    let size = Vec2::new(img_w, img_h) / ppp;
+                    let (inner, outer, focused) = overlay_ctx.input(|input| {
+                        let viewport = input.viewport();
+                        (viewport.inner_rect, viewport.outer_rect, viewport.focused)
+                    });
+                    let inner_size = inner.map(|rect| rect.size());
+                    if !self.viewport_fitted
+                        || inner_size != self.viewport_inner_size
+                        || inner_size.is_some_and(|current| exceeds_half_pixel(size - current, ppp))
+                    {
+                        self.viewport_inner_size = inner_size;
+                        self.fit_viewport_to_snapshot(overlay_ctx, size, inner, outer);
+                    }
                     if !self.focus_acquired {
-                        self.focus_guard.enforce_overlay_focus(OVERLAY_WINDOW_TITLE);
+                        self.focus_acquired = focused == Some(true);
+                        if !self.focus_acquired {
+                            self.focus_guard.enforce_overlay_focus(OVERLAY_WINDOW_TITLE);
+                        }
                     }
                 }
             }
@@ -873,6 +892,10 @@ impl RegionOverlayState {
         if !matches!(outcome, OverlayModeOutcome::Pending) {
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(false));
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+            ctx.request_repaint();
+        } else if !self.overlay_revealed {
+            self.overlay_revealed = true;
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
             ctx.request_repaint();
         }
 
