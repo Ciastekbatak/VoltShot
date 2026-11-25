@@ -1,6 +1,6 @@
 use std::{
     mem::{self, MaybeUninit},
-    ptr, slice, thread,
+    ptr, slice,
 };
 
 use sharex_core::{CapturedImage, CoreError, WindowId, WindowInfo};
@@ -129,29 +129,7 @@ pub(super) fn primary_monitor_rect_win32() -> Option<(i32, i32, u32, u32)> {
 fn bgra_to_rgba_opaque(src: &[u8]) -> Vec<u8> {
     let len = src.len();
     let mut rgba: Vec<u8> = Vec::with_capacity(len);
-    let dst = &mut rgba.spare_capacity_mut()[..len];
-    let workers = if len >= 256 * 1024 {
-        thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
-            .clamp(1, 8)
-    } else {
-        1
-    };
-
-    if workers <= 1 {
-        convert_bgra_stripe(src, dst);
-    } else {
-        let pixels = len / 4;
-        let stripe_bytes = pixels.div_ceil(workers) * 4;
-        thread::scope(|scope| {
-            for (src_chunk, dst_chunk) in src.chunks(stripe_bytes).zip(dst.chunks_mut(stripe_bytes))
-            {
-                scope.spawn(move || convert_bgra_stripe(src_chunk, dst_chunk));
-            }
-        });
-    }
-
+    convert_bgra_stripe(src, &mut rgba.spare_capacity_mut()[..len]);
     unsafe {
         rgba.set_len(len);
     }

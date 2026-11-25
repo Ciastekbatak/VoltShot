@@ -373,7 +373,7 @@ impl RegionOverlayState {
             .with_always_on_top()
             .with_resizable(false)
             .with_taskbar(false)
-            .with_transparent(true)
+            .with_transparent(false)
             .with_visible(reveal_now)
             .with_clamp_size_to_monitor_size(false)
             .with_position([self.origin_x as f32 / ppp, self.origin_y as f32 / ppp])
@@ -381,6 +381,7 @@ impl RegionOverlayState {
             .with_active(reveal_now);
 
         let mut outcome = OverlayModeOutcome::Pending;
+        let mut revealed_this_frame = false;
 
         ctx.show_viewport_immediate(viewport_id, builder, |overlay_ctx, class| {
             if class != egui::ViewportClass::Embedded {
@@ -395,6 +396,9 @@ impl RegionOverlayState {
                     if prepared {
                         self.viewport_fitted = true;
                     }
+                    self.overlay_revealed = true;
+                    revealed_this_frame = true;
+                    overlay_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 } else {
                     let ppp = overlay_ctx.pixels_per_point();
                     let size = Vec2::new(img_w, img_h) / ppp;
@@ -904,11 +908,9 @@ impl RegionOverlayState {
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(false));
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
             ctx.request_repaint();
-        } else if !self.overlay_revealed {
-            self.overlay_revealed = true;
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
-            ctx.request_repaint();
-            crate::win_focus::wake_hidden_main_window();
+        } else if revealed_this_frame {
+            self.focus_guard.enforce_overlay_focus(OVERLAY_WINDOW_TITLE);
+            self.focus_acquired = true;
         }
 
         outcome
