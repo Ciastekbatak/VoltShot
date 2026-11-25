@@ -6,11 +6,11 @@ use eframe::egui::{
     self, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Shadow, Stroke, Vec2,
 };
 use sharex_capture::{DesktopSnapshot, XcapCapturer, find_window_at_point};
-use sharex_core::{CapturedImage, Region, ScreenCapturer, WindowInfo};
+use sharex_core::{CapturedImage, Region, WindowInfo};
 use sharex_editor::{AnnotationKind, EditorDocument, Point, RectF, RgbaColor, SHAREX_PALETTE};
 use sharex_tools::{ColorSample, sample_image};
 
-const OVERLAY_WINDOW_TITLE: &str = "ShareX Region Capture";
+const OVERLAY_WINDOW_TITLE: &str = "VoltShot Region Capture";
 const MIN_REGION_DRAG: f32 = 4.0;
 const MAGNIFIER_HALF_EXTENT: i32 = 5;
 const MIN_LOUPE_HALF_EXTENT: i32 = 3;
@@ -269,24 +269,35 @@ impl RegionOverlayState {
         snapshot: DesktopSnapshot,
         mode: OverlayMode,
     ) -> Self {
+        Self::open_with_preloaded(ctx, snapshot, None, mode)
+    }
+
+    /// Opens the overlay using pre-enumerated snap windows when captured in parallel with the desktop.
+    pub fn open_with_preloaded(
+        ctx: &egui::Context,
+        snapshot: DesktopSnapshot,
+        pre_windows: Option<Vec<WindowInfo>>,
+        mode: OverlayMode,
+    ) -> Self {
         let focus_guard = OverlayFocusGuard::capture_current_foreground();
         let capturer = XcapCapturer::new();
         let mut windows = if mode == OverlayMode::ColorPicker {
             Vec::new()
         } else {
-            capturer.list_snap_windows().unwrap_or_default()
+            pre_windows.unwrap_or_else(|| capturer.list_snap_windows().unwrap_or_default())
         };
-        windows.retain(|window| !window.title.contains("ShareX"));
-        let primary_monitor = capturer.list_monitors().ok().and_then(|monitors| {
-            let primary = monitors.into_iter().find(|monitor| monitor.is_primary)?;
-            Some(RectF {
-                x: (i64::from(primary.x) - i64::from(snapshot.origin_x)) as f32,
-                y: (i64::from(primary.y) - i64::from(snapshot.origin_y)) as f32,
-                width: primary.width as f32,
-                height: primary.height as f32,
-            })
+        windows.retain(|window| {
+            !window.title.contains("ShareX") && !window.title.contains("VoltShot")
         });
-        let color_img = crate::image_texture::bounded_color_image(
+        let primary_monitor = capturer
+            .primary_monitor_rect()
+            .map(|(x, y, width, height)| RectF {
+                x: (i64::from(x) - i64::from(snapshot.origin_x)) as f32,
+                y: (i64::from(y) - i64::from(snapshot.origin_y)) as f32,
+                width: width as f32,
+                height: height as f32,
+            });
+        let color_img = crate::image_texture::bounded_opaque_color_image(
             &snapshot.image,
             ctx.input(|input| input.max_texture_side),
         );
@@ -897,6 +908,7 @@ impl RegionOverlayState {
             self.overlay_revealed = true;
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
             ctx.request_repaint();
+            crate::win_focus::wake_hidden_main_window();
         }
 
         outcome

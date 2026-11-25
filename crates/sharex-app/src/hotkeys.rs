@@ -12,6 +12,7 @@ pub struct TriggeredHotkey {
     pub id: String,
     pub action: sharex_core::HotkeyAction,
     pub pre_snapshot: Option<sharex_capture::DesktopSnapshot>,
+    pub pre_windows: Option<Vec<sharex_core::WindowInfo>>,
 }
 
 #[cfg(target_os = "windows")]
@@ -169,23 +170,32 @@ mod platform {
                     let id = msg.wParam as i32;
                     if let Some((binding_id, action)) = registered.get(&id) {
                         win_focus::allow_self_foreground();
-                        let pre_snapshot = if matches!(
+                        let (pre_snapshot, pre_windows) = if matches!(
                             action,
                             HotkeyAction::CaptureRegion
                                 | HotkeyAction::CaptureOcr
                                 | HotkeyAction::PickScreenColor
                         ) {
-                            let snap =
-                                crate::gui::capture_overlay_snapshot(&XcapCapturer::new()).ok();
+                            let need_windows = *action != HotkeyAction::PickScreenColor;
+                            let capturer = XcapCapturer::new();
+                            let (snap, windows) = thread::scope(|scope| {
+                                let win_job = need_windows
+                                    .then(|| scope.spawn(|| capturer.list_snap_windows().ok()));
+                                let snap = crate::gui::capture_overlay_snapshot(&capturer).ok();
+                                let windows =
+                                    win_job.and_then(|handle| handle.join().ok().flatten());
+                                (snap, windows)
+                            });
                             win_focus::release_cursor_clip();
-                            snap
+                            (snap, windows)
                         } else {
-                            None
+                            (None, None)
                         };
                         let _ = action_tx.send(TriggeredHotkey {
                             id: binding_id.clone(),
                             action: *action,
                             pre_snapshot,
+                            pre_windows,
                         });
                         ctx.request_repaint();
                         win_focus::wake_hidden_main_window();
@@ -528,6 +538,7 @@ mod platform {
                         id: binding_id.clone(),
                         action: *action,
                         pre_snapshot: None,
+                        pre_windows: None,
                     });
                 }
             }

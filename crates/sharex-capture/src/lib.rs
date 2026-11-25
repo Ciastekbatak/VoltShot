@@ -252,6 +252,19 @@ impl XcapCapturer {
         self.list_windows()
     }
 
+    /// Returns the primary display `(x, y, width, height)` using a fast OS query when available.
+    pub fn primary_monitor_rect(&self) -> Option<(i32, i32, u32, u32)> {
+        #[cfg(target_os = "windows")]
+        if let Some(rect) = win_fast::primary_monitor_rect_win32() {
+            return Some(rect);
+        }
+
+        self.list_monitors().ok().and_then(|monitors| {
+            let primary = monitors.into_iter().find(|monitor| monitor.is_primary)?;
+            Some((primary.x, primary.y, primary.width, primary.height))
+        })
+    }
+
     fn capture_virtual_desktop_from_monitors<'a>(
         &self,
         monitors: impl ExactSizeIterator<Item = (&'a Monitor, MonitorInfo)>,
