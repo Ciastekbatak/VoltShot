@@ -141,7 +141,7 @@ mod windows {
             let icon = Icon::from_rgba(build_tray_icon_rgba(ICON_SIZE), ICON_SIZE, ICON_SIZE)
                 .map_err(|err| err.to_string())?;
             let icon = TrayIconBuilder::new()
-                .with_tooltip("ShareX")
+                .with_tooltip("VoltShot")
                 .with_icon(icon)
                 .with_menu(Box::new(menu))
                 .with_menu_on_left_click(false)

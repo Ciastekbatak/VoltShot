@@ -11,10 +11,10 @@ fn main() {
 fn compile_windows_resources() {
     let mut res = winresource::WindowsResource::new();
     res.set_icon("../../assets/sharex.ico")
-        .set("ProductName", "ShareX (Rust)")
+        .set("ProductName", "VoltShot")
         .set(
             "FileDescription",
-            "ShareX in Rust - Screen Capture, Editor & Sharing",
+            "VoltShot - Next-Gen Screen Capture, Editor & Sharing",
         )
         .set("LegalCopyright", "GPL-3.0-or-later");
     res.compile()

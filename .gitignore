@@ -1,4 +1,6 @@
 /target
+/release
+/dist
 **/*.rs.bk
 *.pdb
 .DS_Store

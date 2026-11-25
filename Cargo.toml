@@ -9,6 +9,7 @@ members = [
     "crates/sharex-tools",
     "crates/sharex-uploaders",
     "crates/sharex-app",
+    "crates/voltshot-installer",
 ]
 
 [workspace.package]

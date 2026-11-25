@@ -46,7 +46,7 @@ const THUMB_CACHE_CAPACITY: usize = 32;
 const THUMB_MAX_SIDE: usize = 360;
 const THUMBS_DECODED_PER_FRAME: usize = 2;
 const HISTORY_LIMIT: usize = 100;
-const AUTOSTART_APP_NAME: &str = "ShareX-RS";
+const AUTOSTART_APP_NAME: &str = "VoltShot";
 
 /// Starts the ShareX-style native desktop application window with global hotkeys.
 pub fn launch_gui(config_path: PathBuf) -> Result<(), eframe::Error> {
@@ -96,7 +96,7 @@ pub fn launch_gui_with_fallback(
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("ShareX (Rust)")
+            .with_title(crate::win_focus::MAIN_WINDOW_TITLE)
             .with_icon(std::sync::Arc::new(window_icon))
             .with_inner_size([1180.0, 740.0])
             .with_min_inner_size([880.0, 560.0])
@@ -106,7 +106,7 @@ pub fn launch_gui_with_fallback(
     };
 
     eframe::run_native(
-        "ShareX (Rust)",
+        crate::win_focus::MAIN_WINDOW_TITLE,
         options,
         Box::new(move |cc| {
             Ok(Box::new(SharexGuiApp::new(

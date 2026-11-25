@@ -1,5 +1,5 @@
-/// Title of the main ShareX-RS desktop window used for Win32 window lookups.
-pub const MAIN_WINDOW_TITLE: &str = "ShareX (Rust)";
+/// Title of the main VoltShot desktop window used for Win32 window lookups.
+pub const MAIN_WINDOW_TITLE: &str = "VoltShot";
 
 #[cfg(target_os = "windows")]
 mod imp {

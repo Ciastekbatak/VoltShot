@@ -39,17 +39,25 @@ jobs:
           sudo apt-get install -y pkg-config libclang-dev libxcb1-dev libxrandr-dev libdbus-1-dev libpipewire-0.3-dev libwayland-dev libegl-dev libxkbcommon-dev libfontconfig-dev
       - name: Build release binary
         run: cargo build --release -p sharex-app
-      - name: Package Windows archive
+      - name: Build Windows installer and portable archive
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           PLATFORM: ${{ matrix.platform }}
           BINARY: ${{ matrix.binary }}
+          VOLTSHOT_EMBED_PAYLOAD: "1"
         run: |
+          cargo build --release -p voltshot-installer
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $archive = "dist/sharex-$($env:RELEASE_TAG)-$($env:PLATFORM).zip"
-          Compress-Archive -Path "target/release/$($env:BINARY)" -DestinationPath $archive -Force
+          $portableDir = "dist/portable-stage"
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          Copy-Item "target/release/$($env:BINARY)" "$portableDir/VoltShot.exe" -Force
+          $archive = "dist/VoltShot-$($env:RELEASE_TAG)-$($env:PLATFORM)-portable.zip"
+          Compress-Archive -Path "$portableDir/VoltShot.exe" -DestinationPath $archive -Force
+          Remove-Item -Recurse -Force $portableDir
+          $installer = "dist/VoltShot-Setup-$($env:RELEASE_TAG)-$($env:PLATFORM).exe"
+          Copy-Item "target/release/voltshot-setup.exe" $installer -Force
       - name: Package Unix archive
         if: runner.os != 'Windows'
         env:
@@ -58,7 +66,9 @@ jobs:
           BINARY: ${{ matrix.binary }}
         run: |
           mkdir -p dist
-          tar -czf "dist/sharex-${RELEASE_TAG}-${PLATFORM}.tar.gz" -C target/release "${BINARY}"
+          cp "target/release/${BINARY}" "dist/voltshot"
+          tar -czf "dist/VoltShot-${RELEASE_TAG}-${PLATFORM}.tar.gz" -C dist voltshot
+          rm -f dist/voltshot
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}
@@ -71,12 +81,18 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
       - name: Attach release artifacts
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: false
