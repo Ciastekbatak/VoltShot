@@ -88,6 +88,10 @@ pub fn launch_gui_with_fallback(
         {
             create.instance_descriptor.backends = eframe::egui_wgpu::wgpu::Backends::DX12;
         }
+        #[cfg(target_os = "macos")]
+        {
+            create.instance_descriptor.backends = eframe::egui_wgpu::wgpu::Backends::METAL;
+        }
         create.power_preference = eframe::egui_wgpu::wgpu::PowerPreference::HighPerformance;
         let base_desc = create.device_descriptor;
         create.device_descriptor = std::sync::Arc::new(move |adapter| {
@@ -2709,7 +2713,7 @@ impl VoltShotGuiApp {
                     let mut next = self.run_at_startup;
                     if ui
                         .add_enabled(
-                            cfg!(target_os = "windows"),
+                            AutostartManager::is_supported(),
                             egui::Checkbox::new(&mut next, s.run_at_startup),
                         )
                         .changed()

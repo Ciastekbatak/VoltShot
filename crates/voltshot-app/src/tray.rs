@@ -181,29 +181,29 @@ fn point_in_polygon(x: f64, y: f64, poly: &[(f64, f64)]) -> bool {
 pub struct TrayRuntime {
     actions: mpsc::Receiver<TrayAction>,
     init_error: Option<String>,
-    #[cfg(target_os = "windows")]
-    _native: Option<windows::NativeTray>,
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    _native: Option<native::NativeTray>,
 }
 
 impl TrayRuntime {
-    /// On Windows, create and drop the runtime on the thread running the GUI event loop.
+    /// Creates the OS-native system tray runtime on the GUI thread.
     pub fn new(ctx: egui::Context) -> Self {
         let (action_tx, actions) = mpsc::channel();
-        #[cfg(target_os = "windows")]
-        let (native, init_error) = match windows::NativeTray::new(ctx, action_tx) {
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+        let (native, init_error) = match native::NativeTray::new(ctx, action_tx) {
             Ok(native) => (Some(native), None),
             Err(error) => (None, Some(error)),
         };
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         let init_error = {
             drop((ctx, action_tx));
-            Some("The native VoltShot system tray is available on Windows only".to_owned())
+            Some("The native VoltShot system tray is unavailable on this platform".to_owned())
         };
 
         Self {
             actions,
             init_error,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             _native: native,
         }
     }
@@ -221,8 +221,8 @@ impl TrayRuntime {
     }
 }
 
-#[cfg(target_os = "windows")]
-mod windows {
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+mod native {
     use super::{TrayAction, TrayMenuMap, build_tray_icon_rgba, egui, mpsc};
     use std::sync::{Mutex, MutexGuard};
     use std::thread::{self, JoinHandle};
@@ -231,16 +231,18 @@ mod windows {
     use tray_icon::{
         Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetShellWindow;
 
     const ICON_SIZE: u32 = 32;
     const POLL_INTERVAL: Duration = Duration::from_millis(16);
     static ACTIVE_TRAY: Mutex<()> = Mutex::new(());
 
     pub(super) struct NativeTray {
+        #[cfg(not(target_os = "linux"))]
         _icon: TrayIcon,
         stop: mpsc::Sender<()>,
         worker: Option<JoinHandle<()>>,
+        #[cfg(target_os = "linux")]
+        gtk_thread: Option<JoinHandle<()>>,
         _active: MutexGuard<'static, ()>,
     }
 
@@ -249,74 +251,147 @@ mod windows {
             ctx: egui::Context,
             action_tx: mpsc::Sender<TrayAction>,
         ) -> Result<Self, String> {
-            if unsafe { GetShellWindow() }.is_null() {
+            #[cfg(target_os = "windows")]
+            if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetShellWindow() }.is_null() {
                 return Err("The Windows desktop shell is unavailable".to_owned());
+            }
+
+            #[cfg(target_os = "linux")]
+            if std::env::var_os("DISPLAY").is_none()
+                && std::env::var_os("WAYLAND_DISPLAY").is_none()
+            {
+                return Err("No Linux display server is active for the system tray".to_owned());
             }
 
             let active = ACTIVE_TRAY
                 .try_lock()
                 .map_err(|_| "The VoltShot system tray is already active".to_owned())?;
-            let (menu, menu_map) = build_menu().map_err(|err| err.to_string())?;
-            let icon = Icon::from_rgba(build_tray_icon_rgba(ICON_SIZE), ICON_SIZE, ICON_SIZE)
-                .map_err(|err| err.to_string())?;
-            let icon = TrayIconBuilder::new()
-                .with_tooltip("VoltShot")
-                .with_icon(icon)
-                .with_menu(Box::new(menu))
-                .with_menu_on_left_click(false)
-                .build()
-                .map_err(|err| err.to_string())?;
 
-            let icon_id = icon.id().clone();
-            let (stop, stop_rx) = mpsc::channel();
-            let worker = thread::Builder::new()
-                .name("voltshot-tray-events".to_owned())
-                .spawn(move || {
-                    let menu_events = MenuEvent::receiver();
-                    let icon_events = TrayIconEvent::receiver();
-                    loop {
-                        let menu_actions = menu_events
-                            .try_iter()
-                            .filter_map(|event| menu_map.action_for(event.id()));
-                        let icon_actions = icon_events.try_iter().filter_map(|event| match event {
-                            TrayIconEvent::Click {
-                                id,
-                                button: MouseButton::Left,
-                                button_state: MouseButtonState::Up,
-                                ..
-                            }
-                            | TrayIconEvent::DoubleClick {
-                                id,
-                                button: MouseButton::Left,
-                                ..
-                            } if id == icon_id => Some(TrayAction::OpenMainWindow),
-                            _ => None,
-                        });
-
-                        for action in menu_actions.chain(icon_actions) {
-                            if action_tx.send(action).is_err() {
-                                return;
-                            }
-                            ctx.request_repaint();
-                            crate::win_focus::wake_hidden_main_window();
-                        }
-
-                        if stop_rx.recv_timeout(POLL_INTERVAL)
-                            != Err(mpsc::RecvTimeoutError::Timeout)
-                        {
+            #[cfg(target_os = "linux")]
+            {
+                let (init_tx, init_rx) =
+                    mpsc::channel::<Result<(TrayMenuMap, tray_icon::TrayIconId), String>>();
+                let gtk_thread = thread::Builder::new()
+                    .name("voltshot-linux-tray".to_owned())
+                    .spawn(move || {
+                        if let Err(err) = gtk::init() {
+                            let _ = init_tx.send(Err(format!("GTK init failed: {err}")));
                             return;
                         }
-                    }
-                })
-                .map_err(|err| err.to_string())?;
+                        let created = (|| -> Result<(TrayIcon, TrayMenuMap), String> {
+                            let (menu, menu_map) = build_menu().map_err(|err| err.to_string())?;
+                            let icon = Icon::from_rgba(
+                                build_tray_icon_rgba(ICON_SIZE),
+                                ICON_SIZE,
+                                ICON_SIZE,
+                            )
+                            .map_err(|err| err.to_string())?;
+                            let tray = TrayIconBuilder::new()
+                                .with_tooltip("VoltShot")
+                                .with_icon(icon)
+                                .with_menu(Box::new(menu))
+                                .build()
+                                .map_err(|err| err.to_string())?;
+                            Ok((tray, menu_map))
+                        })();
+                        match created {
+                            Ok((tray, menu_map)) => {
+                                let icon_id = tray.id().clone();
+                                let _ = init_tx.send(Ok((menu_map, icon_id)));
+                                gtk::main();
+                                drop(tray);
+                            }
+                            Err(err) => {
+                                let _ = init_tx.send(Err(err));
+                            }
+                        }
+                    })
+                    .map_err(|err| err.to_string())?;
 
-            Ok(Self {
-                _icon: icon,
-                stop,
-                worker: Some(worker),
-                _active: active,
-            })
+                let (menu_map, icon_id) = init_rx
+                    .recv()
+                    .map_err(|_| "Linux tray thread exited during initialization".to_owned())??;
+
+                let (stop, worker) = spawn_event_worker(ctx, action_tx, menu_map, icon_id)?;
+                return Ok(Self {
+                    stop,
+                    worker: Some(worker),
+                    gtk_thread: Some(gtk_thread),
+                    _active: active,
+                });
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                let (menu, menu_map) = build_menu().map_err(|err| err.to_string())?;
+                let icon = Icon::from_rgba(build_tray_icon_rgba(ICON_SIZE), ICON_SIZE, ICON_SIZE)
+                    .map_err(|err| err.to_string())?;
+                let builder = TrayIconBuilder::new()
+                    .with_tooltip("VoltShot")
+                    .with_icon(icon)
+                    .with_menu(Box::new(menu));
+                #[cfg(target_os = "windows")]
+                let builder = builder.with_menu_on_left_click(false);
+                let icon = builder.build().map_err(|err| err.to_string())?;
+                let icon_id = icon.id().clone();
+                let (stop, worker) = spawn_event_worker(ctx, action_tx, menu_map, icon_id)?;
+
+                Ok(Self {
+                    _icon: icon,
+                    stop,
+                    worker: Some(worker),
+                    _active: active,
+                })
+            }
         }
+    }
+
+    fn spawn_event_worker(
+        ctx: egui::Context,
+        action_tx: mpsc::Sender<TrayAction>,
+        menu_map: TrayMenuMap,
+        icon_id: tray_icon::TrayIconId,
+    ) -> Result<(mpsc::Sender<()>, JoinHandle<()>), String> {
+        let (stop, stop_rx) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("voltshot-tray-events".to_owned())
+            .spawn(move || {
+                let menu_events = MenuEvent::receiver();
+                let icon_events = TrayIconEvent::receiver();
+                loop {
+                    let menu_actions = menu_events
+                        .try_iter()
+                        .filter_map(|event| menu_map.action_for(event.id()));
+                    let icon_actions = icon_events.try_iter().filter_map(|event| match event {
+                        TrayIconEvent::Click {
+                            id,
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                        | TrayIconEvent::DoubleClick {
+                            id,
+                            button: MouseButton::Left,
+                            ..
+                        } if id == icon_id => Some(TrayAction::OpenMainWindow),
+                        _ => None,
+                    });
+
+                    for action in menu_actions.chain(icon_actions) {
+                        if action_tx.send(action).is_err() {
+                            return;
+                        }
+                        ctx.request_repaint();
+                        crate::win_focus::wake_hidden_main_window();
+                    }
+
+                    if stop_rx.recv_timeout(POLL_INTERVAL) != Err(mpsc::RecvTimeoutError::Timeout) {
+                        return;
+                    }
+                }
+            })
+            .map_err(|err| err.to_string())?;
+        Ok((stop, worker))
     }
 
     impl Drop for NativeTray {
@@ -324,6 +399,16 @@ mod windows {
             let _ = self.stop.send(());
             if let Some(worker) = self.worker.take() {
                 let _ = worker.join();
+            }
+            #[cfg(target_os = "linux")]
+            {
+                gtk::glib::idle_add(|| {
+                    gtk::main_quit();
+                    gtk::glib::ControlFlow::Break
+                });
+                if let Some(gtk_thread) = self.gtk_thread.take() {
+                    let _ = gtk_thread.join();
+                }
             }
         }
     }
@@ -395,7 +480,7 @@ mod tests {
             ("open-screenshots-folder", TrayAction::OpenScreenshotsFolder),
             ("quit", TrayAction::Quit),
         ];
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
         let entries = entries.map(|(id, action)| (tray_icon::menu::MenuId::new(id), action));
 
         let mut map = TrayMenuMap::default();
@@ -408,7 +493,7 @@ mod tests {
         assert_eq!(map.action_for("unrelated-action"), None);
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     #[test]
     fn unsupported_platform_reports_an_error_without_actions() {
         let tray = TrayRuntime::new(egui::Context::default());

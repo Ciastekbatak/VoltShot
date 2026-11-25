@@ -366,10 +366,44 @@ mod imp {
 
 #[cfg(not(target_os = "windows"))]
 mod imp {
-    pub struct SingleInstanceGuard;
+    #[cfg(unix)]
+    use fs2::FileExt;
+    #[cfg(unix)]
+    use std::fs::{File, OpenOptions};
+    #[cfg(unix)]
+    use std::path::PathBuf;
+
+    pub struct SingleInstanceGuard {
+        #[cfg(unix)]
+        _lock: Option<File>,
+    }
 
     pub fn acquire_single_instance() -> Option<SingleInstanceGuard> {
-        Some(SingleInstanceGuard)
+        #[cfg(unix)]
+        {
+            let lock_dir = std::env::var_os("XDG_RUNTIME_DIR")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let lock_path = lock_dir.join("voltshot.lock");
+            if let Ok(file) = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(lock_path)
+            {
+                if file.try_lock_exclusive().is_err() {
+                    return None;
+                }
+                return Some(SingleInstanceGuard { _lock: Some(file) });
+            }
+            Some(SingleInstanceGuard { _lock: None })
+        }
+        #[cfg(not(unix))]
+        {
+            Some(SingleInstanceGuard {})
+        }
     }
 
     pub fn is_main_window_hidden() -> bool {

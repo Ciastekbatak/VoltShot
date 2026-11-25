@@ -439,7 +439,7 @@ mod platform {
     use std::collections::HashMap;
     use std::sync::mpsc::{self, Receiver};
     use std::thread;
-    use voltshot_core::{HotkeyAction, HotkeyBinding, HotkeyCombo, KeyCode, KeyModifiers};
+    use voltshot_core::{HotkeyAction, HotkeyBinding, HotkeyCombo, KeyCode};
 
     pub struct HotkeyRuntime {
         manager: Option<GlobalHotKeyManager>,

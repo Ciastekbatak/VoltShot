@@ -82,7 +82,73 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::generate_shutter_wav;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+
+    static SHUTTER_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+    pub fn play_capture_sound() {
+        let Some(path) = SHUTTER_PATH.get_or_init(|| {
+            let path = std::env::temp_dir().join("voltshot-shutter.wav");
+            std::fs::write(&path, generate_shutter_wav()).ok()?;
+            Some(path)
+        }) else {
+            return;
+        };
+        let _ = Command::new("afplay")
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+mod imp {
+    use super::generate_shutter_wav;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+
+    static SHUTTER_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+    pub fn play_capture_sound() {
+        let Some(path) = SHUTTER_PATH.get_or_init(|| {
+            let base = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let path = base.join("voltshot-shutter.wav");
+            std::fs::write(&path, generate_shutter_wav()).ok()?;
+            Some(path)
+        }) else {
+            return;
+        };
+        for (program, extra_args) in [
+            ("pw-play", &[][..]),
+            ("paplay", &[][..]),
+            ("aplay", &["-q"][..]),
+        ] {
+            if Command::new(program)
+                .args(extra_args)
+                .arg(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", unix)))]
 mod imp {
     pub fn play_capture_sound() {}
 }

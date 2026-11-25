@@ -116,7 +116,7 @@ impl XcapCapturer {
         }
         let buffer = monitor
             .capture_image()
-            .map_err(|e| CoreError::CaptureFailed(e.to_string()))?;
+            .map_err(|e| format_capture_error(e.to_string()))?;
         let width = buffer.width();
         let height = buffer.height();
         CapturedImage::from_rgba(width, height, buffer.into_raw())
@@ -316,6 +316,19 @@ fn cursor_position() -> Option<(i32, i32)> {
 #[cfg(not(target_os = "windows"))]
 fn cursor_position() -> Option<(i32, i32)> {
     None
+}
+
+fn format_capture_error(message: String) -> CoreError {
+    #[cfg(target_os = "macos")]
+    {
+        CoreError::CaptureFailed(format!(
+            "{message} (On macOS, grant Screen Recording access in System Settings -> Privacy & Security -> Screen & System Audio Recording.)"
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        CoreError::CaptureFailed(message)
+    }
 }
 
 impl ScreenCapturer for XcapCapturer {

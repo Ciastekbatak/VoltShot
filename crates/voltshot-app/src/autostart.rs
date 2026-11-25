@@ -3,16 +3,25 @@ use std::path::Path;
 /// Registry subkey under `HKEY_CURRENT_USER` storing per-user startup commands on Windows.
 pub const RUN_REGISTRY_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
-/// Cross-platform helper managing Windows per-user Run-at-Startup registration.
+/// Cross-platform helper managing per-user Run-at-Startup registration (Windows Registry, Linux XDG, macOS LaunchAgents).
 pub struct AutostartManager;
 
 impl AutostartManager {
+    /// Returns `true` when startup registration is supported on the current operating system.
+    pub const fn is_supported() -> bool {
+        cfg!(any(
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "macos"
+        ))
+    }
+
     /// Returns `true` when `app_name` is currently registered to launch at user sign-in.
     pub fn is_enabled(app_name: &str) -> bool {
         imp::is_enabled(app_name)
     }
 
-    /// Registers or removes `app_name` in the per-user startup registry key.
+    /// Registers or removes `app_name` in the OS per-user startup configuration.
     pub fn set_enabled(
         app_name: &str,
         exe_path: &Path,
@@ -31,6 +40,72 @@ impl AutostartManager {
             quoted
         }
     }
+
+    /// Formats a Freedesktop XDG autostart `.desktop` entry for Linux desktop environments.
+    pub fn format_linux_desktop_entry(app_name: &str, exe_path: &Path, minimized: bool) -> String {
+        let escaped_path = exe_path
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        let exec = if minimized {
+            format!("\"{escaped_path}\" --minimized")
+        } else {
+            format!("\"{escaped_path}\"")
+        };
+        format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Version=1.0\n\
+             Name={app_name}\n\
+             Comment=Next-gen screen capture, annotation editor, and sharing\n\
+             Exec={exec}\n\
+             Icon=voltshot\n\
+             Terminal=false\n\
+             Categories=Graphics;Utility;\n\
+             X-GNOME-Autostart-enabled=true\n"
+        )
+    }
+
+    /// Formats a macOS `launchd` user LaunchAgent `.plist` XML document.
+    pub fn format_macos_launch_agent_plist(
+        label: &str,
+        exe_path: &Path,
+        minimized: bool,
+    ) -> String {
+        let escaped_label = escape_xml(label);
+        let escaped_exe = escape_xml(&exe_path.display().to_string());
+        let minimized_arg = if minimized {
+            "\n        <string>--minimized</string>"
+        } else {
+            ""
+        };
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n\
+             <dict>\n\
+                 <key>Label</key>\n\
+                 <string>{escaped_label}</string>\n\
+                 <key>ProgramArguments</key>\n\
+                 <array>\n\
+                     <string>{escaped_exe}</string>{minimized_arg}\n\
+                 </array>\n\
+                 <key>RunAtLoad</key>\n\
+                 <true/>\n\
+             </dict>\n\
+             </plist>\n"
+        )
+    }
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// Encodes `value` as a NUL-terminated UTF-16 code unit sequence for Win32 wide-string APIs.
@@ -145,7 +220,118 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+mod imp {
+    use super::AutostartManager;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn desktop_entry_path(app_name: &str) -> Option<PathBuf> {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        let slug = app_name.to_ascii_lowercase().replace(' ', "-");
+        Some(base.join("autostart").join(format!("{slug}.desktop")))
+    }
+
+    pub fn is_enabled(app_name: &str) -> bool {
+        if app_name.is_empty() {
+            return false;
+        }
+        desktop_entry_path(app_name).is_some_and(|path| path.is_file())
+    }
+
+    pub fn set_enabled(
+        app_name: &str,
+        exe_path: &Path,
+        minimized: bool,
+        enabled: bool,
+    ) -> Result<(), String> {
+        if app_name.is_empty() {
+            return Err("Application name must not be empty.".to_string());
+        }
+        let path = desktop_entry_path(app_name)
+            .ok_or_else(|| "Could not determine Linux XDG autostart directory.".to_string())?;
+        if enabled {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| format!("Failed to create autostart directory: {err}"))?;
+            }
+            let content =
+                AutostartManager::format_linux_desktop_entry(app_name, exe_path, minimized);
+            fs::write(&path, content)
+                .map_err(|err| format!("Failed to write {}: {err}", path.display()))
+        } else {
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(format!("Failed to remove {}: {err}", path.display())),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::AutostartManager;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn launch_agent_label(app_name: &str) -> String {
+        let slug = app_name.to_ascii_lowercase().replace(' ', "-");
+        format!("io.{slug}.app")
+    }
+
+    fn launch_agent_path(app_name: &str) -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        let label = launch_agent_label(app_name);
+        Some(
+            home.join("Library")
+                .join("LaunchAgents")
+                .join(format!("{label}.plist")),
+        )
+    }
+
+    pub fn is_enabled(app_name: &str) -> bool {
+        if app_name.is_empty() {
+            return false;
+        }
+        launch_agent_path(app_name).is_some_and(|path| path.is_file())
+    }
+
+    pub fn set_enabled(
+        app_name: &str,
+        exe_path: &Path,
+        minimized: bool,
+        enabled: bool,
+    ) -> Result<(), String> {
+        if app_name.is_empty() {
+            return Err("Application name must not be empty.".to_string());
+        }
+        let path = launch_agent_path(app_name)
+            .ok_or_else(|| "Could not determine macOS LaunchAgents directory.".to_string())?;
+        if enabled {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| format!("Failed to create LaunchAgents directory: {err}"))?;
+            }
+            let label = launch_agent_label(app_name);
+            let content =
+                AutostartManager::format_macos_launch_agent_plist(&label, exe_path, minimized);
+            fs::write(&path, content)
+                .map_err(|err| format!("Failed to write {}: {err}", path.display()))
+        } else {
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(format!("Failed to remove {}: {err}", path.display())),
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 mod imp {
     use std::path::Path;
 
@@ -160,7 +346,7 @@ mod imp {
         enabled: bool,
     ) -> Result<(), String> {
         if enabled {
-            Err("Windows startup registration is only supported on Windows.".to_string())
+            Err("Startup registration is not supported on this platform.".to_string())
         } else {
             Ok(())
         }
@@ -217,5 +403,32 @@ mod tests {
         assert_eq!(unicode.last(), Some(&0));
         let decoded = String::from_utf16(&unicode[..unicode.len() - 1]).expect("valid utf-16");
         assert_eq!(decoded, "Śx📷");
+    }
+
+    #[test]
+    fn formats_linux_xdg_desktop_entry_and_macos_launch_agent_plist() {
+        let linux_entry = AutostartManager::format_linux_desktop_entry(
+            "VoltShot",
+            Path::new("/usr/local/bin/voltshot"),
+            true,
+        );
+        assert!(linux_entry.contains("[Desktop Entry]"));
+        assert!(linux_entry.contains("Name=VoltShot"));
+        assert!(linux_entry.contains("Exec=\"/usr/local/bin/voltshot\" --minimized"));
+        assert!(linux_entry.contains("Icon=voltshot"));
+        assert!(linux_entry.contains("X-GNOME-Autostart-enabled=true"));
+
+        let mac_plist = AutostartManager::format_macos_launch_agent_plist(
+            "io.voltshot.app",
+            Path::new("/Applications/VoltShot & Tools/VoltShot.app/Contents/MacOS/voltshot"),
+            true,
+        );
+        assert!(mac_plist.contains("<string>io.voltshot.app</string>"));
+        assert!(mac_plist.contains(
+            "<string>/Applications/VoltShot &amp; Tools/VoltShot.app/Contents/MacOS/voltshot</string>"
+        ));
+        assert!(mac_plist.contains("<string>--minimized</string>"));
+        assert!(mac_plist.contains("<key>RunAtLoad</key>"));
+        assert!(AutostartManager::is_supported());
     }
 }

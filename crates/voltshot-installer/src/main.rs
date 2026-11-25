@@ -9,7 +9,9 @@ use std::env;
 #[cfg(any(target_os = "windows", test))]
 use std::fs::{self, File};
 #[cfg(any(target_os = "windows", test))]
-use std::io::{self, Read};
+use std::io;
+#[cfg(target_os = "windows")]
+use std::io::Read;
 #[cfg(any(target_os = "windows", test))]
 use std::path::Path;
 use std::path::PathBuf;

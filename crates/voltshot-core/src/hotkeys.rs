@@ -410,8 +410,79 @@ pub struct HotkeyBinding {
     pub enabled: bool,
 }
 
-/// Returns the default VoltShot global hotkey set.
+/// Returns the default VoltShot global hotkey set for the current operating system.
 pub fn default_voltshot_hotkeys() -> Vec<HotkeyBinding> {
+    default_voltshot_hotkeys_for_os(cfg!(target_os = "macos"))
+}
+
+/// Returns the default VoltShot global hotkey set for Windows/Linux (`is_macos = false`)
+/// or macOS (`is_macos = true`, avoiding the absent `PrintScreen` key and macOS screenshot shortcuts).
+pub fn default_voltshot_hotkeys_for_os(is_macos: bool) -> Vec<HotkeyBinding> {
+    if is_macos {
+        let ctrl_shift = KeyModifiers {
+            ctrl: true,
+            shift: true,
+            alt: false,
+            meta: false,
+        };
+        return vec![
+            HotkeyBinding {
+                id: "capture-fullscreen".into(),
+                action: HotkeyAction::CaptureFullscreen,
+                combo: Some(HotkeyCombo::new(ctrl_shift, KeyCode::Digit1)),
+                enabled: true,
+            },
+            HotkeyBinding {
+                id: "capture-region".into(),
+                action: HotkeyAction::CaptureRegion,
+                combo: Some(HotkeyCombo::new(ctrl_shift, KeyCode::Digit2)),
+                enabled: true,
+            },
+            HotkeyBinding {
+                id: "capture-active-window".into(),
+                action: HotkeyAction::CaptureActiveWindow,
+                combo: Some(HotkeyCombo::new(ctrl_shift, KeyCode::Digit3)),
+                enabled: true,
+            },
+            HotkeyBinding {
+                id: "capture-last-region".into(),
+                action: HotkeyAction::CaptureLastRegion,
+                combo: Some(HotkeyCombo::new(ctrl_shift, KeyCode::Digit4)),
+                enabled: true,
+            },
+            HotkeyBinding {
+                id: "open-editor".into(),
+                action: HotkeyAction::OpenEditor,
+                combo: Some(HotkeyCombo::new(ctrl_shift, KeyCode::KeyE)),
+                enabled: true,
+            },
+            HotkeyBinding {
+                id: "record-video".into(),
+                action: HotkeyAction::RecordVideo,
+                combo: Some(HotkeyCombo::new(ctrl_shift, KeyCode::KeyR)),
+                enabled: true,
+            },
+            HotkeyBinding {
+                id: "record-gif".into(),
+                action: HotkeyAction::RecordGif,
+                combo: Some(HotkeyCombo::new(ctrl_shift, KeyCode::KeyG)),
+                enabled: true,
+            },
+            HotkeyBinding {
+                id: "capture-ocr".into(),
+                action: HotkeyAction::CaptureOcr,
+                combo: Some(HotkeyCombo::new(ctrl_shift, KeyCode::KeyO)),
+                enabled: true,
+            },
+            HotkeyBinding {
+                id: "pick-screen-color".into(),
+                action: HotkeyAction::PickScreenColor,
+                combo: Some(HotkeyCombo::new(ctrl_shift, KeyCode::KeyC)),
+                enabled: true,
+            },
+        ];
+    }
+
     vec![
         HotkeyBinding {
             id: "capture-fullscreen".into(),
@@ -530,7 +601,7 @@ mod tests {
 
     #[test]
     fn default_hotkeys_include_standard_voltshot_bindings() {
-        let defaults = default_voltshot_hotkeys();
+        let defaults = default_voltshot_hotkeys_for_os(false);
         assert_eq!(defaults.len(), 9);
         assert!(
             defaults
@@ -587,5 +658,23 @@ mod tests {
             assert_eq!(binding.combo, Some(HotkeyCombo::parse(combo).unwrap()));
             assert!(binding.enabled);
         }
+
+        let mac_defaults = default_voltshot_hotkeys_for_os(true);
+        assert_eq!(mac_defaults.len(), 9);
+        assert!(
+            mac_defaults
+                .iter()
+                .map(|binding| binding.action)
+                .eq(HotkeyAction::ALL)
+        );
+        assert!(
+            mac_defaults
+                .iter()
+                .all(|b| b.combo.is_some_and(|c| c.key != KeyCode::PrintScreen))
+        );
+        assert_eq!(
+            mac_defaults[1].combo.map(|c| c.to_string()).as_deref(),
+            Some("Ctrl + Shift + 2")
+        );
     }
 }

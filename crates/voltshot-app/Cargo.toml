@@ -56,6 +56,16 @@ windows-sys = { version = "0.59", features = [
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 global-hotkey.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+fs2 = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = "0.21"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+tray-icon = "0.21"
+
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"
 
