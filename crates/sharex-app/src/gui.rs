@@ -399,6 +399,14 @@ impl SharexGuiApp {
             .unwrap_or_else(|| i18n::strings(self.language).status_unbound.to_owned())
     }
 
+    fn request_full_quit(&mut self, ctx: &egui::Context) {
+        self.force_quit = true;
+        self.hidden_wake_frames = self.hidden_wake_frames.max(6);
+        self.hidden_pump.set_interval_ms(16);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        crate::win_focus::close_main_window_now();
+    }
+
     fn handle_tray_action(&mut self, ctx: &egui::Context, action: TrayAction) {
         match action {
             TrayAction::CaptureFullscreen => {
@@ -411,6 +419,8 @@ impl SharexGuiApp {
                 self.capture_source(ctx, CaptureSource::ActiveWindow);
             }
             TrayAction::OpenMainWindow => {
+                self.hidden_wake_frames = self.hidden_wake_frames.max(4);
+                crate::win_focus::restore_main_window();
                 show_main_window(ctx);
             }
             TrayAction::OpenScreenshotsFolder => {
@@ -418,8 +428,7 @@ impl SharexGuiApp {
                 open_folder_in_os(&self.config.output_dir);
             }
             TrayAction::Quit => {
-                self.force_quit = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.request_full_quit(ctx);
             }
         }
     }
@@ -2774,7 +2783,7 @@ impl eframe::App for SharexGuiApp {
         let hidden = crate::win_focus::is_main_window_hidden();
         let pump_ms = if !hidden {
             0
-        } else if waking_after_close {
+        } else if waking_after_close || self.force_quit {
             16
         } else if self.recording.is_recording()
             || self.recording.is_finalizing()
@@ -2848,6 +2857,27 @@ impl eframe::App for SharexGuiApp {
                                 .size(11.5_f32)
                                 .color(p.text_muted),
                         );
+
+                        ui.add_space(6.0_f32);
+                        let quit_btn = egui::Button::new(
+                            RichText::new(i18n::strings(self.language).close)
+                                .size(11.0_f32)
+                                .color(p.danger),
+                        )
+                        .fill(Color32::from_rgba_unmultiplied(239, 68, 68, 22))
+                        .stroke(Stroke::new(
+                            1.0_f32,
+                            Color32::from_rgba_unmultiplied(239, 68, 68, 70),
+                        ))
+                        .corner_radius(CornerRadius::same(4))
+                        .min_size(Vec2::new(42.0_f32, 18.0_f32));
+                        if ui
+                            .add(quit_btn)
+                            .on_hover_text("Exit ShareX completely (stops tray & hotkeys)")
+                            .clicked()
+                        {
+                            self.request_full_quit(ctx);
+                        }
 
                         if self.watcher.is_active() && self.watcher.watched_count() > 0 {
                             ui.add_space(6.0_f32);

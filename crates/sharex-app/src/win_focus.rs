@@ -17,7 +17,7 @@ mod imp {
         AllowSetForegroundWindow, BringWindowToTop, ClipCursor, FindWindowW, GetForegroundWindow,
         GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, PostMessageW, SW_RESTORE, SW_SHOW,
         SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
-        WM_PAINT,
+        WM_CLOSE, WM_PAINT,
     };
 
     const SINGLE_INSTANCE_MUTEX: &str = "Local\\ShareX_Rust_SingleInstance_v1";
@@ -79,6 +79,28 @@ mod imp {
         let hwnd = find_own_window_by_title(MAIN_WINDOW_TITLE);
         if !hwnd.is_null() && unsafe { IsWindowVisible(hwnd) } == 0 {
             unsafe {
+                PostMessageW(hwnd, WM_PAINT, 0, 0);
+            }
+        }
+    }
+
+    pub fn restore_main_window() {
+        let hwnd = find_own_window_by_title(MAIN_WINDOW_TITLE);
+        if !hwnd.is_null() {
+            unsafe {
+                ShowWindow(hwnd, SW_SHOW);
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+                PostMessageW(hwnd, WM_PAINT, 0, 0);
+            }
+        }
+    }
+
+    pub fn close_main_window_now() {
+        let hwnd = find_own_window_by_title(MAIN_WINDOW_TITLE);
+        if !hwnd.is_null() {
+            unsafe {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
                 PostMessageW(hwnd, WM_PAINT, 0, 0);
             }
         }
@@ -215,6 +237,10 @@ mod imp {
 
     pub fn wake_hidden_main_window() {}
 
+    pub fn restore_main_window() {}
+
+    pub fn close_main_window_now() {}
+
     pub fn allow_self_foreground() {}
 
     pub fn release_cursor_clip() {}
@@ -236,5 +262,6 @@ mod imp {
 
 pub use imp::{
     OverlayFocusGuard, SingleInstanceGuard, acquire_single_instance, allow_self_foreground,
-    is_main_window_hidden, release_cursor_clip, trim_working_set, wake_hidden_main_window,
+    close_main_window_now, is_main_window_hidden, release_cursor_clip, restore_main_window,
+    trim_working_set, wake_hidden_main_window,
 };

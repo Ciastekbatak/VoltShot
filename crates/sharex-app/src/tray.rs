@@ -109,7 +109,9 @@ mod windows {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-    use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
+    use tray_icon::{
+        Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::GetShellWindow;
 
     const ICON_SIZE: u32 = 32;
@@ -158,7 +160,13 @@ mod windows {
                             .try_iter()
                             .filter_map(|event| menu_map.action_for(event.id()));
                         let icon_actions = icon_events.try_iter().filter_map(|event| match event {
-                            TrayIconEvent::DoubleClick {
+                            TrayIconEvent::Click {
+                                id,
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up,
+                                ..
+                            }
+                            | TrayIconEvent::DoubleClick {
                                 id,
                                 button: MouseButton::Left,
                                 ..
@@ -214,7 +222,7 @@ mod windows {
                 ("Open Main Window", TrayAction::OpenMainWindow),
                 ("Open Screenshots Folder", TrayAction::OpenScreenshotsFolder),
             ],
-            &[("Quit", TrayAction::Quit)],
+            &[("Quit ShareX", TrayAction::Quit)],
         ];
         for (index, group) in groups.into_iter().enumerate() {
             if index != 0 {
