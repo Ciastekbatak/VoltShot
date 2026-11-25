@@ -66,9 +66,15 @@ fn compiled_binary_serves_help_uploaders_config_history_and_hotkeys_commands() {
         .expect("run voltshot hotkeys");
     assert!(hotkeys_out.status.success());
     let hk_text = String::from_utf8_lossy(&hotkeys_out.stdout);
-    assert!(hk_text.contains("PrintScreen"));
-    assert!(hk_text.contains("Ctrl + PrintScreen"));
-    assert!(hk_text.contains("Alt + PrintScreen"));
+    if cfg!(target_os = "macos") {
+        assert!(hk_text.contains("Ctrl + Shift + 1"));
+        assert!(hk_text.contains("Ctrl + Shift + 2"));
+        assert!(hk_text.contains("Ctrl + Shift + 3"));
+    } else {
+        assert!(hk_text.contains("PrintScreen"));
+        assert!(hk_text.contains("Ctrl + PrintScreen"));
+        assert!(hk_text.contains("Alt + PrintScreen"));
+    }
     assert!(hk_text.contains("Ctrl + Shift + O"));
     assert!(hk_text.contains("Ctrl + Shift + C"));
 }

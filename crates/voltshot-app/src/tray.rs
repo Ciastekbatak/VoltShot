@@ -313,12 +313,12 @@ mod native {
                     .map_err(|_| "Linux tray thread exited during initialization".to_owned())??;
 
                 let (stop, worker) = spawn_event_worker(ctx, action_tx, menu_map, icon_id)?;
-                return Ok(Self {
+                Ok(Self {
                     stop,
                     worker: Some(worker),
                     gtk_thread: Some(gtk_thread),
                     _active: active,
-                });
+                })
             }
 
             #[cfg(not(target_os = "linux"))]
