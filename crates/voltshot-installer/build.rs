@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_embedded_payload)");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=../../assets/sharex.ico");
+    println!("cargo:rerun-if-changed=../../assets/voltshot.ico");
     println!("cargo:rerun-if-env-changed=VOLTSHOT_EMBED_PAYLOAD");
     println!("cargo:rerun-if-env-changed=VOLTSHOT_PAYLOAD_PATH");
 
@@ -37,7 +37,7 @@ fn resolve_payload_source() -> Option<PathBuf> {
         }
     }
     if env::var("VOLTSHOT_EMBED_PAYLOAD").as_deref() == Ok("1") {
-        let default_exe = PathBuf::from("../../target/release/sharex.exe");
+        let default_exe = PathBuf::from("../../target/release/voltshot.exe");
         if default_exe.is_file() {
             return Some(default_exe);
         }
@@ -58,7 +58,7 @@ fn compress_payload(src: &Path, dst: &Path) -> io::Result<()> {
 #[cfg(target_os = "windows")]
 fn compile_windows_resources() {
     let mut res = winresource::WindowsResource::new();
-    res.set_icon("../../assets/sharex.ico")
+    res.set_icon("../../assets/voltshot.ico")
         .set("ProductName", "VoltShot Setup")
         .set(
             "FileDescription",

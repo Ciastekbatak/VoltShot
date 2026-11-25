@@ -205,7 +205,6 @@ mod platform {
     const APP_PATHS_REG_SUBKEY: &str =
         r"Software\Microsoft\Windows\CurrentVersion\App Paths\VoltShot.exe";
     const RUN_REG_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-    const LEGACY_RUN_VALUE: &str = "ShareX-RS";
 
     struct RegKeyGuard(HKEY);
 
@@ -411,7 +410,6 @@ mod platform {
 
         stop_running_app();
         remove_autostart_entry(APP_NAME);
-        remove_autostart_entry(LEGACY_RUN_VALUE);
         delete_registry_tree(UNINSTALL_REG_SUBKEY);
         delete_registry_tree(APP_PATHS_REG_SUBKEY);
 
@@ -597,7 +595,6 @@ mod platform {
     }
 
     fn set_autostart(exe_path: &Path, enabled: bool) -> Result<(), String> {
-        remove_autostart_entry(LEGACY_RUN_VALUE);
         if enabled {
             let key = create_registry_key(RUN_REG_SUBKEY)?;
             set_reg_sz(

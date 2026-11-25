@@ -12,7 +12,7 @@ So I started building **VoltShot** from the ground up in Rust with native Direct
 
 ## ⚡ VoltShot vs Original ShareX (Measured on Windows 11)
 
-![VoltShot vs ShareX Benchmark](https://raw.githubusercontent.com/sharex-in-rust/sharex-in-rust/master/assets/benchmark-comparison.png)
+![VoltShot vs ShareX Benchmark](https://raw.githubusercontent.com/Ciastekbatak/VoltShot/master/assets/benchmark-comparison.png)
 
 | Metric | Original ShareX (.NET) | VoltShot v0.1.0 (Rust + DX12) | Improvement |
 | --- | ---: | ---: | --- |

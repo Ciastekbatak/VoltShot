@@ -122,13 +122,13 @@ Requires Rust `1.85+` via `rustup`. On Linux, see [CONTRIBUTING.md](CONTRIBUTING
 cargo test --workspace
 
 # Build VoltShot (release)
-cargo build --release -p sharex-app
+cargo build --release -p voltshot-app
 
 # Build the self-contained Windows Installer (embeds compressed VoltShot.exe)
 VOLTSHOT_EMBED_PAYLOAD=1 cargo build --release -p voltshot-installer
 
 # Run the 1080p effects pipeline benchmark
-cargo run --release -p sharex-effects --example bench_pipeline
+cargo run --release -p voltshot-effects --example bench_pipeline
 ```
 
 ## License

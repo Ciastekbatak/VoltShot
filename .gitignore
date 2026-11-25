@@ -5,5 +5,5 @@
 *.pdb
 .DS_Store
 Thumbs.db
-sharex-data/
+voltshot-data/
 *.local.toml

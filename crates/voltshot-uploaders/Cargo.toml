@@ -1,0 +1,22 @@
+[package]
+name = "voltshot-uploaders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Uploader registry and built-in destinations for VoltShot in Rust."
+
+[dependencies]
+chrono.workspace = true
+fancy-regex = "0.20"
+getrandom = "0.2"
+hmac = "0.12"
+percent-encoding = "2.3"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+voltshot-core = { path = "../voltshot-core" }
+tempfile.workspace = true
+ureq = { version = "3.5", default-features = false, features = ["rustls", "gzip"] }
+url = "2.5"

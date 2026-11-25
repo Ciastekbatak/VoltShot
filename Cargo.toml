@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/sharex-core",
-    "crates/sharex-capture",
-    "crates/sharex-editor",
-    "crates/sharex-effects",
-    "crates/sharex-media",
-    "crates/sharex-tools",
-    "crates/sharex-uploaders",
-    "crates/sharex-app",
+    "crates/voltshot-core",
+    "crates/voltshot-capture",
+    "crates/voltshot-editor",
+    "crates/voltshot-effects",
+    "crates/voltshot-media",
+    "crates/voltshot-tools",
+    "crates/voltshot-uploaders",
+    "crates/voltshot-app",
     "crates/voltshot-installer",
 ]
 
@@ -16,7 +16,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/sharex-in-rust/sharex-in-rust"
+repository = "https://github.com/Ciastekbatak/VoltShot"
 rust-version = "1.85"
 
 [workspace.dependencies]

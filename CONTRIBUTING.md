@@ -1,6 +1,6 @@
-# Contributing to ShareX in Rust
+# Contributing to VoltShot in Rust
 
-Every pull request must keep `sharex-core` free of OS capture, clipboard, and GUI dependencies. Put platform code in `sharex-capture` or `sharex-app`, and put destination plugins in `sharex-uploaders`.
+Every pull request must keep `voltshot-core` free of OS capture, clipboard, and GUI dependencies. Put platform code in `voltshot-capture` or `voltshot-app`, and put destination plugins in `voltshot-uploaders`.
 
 ## Prerequisites
 
@@ -38,14 +38,14 @@ cargo test --workspace
 
 ## Add a new uploader
 
-1. Create a module under `crates/sharex-uploaders/src/`.
-2. Implement the `sharex_core::Uploader` trait (`id`, `name`, `description`, `upload`).
-3. Register the uploader in `UploaderRegistry` inside `crates/sharex-uploaders/src/lib.rs`.
+1. Create a module under `crates/voltshot-uploaders/src/`.
+2. Implement the `voltshot_core::Uploader` trait (`id`, `name`, `description`, `upload`).
+3. Register the uploader in `UploaderRegistry` inside `crates/voltshot-uploaders/src/lib.rs`.
 4. Add unit tests that verify the observable behavior of `upload` against a local mock or temporary directory.
 
 ## Architecture rules
 
-- Validate untrusted input at boundaries (CLI flags, TOML config, region strings, external API responses) and convert it into typed models in `sharex-core`.
+- Validate untrusted input at boundaries (CLI flags, TOML config, region strings, external API responses) and convert it into typed models in `voltshot-core`.
 - Prefer enums and validated structs over loose booleans or stringly typed flags.
 - Write tests against public crate interfaces so internal refactors do not break tests.
 - Keep pull requests focused on one crate or one feature slice.
