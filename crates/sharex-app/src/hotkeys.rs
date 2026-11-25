@@ -12,7 +12,6 @@ pub struct TriggeredHotkey {
     pub id: String,
     pub action: sharex_core::HotkeyAction,
     pub pre_snapshot: Option<sharex_capture::DesktopSnapshot>,
-    pub pre_windows: Option<Vec<sharex_core::WindowInfo>>,
 }
 
 #[cfg(target_os = "windows")]
@@ -160,20 +159,6 @@ mod platform {
         apply_win32_bindings(&desired, &statuses, &mut registered);
         let _ = ready_tx.send(tid);
 
-        let (win_req_tx, win_req_rx) = mpsc::channel::<()>();
-        let (win_res_tx, win_res_rx) = mpsc::channel::<Option<Vec<sharex_core::WindowInfo>>>();
-        let _win_worker = thread::Builder::new()
-            .name("voltshot-snap-windows".into())
-            .spawn(move || {
-                let capturer = XcapCapturer::new();
-                while win_req_rx.recv().is_ok() {
-                    if win_res_tx.send(capturer.list_snap_windows().ok()).is_err() {
-                        break;
-                    }
-                }
-            });
-        let capturer = XcapCapturer::new();
-
         loop {
             let ret = unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) };
             if ret <= 0 {
@@ -184,30 +169,23 @@ mod platform {
                     let id = msg.wParam as i32;
                     if let Some((binding_id, action)) = registered.get(&id) {
                         win_focus::allow_self_foreground();
-                        let (pre_snapshot, pre_windows) = if matches!(
+                        let pre_snapshot = if matches!(
                             action,
                             HotkeyAction::CaptureRegion
                                 | HotkeyAction::CaptureOcr
                                 | HotkeyAction::PickScreenColor
                         ) {
-                            let need_windows = *action != HotkeyAction::PickScreenColor
-                                && win_req_tx.send(()).is_ok();
-                            let snap = crate::gui::capture_overlay_snapshot(&capturer).ok();
-                            let windows = if need_windows {
-                                win_res_rx.recv().ok().flatten()
-                            } else {
-                                None
-                            };
+                            let snap =
+                                crate::gui::capture_overlay_snapshot(&XcapCapturer::new()).ok();
                             win_focus::release_cursor_clip();
-                            (snap, windows)
+                            snap
                         } else {
-                            (None, None)
+                            None
                         };
                         let _ = action_tx.send(TriggeredHotkey {
                             id: binding_id.clone(),
                             action: *action,
                             pre_snapshot,
-                            pre_windows,
                         });
                         ctx.request_repaint();
                         win_focus::wake_hidden_main_window();
@@ -550,7 +528,6 @@ mod platform {
                         id: binding_id.clone(),
                         action: *action,
                         pre_snapshot: None,
-                        pre_windows: None,
                     });
                 }
             }

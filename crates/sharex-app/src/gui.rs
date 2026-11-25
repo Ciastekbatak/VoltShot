@@ -445,7 +445,6 @@ impl SharexGuiApp {
                     ctx,
                     OverlayMode::Capture,
                     event.pre_snapshot,
-                    event.pre_windows,
                     Some(settings),
                 );
             }
@@ -486,22 +485,10 @@ impl SharexGuiApp {
                 self.active_view = ActiveView::Recording;
             }
             HotkeyAction::CaptureOcr => {
-                self.start_overlay(
-                    ctx,
-                    OverlayMode::Ocr,
-                    event.pre_snapshot,
-                    event.pre_windows,
-                    None,
-                );
+                self.start_overlay(ctx, OverlayMode::Ocr, event.pre_snapshot, None);
             }
             HotkeyAction::PickScreenColor => {
-                self.start_overlay(
-                    ctx,
-                    OverlayMode::ColorPicker,
-                    event.pre_snapshot,
-                    event.pre_windows,
-                    None,
-                );
+                self.start_overlay(ctx, OverlayMode::ColorPicker, event.pre_snapshot, None);
             }
         }
     }
@@ -527,7 +514,6 @@ impl SharexGuiApp {
         ctx: &egui::Context,
         mode: OverlayMode,
         pre_snapshot: Option<DesktopSnapshot>,
-        pre_windows: Option<Vec<sharex_core::WindowInfo>>,
         capture_settings: Option<CaptureSettings>,
     ) {
         if self.overlay.is_some() || (mode == OverlayMode::Ocr && self.ocr_pending.is_some()) {
@@ -536,12 +522,7 @@ impl SharexGuiApp {
         let snapshot = pre_snapshot.map_or_else(|| capture_overlay_snapshot(&self.capturer), Ok);
         match snapshot {
             Ok(snapshot) => {
-                self.overlay = Some(RegionOverlayState::open_with_preloaded(
-                    ctx,
-                    snapshot,
-                    pre_windows,
-                    mode,
-                ));
+                self.overlay = Some(RegionOverlayState::open_with_mode(ctx, snapshot, mode));
                 self.overlay_capture_settings = capture_settings;
                 self.status_line = match mode {
                     OverlayMode::Capture => "Select a region to capture. Esc to cancel.",
@@ -563,14 +544,14 @@ impl SharexGuiApp {
     }
 
     fn start_overlay_with_mode(&mut self, ctx: &egui::Context, mode: OverlayMode) {
-        self.start_overlay(ctx, mode, None, None, None);
+        self.start_overlay(ctx, mode, None, None);
     }
 
     fn capture_last_region(&mut self, ctx: &egui::Context, settings: CaptureSettings) {
         if let Some(region) = self.config.last_region {
             self.capture_source_with_settings(ctx, CaptureSource::Region { region }, settings);
         } else {
-            self.start_overlay(ctx, OverlayMode::Capture, None, None, Some(settings));
+            self.start_overlay(ctx, OverlayMode::Capture, None, Some(settings));
         }
     }
 

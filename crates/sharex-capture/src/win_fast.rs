@@ -1,7 +1,4 @@
-use std::{
-    mem::{self, MaybeUninit},
-    ptr, slice,
-};
+use std::{mem, ptr, slice};
 
 use sharex_core::{CapturedImage, CoreError, WindowId, WindowInfo};
 use windows_sys::Win32::{
@@ -24,9 +21,9 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::{
         EnumWindows, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetLayeredWindowAttributes,
         GetSystemMetrics, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-        GetWindowThreadProcessId, IsIconic, IsWindowVisible, LWA_ALPHA, SM_CXSCREEN,
-        SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-        WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WSF_VISIBLE,
+        GetWindowThreadProcessId, IsIconic, IsWindowVisible, LWA_ALPHA, SM_CXVIRTUALSCREEN,
+        SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WS_EX_LAYERED,
+        WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WSF_VISIBLE,
     },
 };
 
@@ -116,40 +113,14 @@ pub(super) fn capture_screen_area(
     }
 
     let src = unsafe { slice::from_raw_parts(bits.cast::<u8>(), len) };
-    let rgba = bgra_to_rgba_opaque(src);
+    let mut rgba = vec![0u8; len];
+    for (dst_px, src_px) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        dst_px[0] = src_px[2];
+        dst_px[1] = src_px[1];
+        dst_px[2] = src_px[0];
+        dst_px[3] = 255;
+    }
     CapturedImage::from_rgba(width, height, rgba)
-}
-
-pub(super) fn primary_monitor_rect_win32() -> Option<(i32, i32, u32, u32)> {
-    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    (width > 0 && height > 0).then_some((0, 0, width as u32, height as u32))
-}
-
-fn bgra_to_rgba_opaque(src: &[u8]) -> Vec<u8> {
-    let len = src.len();
-    let mut rgba: Vec<u8> = Vec::with_capacity(len);
-    convert_bgra_stripe(src, &mut rgba.spare_capacity_mut()[..len]);
-    unsafe {
-        rgba.set_len(len);
-    }
-    rgba
-}
-
-#[inline]
-fn convert_bgra_stripe(src: &[u8], dst: &mut [MaybeUninit<u8>]) {
-    for (dst_px, src_px) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-        let bgra = u32::from_le_bytes([src_px[0], src_px[1], src_px[2], src_px[3]]);
-        let rgba = (bgra & 0x0000_FF00)
-            | ((bgra & 0x00FF_0000) >> 16)
-            | ((bgra & 0x0000_00FF) << 16)
-            | 0xFF00_0000;
-        let bytes = rgba.to_le_bytes();
-        dst_px[0].write(bytes[0]);
-        dst_px[1].write(bytes[1]);
-        dst_px[2].write(bytes[2]);
-        dst_px[3].write(bytes[3]);
-    }
 }
 
 fn virtual_screen() -> Option<ScreenRect> {
@@ -370,36 +341,4 @@ fn is_cloaked(hwnd: HWND) -> bool {
         )
     };
     result >= 0 && cloaked != 0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bgra_to_rgba_opaque_swizzles_small_and_multithreaded_buffers() {
-        let small = [10u8, 20, 30, 0, 100, 150, 200, 42];
-        assert_eq!(
-            bgra_to_rgba_opaque(&small),
-            vec![30, 20, 10, 255, 200, 150, 100, 255]
-        );
-
-        let pixel_count = 100_000usize;
-        let mut large = Vec::with_capacity(pixel_count * 4);
-        for i in 0..pixel_count {
-            large.extend_from_slice(&[
-                (i % 251) as u8,
-                ((i * 3) % 251) as u8,
-                ((i * 7) % 251) as u8,
-                0,
-            ]);
-        }
-        let converted = bgra_to_rgba_opaque(&large);
-        assert_eq!(converted.len(), large.len());
-        for i in [0, 1, 12345, pixel_count / 2, pixel_count - 1] {
-            let s = &large[i * 4..i * 4 + 4];
-            let d = &converted[i * 4..i * 4 + 4];
-            assert_eq!(d, &[s[2], s[1], s[0], 255]);
-        }
-    }
 }

@@ -6,11 +6,11 @@ use eframe::egui::{
     self, Color32, CornerRadius, FontId, Margin, Pos2, Rect, RichText, Sense, Shadow, Stroke, Vec2,
 };
 use sharex_capture::{DesktopSnapshot, XcapCapturer, find_window_at_point};
-use sharex_core::{CapturedImage, Region, WindowInfo};
+use sharex_core::{CapturedImage, Region, ScreenCapturer, WindowInfo};
 use sharex_editor::{AnnotationKind, EditorDocument, Point, RectF, RgbaColor, SHAREX_PALETTE};
 use sharex_tools::{ColorSample, sample_image};
 
-const OVERLAY_WINDOW_TITLE: &str = "VoltShot Region Capture";
+const OVERLAY_WINDOW_TITLE: &str = "ShareX Region Capture";
 const MIN_REGION_DRAG: f32 = 4.0;
 const MAGNIFIER_HALF_EXTENT: i32 = 5;
 const MIN_LOUPE_HALF_EXTENT: i32 = 3;
@@ -238,7 +238,6 @@ pub struct RegionOverlayState {
     texture: egui::TextureHandle,
     focus_guard: OverlayFocusGuard,
     focus_acquired: bool,
-    overlay_revealed: bool,
     viewport_fitted: bool,
     viewport_inner_size: Option<Vec2>,
     active_tool: OverlayTool,
@@ -269,35 +268,26 @@ impl RegionOverlayState {
         snapshot: DesktopSnapshot,
         mode: OverlayMode,
     ) -> Self {
-        Self::open_with_preloaded(ctx, snapshot, None, mode)
-    }
-
-    /// Opens the overlay using pre-enumerated snap windows when captured in parallel with the desktop.
-    pub fn open_with_preloaded(
-        ctx: &egui::Context,
-        snapshot: DesktopSnapshot,
-        pre_windows: Option<Vec<WindowInfo>>,
-        mode: OverlayMode,
-    ) -> Self {
         let focus_guard = OverlayFocusGuard::capture_current_foreground();
         let capturer = XcapCapturer::new();
         let mut windows = if mode == OverlayMode::ColorPicker {
             Vec::new()
         } else {
-            pre_windows.unwrap_or_else(|| capturer.list_snap_windows().unwrap_or_default())
+            capturer.list_snap_windows().unwrap_or_default()
         };
         windows.retain(|window| {
             !window.title.contains("ShareX") && !window.title.contains("VoltShot")
         });
-        let primary_monitor = capturer
-            .primary_monitor_rect()
-            .map(|(x, y, width, height)| RectF {
-                x: (i64::from(x) - i64::from(snapshot.origin_x)) as f32,
-                y: (i64::from(y) - i64::from(snapshot.origin_y)) as f32,
-                width: width as f32,
-                height: height as f32,
-            });
-        let color_img = crate::image_texture::bounded_opaque_color_image(
+        let primary_monitor = capturer.list_monitors().ok().and_then(|monitors| {
+            let primary = monitors.into_iter().find(|monitor| monitor.is_primary)?;
+            Some(RectF {
+                x: (i64::from(primary.x) - i64::from(snapshot.origin_x)) as f32,
+                y: (i64::from(primary.y) - i64::from(snapshot.origin_y)) as f32,
+                width: primary.width as f32,
+                height: primary.height as f32,
+            })
+        });
+        let color_img = crate::image_texture::bounded_color_image(
             &snapshot.image,
             ctx.input(|input| input.max_texture_side),
         );
@@ -315,7 +305,6 @@ impl RegionOverlayState {
             texture,
             focus_guard,
             focus_acquired: false,
-            overlay_revealed: false,
             viewport_fitted: false,
             viewport_inner_size: None,
             active_tool: OverlayTool::Region,
@@ -366,59 +355,38 @@ impl RegionOverlayState {
         let img_w = self.document.base_image().width() as f32;
         let img_h = self.document.base_image().height() as f32;
 
-        let reveal_now = self.overlay_revealed;
         let builder = egui::ViewportBuilder::default()
             .with_title(OVERLAY_WINDOW_TITLE)
             .with_decorations(false)
             .with_always_on_top()
             .with_resizable(false)
-            .with_taskbar(false)
-            .with_transparent(false)
-            .with_visible(reveal_now)
             .with_clamp_size_to_monitor_size(false)
             .with_position([self.origin_x as f32 / ppp, self.origin_y as f32 / ppp])
             .with_inner_size([img_w / ppp, img_h / ppp])
-            .with_active(reveal_now);
+            .with_active(true);
 
         let mut outcome = OverlayModeOutcome::Pending;
-        let mut revealed_this_frame = false;
 
         ctx.show_viewport_immediate(viewport_id, builder, |overlay_ctx, class| {
             if class != egui::ViewportClass::Embedded {
-                if !self.overlay_revealed {
-                    let prepared = crate::win_focus::prepare_overlay_window(
-                        OVERLAY_WINDOW_TITLE,
-                        self.origin_x,
-                        self.origin_y,
-                        img_w as i32,
-                        img_h as i32,
-                    );
-                    if prepared {
-                        self.viewport_fitted = true;
-                    }
-                    self.overlay_revealed = true;
-                    revealed_this_frame = true;
-                    overlay_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                } else {
-                    let ppp = overlay_ctx.pixels_per_point();
-                    let size = Vec2::new(img_w, img_h) / ppp;
-                    let (inner, outer, focused) = overlay_ctx.input(|input| {
-                        let viewport = input.viewport();
-                        (viewport.inner_rect, viewport.outer_rect, viewport.focused)
-                    });
-                    let inner_size = inner.map(|rect| rect.size());
-                    if !self.viewport_fitted
-                        || inner_size != self.viewport_inner_size
-                        || inner_size.is_some_and(|current| exceeds_half_pixel(size - current, ppp))
-                    {
-                        self.viewport_inner_size = inner_size;
-                        self.fit_viewport_to_snapshot(overlay_ctx, size, inner, outer);
-                    }
+                let ppp = overlay_ctx.pixels_per_point();
+                let size = Vec2::new(img_w, img_h) / ppp;
+                let (inner, outer, focused) = overlay_ctx.input(|input| {
+                    let viewport = input.viewport();
+                    (viewport.inner_rect, viewport.outer_rect, viewport.focused)
+                });
+                let inner_size = inner.map(|rect| rect.size());
+                if !self.viewport_fitted
+                    || inner_size != self.viewport_inner_size
+                    || inner_size.is_some_and(|current| exceeds_half_pixel(size - current, ppp))
+                {
+                    self.viewport_inner_size = inner_size;
+                    self.fit_viewport_to_snapshot(overlay_ctx, size, inner, outer);
+                }
+                if !self.focus_acquired {
+                    self.focus_acquired = focused == Some(true);
                     if !self.focus_acquired {
-                        self.focus_acquired = focused == Some(true);
-                        if !self.focus_acquired {
-                            self.focus_guard.enforce_overlay_focus(OVERLAY_WINDOW_TITLE);
-                        }
+                        self.focus_guard.enforce_overlay_focus(OVERLAY_WINDOW_TITLE);
                     }
                 }
             }
@@ -908,9 +876,6 @@ impl RegionOverlayState {
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(false));
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
             ctx.request_repaint();
-        } else if revealed_this_frame {
-            self.focus_guard.enforce_overlay_focus(OVERLAY_WINDOW_TITLE);
-            self.focus_acquired = true;
         }
 
         outcome
