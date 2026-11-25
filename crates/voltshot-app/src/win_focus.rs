@@ -124,9 +124,10 @@ mod imp {
         }
         unsafe {
             let module = GetModuleHandleW(ptr::null());
+            let icon_res = ptr::without_provenance::<u16>(1);
             let big = LoadImageW(
                 module,
-                1 as *const u16,
+                icon_res,
                 IMAGE_ICON,
                 0,
                 0,
@@ -137,14 +138,7 @@ mod imp {
             }
             let small_w = GetSystemMetrics(SM_CXSMICON);
             let small_h = GetSystemMetrics(SM_CYSMICON);
-            let small = LoadImageW(
-                module,
-                1 as *const u16,
-                IMAGE_ICON,
-                small_w,
-                small_h,
-                LR_SHARED,
-            );
+            let small = LoadImageW(module, icon_res, IMAGE_ICON, small_w, small_h, LR_SHARED);
             if !small.is_null() {
                 SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
             }
