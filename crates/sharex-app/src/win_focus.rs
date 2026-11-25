@@ -8,6 +8,9 @@ mod imp {
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND,
     };
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute,
+    };
     use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
     use windows_sys::Win32::System::Threading::{
         AttachThreadInput, CreateMutexW, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
@@ -16,8 +19,8 @@ mod imp {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AllowSetForegroundWindow, BringWindowToTop, ClipCursor, FindWindowW, GetForegroundWindow,
         GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, PostMessageW, SW_RESTORE, SW_SHOW,
-        SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
-        WM_CLOSE, WM_PAINT,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW,
+        SetForegroundWindow, SetWindowPos, ShowWindow, WM_CLOSE, WM_PAINT,
     };
 
     const SINGLE_INSTANCE_MUTEX: &str = "Local\\ShareX_Rust_SingleInstance_v1";
@@ -104,6 +107,38 @@ mod imp {
                 PostMessageW(hwnd, WM_PAINT, 0, 0);
             }
         }
+    }
+
+    pub fn prepare_overlay_window(
+        window_title: &str,
+        origin_x: i32,
+        origin_y: i32,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        let hwnd = find_own_window_by_title(window_title);
+        if hwnd.is_null() {
+            return false;
+        }
+        let disable_transitions: i32 = 1;
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+                (&raw const disable_transitions).cast(),
+                size_of::<i32>() as u32,
+            );
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                origin_x,
+                origin_y,
+                width.max(1),
+                height.max(1),
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            );
+        }
+        true
     }
 
     pub fn allow_self_foreground() {
@@ -241,6 +276,16 @@ mod imp {
 
     pub fn close_main_window_now() {}
 
+    pub fn prepare_overlay_window(
+        _window_title: &str,
+        _origin_x: i32,
+        _origin_y: i32,
+        _width: i32,
+        _height: i32,
+    ) -> bool {
+        false
+    }
+
     pub fn allow_self_foreground() {}
 
     pub fn release_cursor_clip() {}
@@ -262,6 +307,6 @@ mod imp {
 
 pub use imp::{
     OverlayFocusGuard, SingleInstanceGuard, acquire_single_instance, allow_self_foreground,
-    close_main_window_now, is_main_window_hidden, release_cursor_clip, restore_main_window,
-    trim_working_set, wake_hidden_main_window,
+    close_main_window_now, is_main_window_hidden, prepare_overlay_window, release_cursor_clip,
+    restore_main_window, trim_working_set, wake_hidden_main_window,
 };
