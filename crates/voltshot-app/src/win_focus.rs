@@ -12,6 +12,7 @@ mod imp {
     use windows_sys::Win32::Graphics::Dwm::{
         DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute,
     };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
     use windows_sys::Win32::System::Threading::{
         AttachThreadInput, CreateMutexW, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
@@ -19,10 +20,11 @@ mod imp {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AllowSetForegroundWindow, BringWindowToTop, ClipCursor, FindWindowW, GetForegroundWindow,
-        GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, IsWindow, IsWindowVisible,
-        PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-        SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow, WM_CLOSE,
-        WM_PAINT,
+        GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, ICON_BIG,
+        ICON_SMALL, IMAGE_ICON, IsWindow, IsWindowVisible, LR_DEFAULTSIZE, LR_SHARED, LoadImageW,
+        PostMessageW, SM_CXSMICON, SM_CYSMICON, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SendMessageW,
+        SetForegroundWindow, SetWindowPos, ShowWindow, WM_CLOSE, WM_PAINT, WM_SETICON,
     };
 
     const SINGLE_INSTANCE_MUTEX: &str = "Local\\VoltShot_SingleInstance_v1";
@@ -115,9 +117,45 @@ mod imp {
         }
     }
 
+    pub fn apply_main_window_icon() -> bool {
+        let hwnd = cached_main_hwnd();
+        if hwnd.is_null() {
+            return false;
+        }
+        unsafe {
+            let module = GetModuleHandleW(ptr::null());
+            let big = LoadImageW(
+                module,
+                1 as *const u16,
+                IMAGE_ICON,
+                0,
+                0,
+                LR_DEFAULTSIZE | LR_SHARED,
+            );
+            if !big.is_null() {
+                SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, big as isize);
+            }
+            let small_w = GetSystemMetrics(SM_CXSMICON);
+            let small_h = GetSystemMetrics(SM_CYSMICON);
+            let small = LoadImageW(
+                module,
+                1 as *const u16,
+                IMAGE_ICON,
+                small_w,
+                small_h,
+                LR_SHARED,
+            );
+            if !small.is_null() {
+                SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
+            }
+        }
+        true
+    }
+
     pub fn restore_main_window() {
         let hwnd = cached_main_hwnd();
         if !hwnd.is_null() {
+            apply_main_window_icon();
             unsafe {
                 ShowWindow(hwnd, SW_SHOW);
                 ShowWindow(hwnd, SW_RESTORE);
@@ -346,6 +384,10 @@ mod imp {
 
     pub fn wake_hidden_main_window() {}
 
+    pub fn apply_main_window_icon() -> bool {
+        true
+    }
+
     pub fn restore_main_window() {}
 
     pub fn close_main_window_now() {}
@@ -399,7 +441,7 @@ mod imp {
 
 pub use imp::{
     OverlayFocusGuard, SingleInstanceGuard, acquire_single_instance, allow_self_foreground,
-    close_main_window_now, hide_overlay_window, is_main_window_hidden, overlay_window_matches,
-    prepare_overlay_window, release_cursor_clip, restore_main_window, trim_working_set,
-    wake_hidden_main_window, wake_overlay_window,
+    apply_main_window_icon, close_main_window_now, hide_overlay_window, is_main_window_hidden,
+    overlay_window_matches, prepare_overlay_window, release_cursor_clip, restore_main_window,
+    trim_working_set, wake_hidden_main_window, wake_overlay_window,
 };

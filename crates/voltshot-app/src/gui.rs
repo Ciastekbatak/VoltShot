@@ -210,6 +210,7 @@ struct VoltShotGuiApp {
     last_hotkey_retry: Instant,
     started_at: Instant,
     startup_trimmed: bool,
+    window_icon_applied: bool,
     hidden_pump: HiddenWindowPumper,
     hidden_wake_frames: u8,
     capturer: XcapCapturer,
@@ -258,6 +259,7 @@ impl VoltShotGuiApp {
             false
         };
         apply_voltshot_theme(&cc.egui_ctx, config.dark_theme);
+        let window_icon_applied = crate::win_focus::apply_main_window_icon();
         let hotkeys = HotkeyRuntime::new(cc.egui_ctx.clone(), &config.hotkeys);
         let tray = TrayRuntime::new(cc.egui_ctx.clone());
         if start_minimized {
@@ -351,6 +353,7 @@ impl VoltShotGuiApp {
             last_hotkey_retry: Instant::now(),
             started_at: Instant::now(),
             startup_trimmed: false,
+            window_icon_applied,
             hidden_pump: HiddenWindowPumper::spawn(),
             hidden_wake_frames: 0,
             capturer,
@@ -1297,13 +1300,6 @@ impl VoltShotGuiApp {
                     .strong()
                     .color(p.text_primary),
             );
-            egui::Frame::NONE
-                .fill(p.accent_subtle)
-                .corner_radius(CornerRadius::same(4))
-                .inner_margin(Margin::symmetric(5, 1))
-                .show(ui, |ui| {
-                    ui.label(RichText::new("RS").size(9.5_f32).strong().color(p.accent));
-                });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut chosen = self.language;
@@ -2807,6 +2803,9 @@ impl eframe::App for VoltShotGuiApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.window_icon_applied {
+            self.window_icon_applied = crate::win_focus::apply_main_window_icon();
+        }
         if !self.startup_trimmed {
             if self.started_at.elapsed() >= Duration::from_millis(1500) {
                 self.startup_trimmed = true;
