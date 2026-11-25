@@ -316,12 +316,10 @@ impl ToastManager {
                                 tint,
                             );
                         } else {
-                            content_ui.painter().text(
-                                thumb_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "SX",
-                                egui::FontId::proportional(16.0),
-                                accent_color,
+                            crate::theme::paint_brand_mark_in_rect(
+                                content_ui.painter(),
+                                thumb_rect.shrink(4.0_f32),
+                                alpha,
                             );
                         }
                         content_ui.painter().rect_stroke(

@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="https://raw.githubusercontent.com/Ciastekbatak/VoltShot/master/assets/icon.svg" width="72" height="72" alt="VoltShot logo">
+</div>
+
 # ⚡ VoltShot v0.1.0 — First Public Release
 
 > **A next-gen screenshot & capture app — inspired by ShareX, rebuilt from scratch in Rust + DirectX 12.**

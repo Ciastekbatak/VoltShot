@@ -130,93 +130,76 @@ pub fn apply_voltshot_theme(ctx: &egui::Context, dark: bool) {
     ctx.set_style(style);
 }
 
-/// Paints a vector VoltShot rounded-square brand mark with viewfinder corners and a geometric `S`.
-pub fn paint_brand_mark(ui: &mut egui::Ui, size: f32, p: &VoltShotPalette) {
+/// Paints a vector VoltShot rounded-square brand mark with viewfinder corners and a lightning bolt.
+pub fn paint_brand_mark(ui: &mut egui::Ui, size: f32, _p: &VoltShotPalette) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    let painter = ui.painter();
-    let corner = (size * 0.25_f32).round().clamp(3.0_f32, 12.0_f32) as u8;
+    paint_brand_mark_in_rect(ui.painter(), rect, 1.0_f32);
+}
 
-    painter.rect_filled(rect, CornerRadius::same(corner), p.accent);
+/// Paints the VoltShot brand mark inside `rect` with an optional opacity multiplier.
+pub fn paint_brand_mark_in_rect(painter: &egui::Painter, rect: Rect, alpha: f32) {
+    let alpha = alpha.clamp(0.0_f32, 1.0_f32);
+    let with_a = |r: u8, g: u8, b: u8, base_a: f32| {
+        Color32::from_rgba_unmultiplied(r, g, b, (base_a * alpha * 255.0_f32).round() as u8)
+    };
+    let size = rect.width().min(rect.height());
+    let corner = (size * (28.0_f32 / 128.0_f32))
+        .round()
+        .clamp(3.0_f32, 16.0_f32) as u8;
+
+    let bg_rect = rect.shrink(size * (4.0_f32 / 128.0_f32));
+    painter.rect_filled(bg_rect, CornerRadius::same(corner), with_a(19, 30, 63, 1.0));
     painter.rect_stroke(
-        rect,
+        bg_rect,
         CornerRadius::same(corner),
-        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 36)),
+        Stroke::new(
+            (size * (3.0_f32 / 128.0_f32)).max(1.0_f32),
+            with_a(56, 189, 248, 0.35),
+        ),
         egui::StrokeKind::Inside,
     );
 
-    let inset = size * 0.17_f32;
-    let arm = size * 0.16_f32;
-    let inner = Rect::from_min_max(
-        Pos2::new(rect.min.x + inset, rect.min.y + inset),
-        Pos2::new(rect.max.x - inset, rect.max.y - inset),
+    let map = |nx: f32, ny: f32| {
+        Pos2::new(
+            rect.min.x + rect.width() * (nx / 128.0_f32),
+            rect.min.y + rect.height() * (ny / 128.0_f32),
+        )
+    };
+    let frame_stroke = Stroke::new(
+        (size * (7.0_f32 / 128.0_f32)).max(1.25_f32),
+        with_a(96, 202, 250, 1.0),
     );
-    let corner_stroke = Stroke::new(
-        (size * 0.065_f32).max(1.1_f32),
-        Color32::from_rgba_unmultiplied(255, 255, 255, 165),
-    );
+    let corners: [[(f32, f32); 3]; 4] = [
+        [(26.0, 46.0), (26.0, 26.0), (46.0, 26.0)],
+        [(82.0, 26.0), (102.0, 26.0), (102.0, 46.0)],
+        [(102.0, 82.0), (102.0, 102.0), (82.0, 102.0)],
+        [(46.0, 102.0), (26.0, 102.0), (26.0, 82.0)],
+    ];
+    for pts in corners {
+        painter.add(egui::Shape::line(
+            pts.into_iter().map(|(x, y)| map(x, y)).collect(),
+            frame_stroke,
+        ));
+    }
 
-    painter.line_segment(
-        [inner.left_top(), Pos2::new(inner.min.x + arm, inner.min.y)],
-        corner_stroke,
-    );
-    painter.line_segment(
-        [inner.left_top(), Pos2::new(inner.min.x, inner.min.y + arm)],
-        corner_stroke,
-    );
-    painter.line_segment(
-        [inner.right_top(), Pos2::new(inner.max.x - arm, inner.min.y)],
-        corner_stroke,
-    );
-    painter.line_segment(
-        [inner.right_top(), Pos2::new(inner.max.x, inner.min.y + arm)],
-        corner_stroke,
-    );
-    painter.line_segment(
-        [
-            inner.left_bottom(),
-            Pos2::new(inner.min.x + arm, inner.max.y),
-        ],
-        corner_stroke,
-    );
-    painter.line_segment(
-        [
-            inner.left_bottom(),
-            Pos2::new(inner.min.x, inner.max.y - arm),
-        ],
-        corner_stroke,
-    );
-    painter.line_segment(
-        [
-            inner.right_bottom(),
-            Pos2::new(inner.max.x - arm, inner.max.y),
-        ],
-        corner_stroke,
-    );
-    painter.line_segment(
-        [
-            inner.right_bottom(),
-            Pos2::new(inner.max.x, inner.max.y - arm),
-        ],
-        corner_stroke,
-    );
+    let bolt_top = with_a(56, 189, 248, 1.0);
+    let bolt_bot = with_a(14, 165, 233, 1.0);
+    let v0 = map(70.0, 28.0);
+    let v1 = map(43.0, 68.0);
+    let v2 = map(61.0, 68.0);
+    let v3 = map(56.0, 100.0);
+    let v4 = map(85.0, 58.0);
+    let v5 = map(67.0, 58.0);
 
-    let sx0 = rect.center().x - size * 0.16_f32;
-    let sx1 = rect.center().x + size * 0.16_f32;
-    let sy_top = rect.center().y - size * 0.21_f32;
-    let sy_mid = rect.center().y;
-    let sy_bot = rect.center().y + size * 0.21_f32;
-    let glyph_stroke = Stroke::new((size * 0.105_f32).max(1.6_f32), Color32::WHITE);
-
-    painter.add(egui::Shape::line(
-        vec![
-            Pos2::new(sx1, sy_top),
-            Pos2::new(sx0, sy_top),
-            Pos2::new(sx0, sy_mid),
-            Pos2::new(sx1, sy_mid),
-            Pos2::new(sx1, sy_bot),
-            Pos2::new(sx0, sy_bot),
-        ],
-        glyph_stroke,
+    painter.add(egui::Shape::convex_polygon(
+        vec![v0, v1, v2, v5],
+        bolt_top,
+        Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![v5, v2, v3, v4],
+        bolt_bot,
+        Stroke::NONE,
     ));
 }
 

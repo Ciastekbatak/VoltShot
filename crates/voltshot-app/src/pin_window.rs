@@ -138,8 +138,14 @@ impl PinManager {
 
         for pin in &mut self.windows {
             let viewport_id = egui::ViewportId::from_hash_of(("voltshot_pin_viewport", pin.id));
+            let pin_icon = egui::IconData {
+                rgba: crate::tray::build_tray_icon_rgba(64),
+                width: 64,
+                height: 64,
+            };
             let builder = egui::ViewportBuilder::default()
                 .with_title(pin.title.clone())
+                .with_icon(std::sync::Arc::new(pin_icon))
                 .with_always_on_top()
                 .with_decorations(!pin.borderless)
                 .with_inner_size(pin.display_size())
