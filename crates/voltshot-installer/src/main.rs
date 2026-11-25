@@ -694,11 +694,9 @@ mod tests {
 
     #[test]
     fn default_install_dir_and_quoted_commands_format_cleanly() {
-        let dir = default_install_dir_from(Path::new(r"C:\Users\Alex\AppData\Local"));
-        assert_eq!(
-            dir,
-            PathBuf::from(r"C:\Users\Alex\AppData\Local\Programs\VoltShot")
-        );
+        let base = Path::new(r"C:\Users\Alex\AppData\Local");
+        let dir = default_install_dir_from(base);
+        assert_eq!(dir, base.join("Programs").join("VoltShot"));
         let exe = dir.join(APP_EXE_NAME);
         assert_eq!(
             format_quoted_command(&exe, "--minimized"),

@@ -23,7 +23,9 @@ sudo apt-get install -y \
 	libxkbcommon-dev \
 	libfontconfig-dev \
 	libgtk-3-dev \
-	libayatana-appindicator3-dev
+	libayatana-appindicator3-dev \
+	libxdo-dev \
+	libgbm-dev
 ```
 
 Windows and macOS require no extra system packages.
