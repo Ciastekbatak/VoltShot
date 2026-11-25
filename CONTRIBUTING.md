@@ -1,4 +1,4 @@
-# Contributing to VoltShot in Rust
+# Contributing to VoltShot
 
 Every pull request must keep `voltshot-core` free of OS capture, clipboard, and GUI dependencies. Put platform code in `voltshot-capture` or `voltshot-app`, and put destination plugins in `voltshot-uploaders`.
 
